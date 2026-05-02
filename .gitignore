@@ -1,0 +1,7 @@
+*.xcframework/
+.DS_Store
+**/.DS_Store
+.claude/
+DerivedData/
+*.xcuserdata/
+**/xcuserdata/
