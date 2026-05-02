@@ -1,0 +1,21 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": [
+          "9JZRGJ724Y.com.seanlee.smartglasses.cameraaccess"
+        ],
+        "components": [
+          {
+            "/": "/meta-wearables",
+            "comment": "Meta Wearables Universal Link"
+          },
+          {
+            "/": "/meta-wearables/*",
+            "comment": "Meta Wearables Universal Link subpaths"
+          }
+        ]
+      }
+    ]
+  }
+}
