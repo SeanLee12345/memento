@@ -1,6 +1,8 @@
 {
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": null,
+  "outputDirectory": "public",
   "headers": [
     {
       "source": "/.well-known/apple-app-site-association",
@@ -10,6 +12,16 @@
           "value": "application/json"
         }
       ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/.well-known/apple-app-site-association",
+      "destination": "/.well-known/apple-app-site-association"
+    },
+    {
+      "source": "/meta-wearables",
+      "destination": "/meta-wearables/index.html"
     }
   ]
 }
