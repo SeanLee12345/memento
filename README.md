@@ -1,6 +1,6 @@
-# Meta Face Simulation
+# Meta Smart Glass Project
 
-SwiftUI iOS prototype for local face detection and speech transcription using a bundled compressed video file. The app does not use Meta DAT, physical glasses, or Meta streaming APIs at runtime.
+SwiftUI iOS prototype for Meta Wearables DAT camera streaming, local face detection, speech transcription, and Mock Device Kit fallback testing.
 
 ## Pipeline
 
@@ -21,10 +21,26 @@ All image/audio decoding and buffer ownership is delegated to Apple frameworks. 
 
 1. Open `CameraAccess.xcodeproj`.
 2. Select the `CameraAccess` scheme.
-3. Run on an iPhone or simulator.
-4. Tap `Start Simulation`.
+3. Run on a physical iPhone for real Meta glasses mode.
+4. Use Mock Device Kit on simulator or when physical glasses are unavailable.
 
-The bundled `CameraAccess/Compressed Video.mp4` is copied into the app bundle and used as the only video/audio source.
+## DAT Developer Mode Retest
+
+After changing `Info.plist` DAT keys, remove stale installs before retesting registration:
+
+1. Delete the app from the iPhone.
+2. In Xcode, use Product -> Clean Build Folder.
+3. Reinstall and run from Xcode on the physical iPhone.
+4. Confirm the app debug panel shows:
+   - `MWDAT.MetaAppID=0`
+   - `MWDAT.AppLinkURLScheme=cameraaccess://`
+   - `CFBundleURLSchemes=[cameraaccess]`
+   - `cameraaccess` URL scheme registered
+   - Developer Mode flag `true`
+5. Tap `Connect Real Glasses`.
+6. If Meta AI opens, return to the app and confirm `handleUrl` or scene-active resume logs appear.
+
+Developer Mode registration still requires Meta AI installed, internet access, Bluetooth enabled, and Developer Mode enabled on the paired glasses in Meta AI.
 
 ## Safety
 
