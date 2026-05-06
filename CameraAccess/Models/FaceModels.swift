@@ -49,6 +49,40 @@ enum StreamLifecycleState: String, Equatable {
   }
 }
 
+enum InputMode: String, CaseIterable, Equatable {
+  case realGlasses = "REAL GLASSES"
+  case mockDeviceKit = "MOCK DEVICE KIT"
+  case simulation = "SIMULATION"
+
+  static var defaultMode: InputMode {
+    #if targetEnvironment(simulator)
+    return .simulation
+    #else
+    return .realGlasses
+    #endif
+  }
+}
+
+enum DATConfigurationMode: String, Equatable {
+  case developerMode = "developerMode"
+  case production = "production"
+}
+
+enum DATConnectionStage: String, Equatable {
+  case sdkConfigured
+  case registrationAvailable
+  case registrationStarting
+  case waitingForMetaAIRegistration
+  case registered
+  case requestingCameraPermission
+  case cameraPermissionGranted
+  case discoveringDevices
+  case deviceSelected
+  case deviceSessionReady
+  case streamReady
+  case streaming
+}
+
 protocol FaceIdentityResolver {
   func displayName(for face: DetectedFace, in image: CGImage) async -> String?
 }

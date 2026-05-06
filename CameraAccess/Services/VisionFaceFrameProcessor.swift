@@ -21,6 +21,11 @@ actor VisionFaceFrameProcessor {
   private var loggedFirstFrameDebug = false
   private var loggedOrientationSweep = false
   private let ciContext = CIContext()
+  private let verboseFrameLogging = ProcessInfo.processInfo.arguments.contains("--verbose-frame-logging")
+  private var visionStatsStartedAt = Date()
+  private var visionStatsProcessedFrames: UInt64 = 0
+  private var visionStatsFaces: UInt64 = 0
+  private var visionStatsDurationMS: Double = 0
 
   init(identityResolver: FaceIdentityResolver = PlaceholderFaceIdentityResolver()) {
     self.identityResolver = identityResolver
@@ -144,7 +149,7 @@ actor VisionFaceFrameProcessor {
 
     let people = currentPeople()
     let durationMS = Date().timeIntervalSince(startedAt) * 1_000
-    AppLogger.log(.vision, "Processed frame #\(sequence): faces=\(faces.count), durationMs=\(String(format: "%.1f", durationMS))")
+    recordVisionStats(sequence: sequence, faceCount: faces.count, durationMS: durationMS)
     return ProcessedVideoFrame(
       sequence: sequence,
       image: image,
@@ -172,7 +177,9 @@ actor VisionFaceFrameProcessor {
       pixelBuffer: pixelBuffer,
       orientation: preferredOrientation
     ), !boxes.isEmpty {
-      AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): orientation=\(preferredOrientation.debugName), faces=\(boxes.count)")
+      if verboseFrameLogging {
+        AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): orientation=\(preferredOrientation.debugName), faces=\(boxes.count)")
+      }
       return boxes
     }
 
@@ -189,7 +196,9 @@ actor VisionFaceFrameProcessor {
       }
       sweepResults.append((orientation, boxes.count))
       if !boxes.isEmpty {
-        AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): preferred=\(preferredOrientation.debugName) returned 0; orientation=\(orientation.debugName) faces=\(boxes.count)")
+        if verboseFrameLogging {
+          AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): preferred=\(preferredOrientation.debugName) returned 0; orientation=\(orientation.debugName) faces=\(boxes.count)")
+        }
         return boxes
       }
     }
@@ -202,6 +211,38 @@ actor VisionFaceFrameProcessor {
       AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): no faces. preferred=\(preferredOrientation.debugName)=0; sweep[\(summary)]")
     }
     return []
+  }
+
+  private func recordVisionStats(sequence: UInt64, faceCount: Int, durationMS: Double) {
+    if verboseFrameLogging {
+      AppLogger.log(.vision, "Processed frame #\(sequence): faces=\(faceCount), durationMs=\(String(format: "%.1f", durationMS))")
+      return
+    }
+
+    visionStatsProcessedFrames += 1
+    visionStatsFaces += UInt64(faceCount)
+    visionStatsDurationMS += durationMS
+    let elapsed = Date().timeIntervalSince(visionStatsStartedAt)
+    guard elapsed >= 2 else { return }
+
+    let avgDurationMS = visionStatsProcessedFrames > 0
+      ? visionStatsDurationMS / Double(visionStatsProcessedFrames)
+      : 0
+    let fps = elapsed > 0 ? Double(visionStatsProcessedFrames) / elapsed : 0
+    AppLogger.log(
+      .vision,
+      String(
+        format: "Vision stats: processed=%llu fps=%.1f avgMs=%.1f faces=%llu",
+        visionStatsProcessedFrames,
+        fps,
+        avgDurationMS,
+        visionStatsFaces
+      )
+    )
+    visionStatsStartedAt = Date()
+    visionStatsProcessedFrames = 0
+    visionStatsFaces = 0
+    visionStatsDurationMS = 0
   }
 
   private func runFaceDetection(
