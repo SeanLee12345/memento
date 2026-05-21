@@ -35,8 +35,6 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>UIBackgroundModes</key>
 	<array>
-		<string>processing</string>
-		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
 		<string>external-accessory</string>
 	</array>
@@ -61,6 +59,11 @@
 	<string>This app uses Bluetooth to discover and connect to paired Meta smart glasses.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>This app uses Bluetooth to discover and connect to paired Meta smart glasses.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This app uses the local network when Meta glasses streaming requires a Wi-Fi device link.</string>
 	<key>NSBonjourServices</key>
@@ -68,9 +71,7 @@
 		<string>_bonjour._tcp</string>
 	</array>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>This app uses the iPhone microphone for live speech transcription while streaming from Meta glasses.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>This app uses Apple Speech recognition to transcribe live microphone audio.</string>
+	<string>This app uses the iPhone microphone for speaker identification and cloud transcription while streaming from Meta glasses.</string>
 	<key>UISupportedExternalAccessoryProtocols</key>
 	<array>
 		<string>com.meta.ar.wearable</string>

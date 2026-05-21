@@ -7,11 +7,22 @@ import UIKit
 import Vision
 
 actor VisionFaceFrameProcessor {
+  private struct FaceDetectionOutput {
+    let observations: [VNFaceObservation]
+    let selectedOrientation: CGImagePropertyOrientation
+    let preferredOrientation: CGImagePropertyOrientation
+    let preferredFaceCount: Int
+    let orientationCounts: [CGImagePropertyOrientation: Int]
+    let usedSweep: Bool
+  }
+
   private struct Track {
     var id: Int
     var personID: UUID
     var boundingBox: CGRect
     var faceImage: UIImage?
+    var lastMouthOpenRatio: Float?
+    var mouthMovementScore: Float
     var lastSeenSequence: UInt64
   }
 
@@ -19,24 +30,43 @@ actor VisionFaceFrameProcessor {
   private var nextTrackID = 1
   private let identityResolver: FaceIdentityResolver
   private var loggedFirstFrameDebug = false
-  private var loggedOrientationSweep = false
   private let ciContext = CIContext()
+  private let faceQualityFilter = FaceQualityFilter()
   private let verboseFrameLogging = ProcessInfo.processInfo.arguments.contains("--verbose-frame-logging")
   private var visionStatsStartedAt = Date()
   private var visionStatsProcessedFrames: UInt64 = 0
   private var visionStatsFaces: UInt64 = 0
   private var visionStatsDurationMS: Double = 0
+  private var facePipelineStatsStartedAt = Date()
+  private var facePipelineFramesSeen: UInt64 = 0
+  private var facePipelineVisionProcessed: UInt64 = 0
+  private var facePipelineFacesDetected: UInt64 = 0
+  private var facePipelineCropsSucceeded: UInt64 = 0
+  private var facePipelineCropsRejected: UInt64 = 0
+  private var facePipelineQualityAccepted: UInt64 = 0
+  private var facePipelineEnrollmentAccepted: UInt64 = 0
+  private var facePipelineQualityRejected: UInt64 = 0
+  private var facePipelineVisionDurationMS: Double = 0
+  private var facePipelineCropDurationMS: Double = 0
+  private var facePipelineQualityDurationMS: Double = 0
+  private var facePipelineSelectedOrientation = "none"
 
   init(identityResolver: FaceIdentityResolver = PlaceholderFaceIdentityResolver()) {
     self.identityResolver = identityResolver
   }
 
-  func process(sampleBuffer: CMSampleBuffer, sequence: UInt64, forceTestFaceOverlay: Bool = false) async -> ProcessedVideoFrame? {
+  func process(
+    sampleBuffer: CMSampleBuffer,
+    sequence: UInt64,
+    forceTestFaceOverlay: Bool = false,
+    context: PipelineContext? = nil
+  ) async -> ProcessedVideoFrame? {
     await process(
       sampleBuffer: sampleBuffer,
       sequence: sequence,
       inputType: "CMSampleBuffer -> CVPixelBuffer",
-      forceTestFaceOverlay: forceTestFaceOverlay
+      forceTestFaceOverlay: forceTestFaceOverlay,
+      context: context
     )
   }
 
@@ -44,7 +74,8 @@ actor VisionFaceFrameProcessor {
     sampleBuffer: CMSampleBuffer,
     sequence: UInt64,
     inputType: String,
-    forceTestFaceOverlay: Bool
+    forceTestFaceOverlay: Bool,
+    context: PipelineContext?
   ) async -> ProcessedVideoFrame? {
     let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
@@ -64,6 +95,7 @@ actor VisionFaceFrameProcessor {
       AppLogger.log(.frames, "Dropped frame #\(sequence): CoreImage could not create a display CGImage")
       return nil
     }
+    AppLogger.log(.visionInput, "\(context.logPrefix) frame=\(sequence) input=CVPixelBuffer width=\(width) height=\(height) orientation=up mirrored=false")
     let image = UIImage(cgImage: cgImage)
 
     return await process(
@@ -73,15 +105,22 @@ actor VisionFaceFrameProcessor {
       sequence: sequence,
       timestamp: timestamp,
       inputType: inputType,
-      forceTestFaceOverlay: forceTestFaceOverlay
+      forceTestFaceOverlay: forceTestFaceOverlay,
+      context: context
     )
   }
 
-  func process(image: UIImage, sequence: UInt64, forceTestFaceOverlay: Bool = false) async -> ProcessedVideoFrame? {
+  func process(
+    image: UIImage,
+    sequence: UInt64,
+    forceTestFaceOverlay: Bool = false,
+    context: PipelineContext? = nil
+  ) async -> ProcessedVideoFrame? {
     guard let cgImage = image.cgImage else {
       AppLogger.log(.frames, "Dropped frame #\(sequence): UIImage.cgImage returned nil")
       return nil
     }
+    AppLogger.log(.visionInput, "\(context.logPrefix) frame=\(sequence) input=UIImage fallback=true reason=pixelBufferUnavailable width=\(cgImage.width) height=\(cgImage.height) orientation=\(Self.cgImagePropertyOrientation(for: image.imageOrientation).debugName)")
 
     return await process(
       image: image,
@@ -90,7 +129,8 @@ actor VisionFaceFrameProcessor {
       sequence: sequence,
       timestamp: nil,
       inputType: "UIImage",
-      forceTestFaceOverlay: forceTestFaceOverlay
+      forceTestFaceOverlay: forceTestFaceOverlay,
+      context: context
     )
   }
 
@@ -101,7 +141,8 @@ actor VisionFaceFrameProcessor {
     sequence: UInt64,
     timestamp: CMTime?,
     inputType: String,
-    forceTestFaceOverlay: Bool
+    forceTestFaceOverlay: Bool,
+    context: PipelineContext?
   ) async -> ProcessedVideoFrame {
     logFirstFrameDebugIfNeeded(
       sequence: sequence,
@@ -109,7 +150,8 @@ actor VisionFaceFrameProcessor {
       cgImage: cgImage,
       pixelBuffer: pixelBuffer,
       timestamp: timestamp,
-      inputType: inputType
+      inputType: inputType,
+      context: context
     )
 
     guard cgImage.width > 0, cgImage.height > 0 else {
@@ -120,27 +162,46 @@ actor VisionFaceFrameProcessor {
         imageSize: .zero,
         faces: [],
         people: [],
-        processedAt: Date()
+        processedAt: Date(),
+        pipelineContext: context,
+        faceDetectionEvent: nil
       )
     }
 
     let startedAt = Date()
-    let boxes: [CGRect]
+    let detection: FaceDetectionOutput
     if forceTestFaceOverlay {
-      boxes = [CGRect(x: 0.34, y: 0.30, width: 0.28, height: 0.34)]
+      let observation = VNFaceObservation(boundingBox: CGRect(x: 0.34, y: 0.30, width: 0.28, height: 0.34))
+      detection = FaceDetectionOutput(
+        observations: [observation],
+        selectedOrientation: .up,
+        preferredOrientation: .up,
+        preferredFaceCount: 1,
+        orientationCounts: [.up: 1],
+        usedSweep: false
+      )
     } else {
-      boxes = detectFaceBoxes(
+      detection = detectFaceObservations(
         displayCGImage: cgImage,
         pixelBuffer: pixelBuffer,
         imageOrientation: image.imageOrientation,
-        sequence: sequence
+        sequence: sequence,
+        context: context
       )
     }
 
-    let safeBoxes = boxes.compactMap {
-      Self.safeNormalizedFaceBox($0, imageSize: CGSize(width: cgImage.width, height: cgImage.height))
+    let observations = detection.observations
+    let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
+    let trackedInputs = observations.compactMap { observation -> FaceTrackInput? in
+      guard let box = Self.safeNormalizedFaceBox(observation.boundingBox, imageSize: imageSize) else {
+        return nil
+      }
+      return FaceTrackInput(
+        boundingBox: box,
+        mouthOpenRatio: Self.mouthOpenRatio(for: observation)
+      )
     }
-    var faces = updateTracks(with: safeBoxes, cgImage: cgImage, sequence: sequence)
+    var faces = updateTracks(with: trackedInputs, cgImage: cgImage, sequence: sequence)
     for index in faces.indices {
       if let name = await identityResolver.displayName(for: faces[index], in: cgImage) {
         faces[index] = DetectedFace(id: faces[index].id, boundingBox: faces[index].boundingBox, displayName: name)
@@ -148,69 +209,360 @@ actor VisionFaceFrameProcessor {
     }
 
     let people = currentPeople()
+    let candidateOutput = buildIdentityCandidates(
+      observations: observations,
+      cgImage: cgImage,
+      sequence: sequence,
+      orientation: detection.selectedOrientation,
+      context: context
+    )
+    let faceDetectionEvent = makeFaceDetectionEvent(
+      context: context,
+      sequence: sequence,
+      image: image,
+      cgImage: cgImage,
+      detection: detection
+    )
+    let identityCandidates = candidateOutput.candidates
+
+    // Update the overlay bounding boxes to show the padded crop area instead of Vision's tight
+    // raw detection box. The raw box intentionally excludes hair/forehead and chin; the padded
+    // box is what the crop pipeline actually captures and is more informative for the user.
+    let imageW = CGFloat(cgImage.width)
+    let imageH = CGFloat(cgImage.height)
+    if imageW > 0, imageH > 0 {
+      faces = faces.map { face in
+        guard let candidate = identityCandidates.first(where: {
+          intersectionOverUnion(face.boundingBox, $0.crop.faceBoundingBoxNormalized) > 0.25
+        }) else { return face }
+        let p = candidate.crop.faceBoundingBoxPixels
+        // Convert pixel rect (top-left origin) → Vision-style normalized (bottom-left origin)
+        let paddedNorm = CGRect(
+          x: p.minX / imageW,
+          y: 1.0 - p.maxY / imageH,
+          width: p.width / imageW,
+          height: p.height / imageH
+        )
+        return DetectedFace(
+          id: face.id,
+          boundingBox: paddedNorm,
+          displayName: face.displayName,
+          mouthOpenRatio: face.mouthOpenRatio,
+          mouthMovementScore: face.mouthMovementScore
+        )
+      }
+    }
+
     let durationMS = Date().timeIntervalSince(startedAt) * 1_000
     recordVisionStats(sequence: sequence, faceCount: faces.count, durationMS: durationMS)
+    recordFacePipelineStats(
+      context: context,
+      facesDetected: observations.count,
+      cropsSucceeded: candidateOutput.cropsSucceeded,
+      cropsRejected: max(0, observations.count - candidateOutput.cropsSucceeded),
+      qualityAccepted: candidateOutput.qualityAccepted,
+      enrollmentAccepted: candidateOutput.enrollmentAccepted,
+      qualityRejected: max(0, candidateOutput.cropsSucceeded - candidateOutput.qualityAccepted),
+      visionDurationMS: durationMS,
+      cropDurationMS: candidateOutput.cropDurationMS,
+      qualityDurationMS: candidateOutput.qualityDurationMS,
+      selectedOrientation: detection.selectedOrientation
+    )
     return ProcessedVideoFrame(
       sequence: sequence,
       image: image,
       imageSize: CGSize(width: cgImage.width, height: cgImage.height),
       faces: faces,
       people: people,
-      processedAt: Date()
+      processedAt: Date(),
+      identityCandidates: identityCandidates,
+      pipelineContext: context,
+      faceDetectionEvent: faceDetectionEvent,
+      alignmentFailures: candidateOutput.alignmentFailures
     )
   }
 
-  private func detectFaceBoxes(
+  private func detectFaceObservations(
     displayCGImage: CGImage,
     pixelBuffer: CVPixelBuffer?,
     imageOrientation: UIImage.Orientation,
-    sequence: UInt64
-  ) -> [CGRect] {
+    sequence: UInt64,
+    context: PipelineContext?
+  ) -> FaceDetectionOutput {
     let preferredOrientation = preferredVisionOrientation(
       imageOrientation: imageOrientation,
       pixelBuffer: pixelBuffer,
       cgImage: displayCGImage
     )
+    let shouldSweep = FaceVisionDebugPipeline.shouldRunOrientationSweep(frame: sequence, verbose: verboseFrameLogging)
 
-    if let boxes = runFaceDetection(
+    let preferredObservations = runFaceDetection(
       cgImage: displayCGImage,
       pixelBuffer: pixelBuffer,
-      orientation: preferredOrientation
-    ), !boxes.isEmpty {
-      if verboseFrameLogging {
-        AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): orientation=\(preferredOrientation.debugName), faces=\(boxes.count)")
-      }
-      return boxes
+      orientation: preferredOrientation,
+      includeQuality: true
+    ) ?? []
+
+    var counts: [CGImagePropertyOrientation: Int] = [preferredOrientation: preferredObservations.count]
+    var observationsByOrientation: [CGImagePropertyOrientation: [VNFaceObservation]] = [preferredOrientation: preferredObservations]
+
+    if !shouldSweep {
+      logOrientationDiagnostic(
+        context: context,
+        sequence: sequence,
+        imageSize: CGSize(width: displayCGImage.width, height: displayCGImage.height),
+        imageOrientation: imageOrientation,
+        preferredOrientation: preferredOrientation,
+        selectedOrientation: preferredOrientation,
+        counts: counts,
+        usedSweep: false,
+        preferredCount: preferredObservations.count
+      )
+      return FaceDetectionOutput(
+        observations: preferredObservations,
+        selectedOrientation: preferredOrientation,
+        preferredOrientation: preferredOrientation,
+        preferredFaceCount: preferredObservations.count,
+        orientationCounts: counts,
+        usedSweep: false
+      )
     }
 
-    let orientations: [CGImagePropertyOrientation] = [.up, .right, .left, .down]
-    var sweepResults: [(CGImagePropertyOrientation, Int)] = []
+    let orientations = FaceVisionDebugPipeline.sweepOrientations
     for orientation in orientations where orientation != preferredOrientation {
-      guard let boxes = runFaceDetection(
+      let observations = runFaceDetection(
         cgImage: displayCGImage,
         pixelBuffer: pixelBuffer,
-        orientation: orientation
-      ) else {
-        sweepResults.append((orientation, -1))
-        continue
-      }
-      sweepResults.append((orientation, boxes.count))
-      if !boxes.isEmpty {
-        if verboseFrameLogging {
-          AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): preferred=\(preferredOrientation.debugName) returned 0; orientation=\(orientation.debugName) faces=\(boxes.count)")
-        }
-        return boxes
-      }
+        orientation: orientation,
+        includeQuality: shouldSweep
+      ) ?? []
+      counts[orientation] = observations.count
+      observationsByOrientation[orientation] = observations
     }
 
-    if !loggedOrientationSweep {
-      loggedOrientationSweep = true
-      let summary = sweepResults
-        .map { "\($0.0.debugName)=\($0.1)" }
-        .joined(separator: ", ")
-      AppLogger.log(.vision, "VNDetectFaceRectanglesRequest frame #\(sequence): no faces. preferred=\(preferredOrientation.debugName)=0; sweep[\(summary)]")
+    let selectedOrientation = orientations.max { lhs, rhs in
+      (counts[lhs] ?? 0) < (counts[rhs] ?? 0)
+    } ?? preferredOrientation
+    let selectedCount = counts[selectedOrientation] ?? 0
+    let selectedObservations: [VNFaceObservation]
+    if selectedOrientation == preferredOrientation {
+      selectedObservations = preferredObservations
+    } else if shouldSweep {
+      selectedObservations = observationsByOrientation[selectedOrientation] ?? []
+    } else {
+      selectedObservations = runFaceDetection(
+        cgImage: displayCGImage,
+        pixelBuffer: pixelBuffer,
+        orientation: selectedOrientation,
+        includeQuality: true
+      ) ?? []
     }
-    return []
+
+    if selectedCount == 0 {
+      AppLogger.log(
+        .visionOrientation,
+        "\(context.logPrefix) frame=\(sequence) noFacesAllOrientations image=\(displayCGImage.width)x\(displayCGImage.height) uiOrientation=\(imageOrientation.debugName) mappedCG=\(preferredOrientation.debugName)"
+      )
+    }
+
+    logOrientationDiagnostic(
+      context: context,
+      sequence: sequence,
+      imageSize: CGSize(width: displayCGImage.width, height: displayCGImage.height),
+      imageOrientation: imageOrientation,
+      preferredOrientation: preferredOrientation,
+      selectedOrientation: selectedOrientation,
+      counts: counts,
+      usedSweep: shouldSweep,
+      preferredCount: preferredObservations.count
+    )
+    return FaceDetectionOutput(
+      observations: selectedObservations,
+      selectedOrientation: selectedOrientation,
+      preferredOrientation: preferredOrientation,
+      preferredFaceCount: preferredObservations.count,
+      orientationCounts: counts,
+      usedSweep: shouldSweep
+    )
+  }
+
+  private func logOrientationDiagnostic(
+    context: PipelineContext?,
+    sequence: UInt64,
+    imageSize: CGSize,
+    imageOrientation: UIImage.Orientation,
+    preferredOrientation: CGImagePropertyOrientation,
+    selectedOrientation: CGImagePropertyOrientation,
+    counts: [CGImagePropertyOrientation: Int],
+    usedSweep: Bool,
+    preferredCount: Int
+  ) {
+    let reason = FaceVisionDebugPipeline.selectionReason(
+      selected: selectedOrientation,
+      mapped: preferredOrientation,
+      usedSweep: usedSweep
+    )
+    AppLogger.log(
+      .visionOrientation,
+      "\(context.logPrefix) frame=\(sequence) image=\(Int(imageSize.width))x\(Int(imageSize.height)) uiOrientation=\(imageOrientation.debugName) mappedCG=\(preferredOrientation.debugName) preferredCount=\(preferredCount) sweep=\(FaceVisionDebugPipeline.orientationCountsText(counts)) selected=\(selectedOrientation.debugName) reason=\(reason)"
+    )
+  }
+
+  private func orientationSummary(_ counts: [CGImagePropertyOrientation: Int]) -> String {
+    return FaceVisionDebugPipeline.sweepOrientations
+      .map { "\($0.debugName)=\(counts[$0] ?? -1)" }
+      .joined(separator: ", ")
+  }
+
+  private struct IdentityCandidateBuildOutput {
+    let candidates: [IdentityCandidate]
+    let cropsSucceeded: Int
+    let qualityAccepted: Int
+    let enrollmentAccepted: Int
+    let cropDurationMS: Double
+    let qualityDurationMS: Double
+    let alignmentFailures: Int
+  }
+
+  private func buildIdentityCandidates(
+    observations: [VNFaceObservation],
+    cgImage: CGImage,
+    sequence: UInt64,
+    orientation: CGImagePropertyOrientation,
+    context: PipelineContext?
+  ) -> IdentityCandidateBuildOutput {
+    let cropStartedAt = Date()
+    let cropResult = FaceCropper.cropFaces(
+      observations: observations,
+      from: cgImage,
+      sequence: sequence,
+      orientation: orientation,
+      context: context
+    )
+    let crops = cropResult.crops
+    let alignmentFailures = cropResult.alignmentFailures
+    let cropDurationMS = Date().timeIntervalSince(cropStartedAt) * 1_000
+    let qualityStartedAt = Date()
+    let largestArea = crops.map { $0.faceBoundingBoxPixels.width * $0.faceBoundingBoxPixels.height }.max() ?? 0
+    let candidates = crops.map { crop in
+      let isDominant = crop.faceBoundingBoxPixels.width * crop.faceBoundingBoxPixels.height >= largestArea
+      let quality = IdentityConfig.enableFaceQualityFilter
+        ? faceQualityFilter.evaluate(crop, faceCount: crops.count, isDominantFace: isDominant)
+        : FaceQualityDecision(
+          detected: true,
+          cropSucceeded: true,
+          rawFaceWidth: Int(crop.rawFaceBoundingBoxPixels.width),
+          rawFaceHeight: Int(crop.rawFaceBoundingBoxPixels.height),
+          accepted: true,
+          score: crop.faceCaptureQuality,
+          reasons: [],
+          rejectionReasons: [],
+          normalizedFaceArea: Float((crop.faceBoundingBoxPixels.width * crop.faceBoundingBoxPixels.height) / max(crop.sourceImageSize.width * crop.sourceImageSize.height, 1)),
+          cropSize: CGSize(width: crop.croppedImage.width, height: crop.croppedImage.height),
+          visionQuality: crop.faceCaptureQuality,
+          cropWidth: crop.croppedImage.width,
+          cropHeight: crop.croppedImage.height,
+          brightness: nil,
+          sharpness: nil,
+          faceAreaRatio: Float((crop.faceBoundingBoxPixels.width * crop.faceBoundingBoxPixels.height) / max(crop.sourceImageSize.width * crop.sourceImageSize.height, 1)),
+          centerOffset: 0,
+          passes: true,
+          rejectReason: nil,
+          tier: .preferredEnrollment,
+          acceptedForRecognition: true,
+          acceptedForEnrollment: true
+        )
+      return IdentityCandidate(crop: crop, quality: quality)
+    }
+    let qualityDurationMS = Date().timeIntervalSince(qualityStartedAt) * 1_000
+    let accepted = candidates.filter(\.quality.accepted).count
+    let enrollmentAccepted = candidates.filter(\.quality.acceptedForEnrollment).count
+    if verboseFrameLogging || sequence % 30 == 0 {
+      let rejectedReasons = candidates
+        .filter { !$0.quality.acceptedForRecognition }
+        .flatMap(\.quality.reasons)
+        .prefix(3)
+        .joined(separator: ", ")
+      AppLogger.log(.frames, "\(context.logPrefix) [FACE] detected=\(observations.count) crops=\(crops.count) acceptedForRecognition=\(accepted) acceptedForEnrollment=\(enrollmentAccepted) rejected=\(candidates.count - accepted) reasons=\(rejectedReasons)")
+    }
+    for (index, candidate) in candidates.enumerated() where verboseFrameLogging || sequence <= 20 || sequence % 30 == 0 {
+      AppLogger.log(
+        .faceQuality,
+        "\(context.logPrefix) frame=\(sequence) face=\(index) quality=\(candidate.quality.visionQuality.map { String(format: "%.2f", $0) } ?? "nil") score=\(candidate.quality.score.map { String(format: "%.2f", $0) } ?? "nil") brightness=\(candidate.quality.brightness.map { String(format: "%.2f", $0) } ?? "nil") areaRatio=\(String(format: "%.3f", candidate.quality.faceAreaRatio)) centerOffset=\(String(format: "%.3f", candidate.quality.centerOffset)) pass=\(candidate.quality.passes) finalAcceptedForRecognition=\(candidate.quality.acceptedForRecognition) finalAcceptedForEnrollment=\(candidate.quality.acceptedForEnrollment) tier=\(candidate.quality.tier.rawValue) width=\(candidate.quality.cropWidth) height=\(candidate.quality.cropHeight) rawWidth=\(candidate.quality.rawFaceWidth) rawHeight=\(candidate.quality.rawFaceHeight) yaw=\(candidate.crop.yaw.map { String(format: "%.2f", $0) } ?? "nil") pitch=\(candidate.crop.pitch.map { String(format: "%.2f", $0) } ?? "nil") roll=\(candidate.crop.roll.map { String(format: "%.2f", $0) } ?? "nil") reason=\(candidate.quality.rejectReason ?? "accepted")"
+      )
+    }
+    return IdentityCandidateBuildOutput(
+      candidates: candidates,
+      cropsSucceeded: crops.count,
+      qualityAccepted: accepted,
+      enrollmentAccepted: enrollmentAccepted,
+      cropDurationMS: cropDurationMS,
+      qualityDurationMS: qualityDurationMS,
+      alignmentFailures: alignmentFailures
+    )
+  }
+
+  private func recordFacePipelineStats(
+    context: PipelineContext?,
+    facesDetected: Int,
+    cropsSucceeded: Int,
+    cropsRejected: Int,
+    qualityAccepted: Int,
+    enrollmentAccepted: Int,
+    qualityRejected: Int,
+    visionDurationMS: Double,
+    cropDurationMS: Double,
+    qualityDurationMS: Double,
+    selectedOrientation: CGImagePropertyOrientation
+  ) {
+    facePipelineFramesSeen += 1
+    facePipelineVisionProcessed += 1
+    facePipelineFacesDetected += UInt64(facesDetected)
+    facePipelineCropsSucceeded += UInt64(cropsSucceeded)
+    facePipelineCropsRejected += UInt64(cropsRejected)
+    facePipelineQualityAccepted += UInt64(qualityAccepted)
+    facePipelineEnrollmentAccepted += UInt64(enrollmentAccepted)
+    facePipelineQualityRejected += UInt64(qualityRejected)
+    facePipelineVisionDurationMS += visionDurationMS
+    facePipelineCropDurationMS += cropDurationMS
+    facePipelineQualityDurationMS += qualityDurationMS
+    facePipelineSelectedOrientation = selectedOrientation.debugName
+
+    let elapsed = Date().timeIntervalSince(facePipelineStatsStartedAt)
+    guard elapsed >= 2 else { return }
+    let avgVisionMS = facePipelineVisionProcessed > 0 ? facePipelineVisionDurationMS / Double(facePipelineVisionProcessed) : 0
+    let avgCropMS = facePipelineVisionProcessed > 0 ? facePipelineCropDurationMS / Double(facePipelineVisionProcessed) : 0
+    let avgQualityMS = facePipelineVisionProcessed > 0 ? facePipelineQualityDurationMS / Double(facePipelineVisionProcessed) : 0
+    AppLogger.log(
+      .facePipelineStats,
+      String(
+        format: "%@ framesSeen=%llu visionProcessed=%llu visionFacesDetected=%llu cropsAcceptedForRecognition=%llu cropsAcceptedForEnrollment=%llu cropsRejectedTooSmall=%llu cropsRejectedBadQuality=%llu embeddingsRun=0 avgVisionMs=%.1f avgCropMs=%.1f avgQualityMs=%.1f selectedOrientation=%@",
+        context.logPrefix,
+        facePipelineFramesSeen,
+        facePipelineVisionProcessed,
+        facePipelineFacesDetected,
+        facePipelineQualityAccepted,
+        facePipelineEnrollmentAccepted,
+        facePipelineCropsRejected,
+        facePipelineQualityRejected,
+        avgVisionMS,
+        avgCropMS,
+        avgQualityMS,
+        facePipelineSelectedOrientation
+      )
+    )
+    facePipelineStatsStartedAt = Date()
+    facePipelineFramesSeen = 0
+    facePipelineVisionProcessed = 0
+    facePipelineFacesDetected = 0
+    facePipelineCropsSucceeded = 0
+    facePipelineCropsRejected = 0
+    facePipelineQualityAccepted = 0
+    facePipelineEnrollmentAccepted = 0
+    facePipelineQualityRejected = 0
+    facePipelineVisionDurationMS = 0
+    facePipelineCropDurationMS = 0
+    facePipelineQualityDurationMS = 0
   }
 
   private func recordVisionStats(sequence: UInt64, faceCount: Int, durationMS: Double) {
@@ -248,15 +600,24 @@ actor VisionFaceFrameProcessor {
   private func runFaceDetection(
     cgImage: CGImage,
     pixelBuffer: CVPixelBuffer?,
-    orientation: CGImagePropertyOrientation
-  ) -> [CGRect]? {
+    orientation: CGImagePropertyOrientation,
+    includeQuality: Bool
+  ) -> [VNFaceObservation]? {
     let request = VNDetectFaceRectanglesRequest()
-    request.usesCPUOnly = true
+    // usesCPUOnly removed — Vision uses Neural Engine when available (5-10x faster on A-series chips).
+    // VNImageRequestHandler is retained and reused across all three passes so the image buffer
+    // is uploaded to hardware only once per frame.
+
     if let pixelBuffer {
       let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
       do {
         try handler.perform([request])
-        return (request.results ?? []).map(\.boundingBox)
+        return enrichWithQualityAndLandmarks(
+          handler: handler,
+          rectangleObservations: request.results ?? [],
+          includeQuality: includeQuality,
+          orientation: orientation
+        )
       } catch {
         AppLogger.log(.vision, "VNDetectFaceRectanglesRequest failed on CVPixelBuffer orientation=\(orientation.debugName): \(error.localizedDescription). Retrying sRGB CGImage.")
       }
@@ -265,10 +626,49 @@ actor VisionFaceFrameProcessor {
     let handler = VNImageRequestHandler(cgImage: cgImage, orientation: orientation, options: [:])
     do {
       try handler.perform([request])
-      return (request.results ?? []).map(\.boundingBox)
+      return enrichWithQualityAndLandmarks(
+        handler: handler,
+        rectangleObservations: request.results ?? [],
+        includeQuality: includeQuality,
+        orientation: orientation
+      )
     } catch {
       AppLogger.log(.vision, "VNDetectFaceRectanglesRequest failed: \(error.localizedDescription)")
       return nil
+    }
+  }
+
+  // Runs quality scoring and landmark detection on the SAME handler that already holds the
+  // image — Apple documents VNImageRequestHandler as safe to call perform() on multiple times
+  // for the same image, avoiding repeated buffer uploads.
+  private func enrichWithQualityAndLandmarks(
+    handler: VNImageRequestHandler,
+    rectangleObservations: [VNFaceObservation],
+    includeQuality: Bool,
+    orientation: CGImagePropertyOrientation
+  ) -> [VNFaceObservation] {
+    guard includeQuality, !rectangleObservations.isEmpty else { return rectangleObservations }
+
+    // Pass 2: quality scores (reuses existing handler — no image re-upload)
+    let qualityRequest = VNDetectFaceCaptureQualityRequest()
+    qualityRequest.inputFaceObservations = rectangleObservations
+    var withQuality = rectangleObservations
+    do {
+      try handler.perform([qualityRequest])
+      withQuality = qualityRequest.results ?? rectangleObservations
+    } catch {
+      AppLogger.log(.faceQuality, "VNDetectFaceCaptureQualityRequest failed orientation=\(orientation.debugName): \(error.localizedDescription)")
+    }
+
+    // Pass 3: 5-point landmarks for similarity-transform alignment in FaceCropper (reuses handler)
+    let landmarksRequest = VNDetectFaceLandmarksRequest()
+    landmarksRequest.inputFaceObservations = withQuality
+    do {
+      try handler.perform([landmarksRequest])
+      return landmarksRequest.results ?? withQuality
+    } catch {
+      AppLogger.log(.faceQuality, "VNDetectFaceLandmarksRequest failed orientation=\(orientation.debugName): \(error.localizedDescription)")
+      return withQuality
     }
   }
 
@@ -288,7 +688,7 @@ actor VisionFaceFrameProcessor {
     // File-decoded sample buffers can carry landscape pixel buffers while the
     // display image is portrait. Try UIImage orientation first when meaningful;
     // otherwise choose by buffer shape and let the orientation sweep correct it.
-    let uiOrientation = CGImagePropertyOrientation(imageOrientation)
+    let uiOrientation = Self.cgImagePropertyOrientation(for: imageOrientation)
     guard uiOrientation == .up, let pixelBuffer else { return uiOrientation }
     let width = CVPixelBufferGetWidth(pixelBuffer)
     let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -298,13 +698,18 @@ actor VisionFaceFrameProcessor {
     return .up
   }
 
+  static func cgImagePropertyOrientation(for orientation: UIImage.Orientation) -> CGImagePropertyOrientation {
+    FaceVisionDebugPipeline.cgImagePropertyOrientation(from: orientation)
+  }
+
   private func logFirstFrameDebugIfNeeded(
     sequence: UInt64,
     image: UIImage,
     cgImage: CGImage,
     pixelBuffer: CVPixelBuffer?,
     timestamp: CMTime?,
-    inputType: String
+    inputType: String,
+    context: PipelineContext?
   ) {
     guard !loggedFirstFrameDebug else { return }
     loggedFirstFrameDebug = true
@@ -325,7 +730,36 @@ actor VisionFaceFrameProcessor {
 
     AppLogger.log(
       .vision,
-      "First Vision frame #\(sequence): input=\(inputType), cgImage=\(cgImage.width)x\(cgImage.height), pixelBuffer=\(pixelSize), uiOrientation=\(image.imageOrientation.debugName), timestamp=\(timestampText)"
+      "\(context.logPrefix) First Vision frame #\(sequence): input=\(inputType), uiImageSize=\(Int(image.size.width))x\(Int(image.size.height)), cgImage=\(cgImage.width)x\(cgImage.height), pixelBuffer=\(pixelSize), uiOrientation=\(image.imageOrientation.debugName), mappedCG=\(Self.cgImagePropertyOrientation(for: image.imageOrientation).debugName), mirrored=\(image.imageOrientation.debugName.contains("Mirrored")), source=glasses-or-file, timestamp=\(timestampText)"
+    )
+  }
+
+  private func makeFaceDetectionEvent(
+    context: PipelineContext?,
+    sequence: UInt64,
+    image: UIImage,
+    cgImage: CGImage,
+    detection: FaceDetectionOutput
+  ) -> FaceDetectionEvent? {
+    guard let context else { return nil }
+    guard sequence <= 30 || sequence % 30 == 0 || detection.observations.isEmpty else { return nil }
+    let sweepJson = FaceVisionDebugPipeline.orientationCountsJSON(detection.orientationCounts)
+    return FaceDetectionEvent(
+      id: UUID(),
+      appRunId: context.appRunId,
+      conversationSessionId: context.conversationSessionId,
+      frameIndex: Int(sequence),
+      frameWidth: Int(image.size.width),
+      frameHeight: Int(image.size.height),
+      uiImageOrientation: image.imageOrientation.debugName,
+      cgImageWidth: cgImage.width,
+      cgImageHeight: cgImage.height,
+      visionOrientationUsed: detection.selectedOrientation.debugName,
+      preferredFaceCount: detection.preferredFaceCount,
+      sweepFaceCountsJson: sweepJson,
+      selectedOrientation: detection.selectedOrientation.debugName,
+      selectedFaceCount: detection.observations.count,
+      createdAt: Date()
     )
   }
 
@@ -359,19 +793,32 @@ actor VisionFaceFrameProcessor {
     return safeNormalized
   }
 
-  private func updateTracks(with boxes: [CGRect], cgImage: CGImage, sequence: UInt64) -> [DetectedFace] {
+  private struct FaceTrackInput {
+    let boundingBox: CGRect
+    let mouthOpenRatio: Float?
+  }
+
+  private func updateTracks(with inputs: [FaceTrackInput], cgImage: CGImage, sequence: UInt64) -> [DetectedFace] {
     var updatedTracks: [Track] = []
     var usedTrackIDs = Set<Int>()
 
-    for box in boxes {
+    for input in inputs {
+      let box = input.boundingBox
       let thumbnail = makeFaceThumbnail(from: cgImage, normalizedBox: box)
       if let matchedTrack = bestMatchingTrack(for: box, excluding: usedTrackIDs) {
         usedTrackIDs.insert(matchedTrack.id)
+        let movementScore = Self.updatedMouthMovementScore(
+          previousRatio: matchedTrack.lastMouthOpenRatio,
+          newRatio: input.mouthOpenRatio,
+          previousScore: matchedTrack.mouthMovementScore
+        )
         updatedTracks.append(Track(
           id: matchedTrack.id,
           personID: matchedTrack.personID,
           boundingBox: box,
           faceImage: thumbnail ?? matchedTrack.faceImage,
+          lastMouthOpenRatio: input.mouthOpenRatio ?? matchedTrack.lastMouthOpenRatio,
+          mouthMovementScore: movementScore,
           lastSeenSequence: sequence
         ))
       } else {
@@ -382,6 +829,8 @@ actor VisionFaceFrameProcessor {
           personID: UUID(),
           boundingBox: box,
           faceImage: thumbnail,
+          lastMouthOpenRatio: input.mouthOpenRatio,
+          mouthMovementScore: 0,
           lastSeenSequence: sequence
         ))
       }
@@ -392,8 +841,40 @@ actor VisionFaceFrameProcessor {
     }
 
     return updatedTracks.map {
-      DetectedFace(id: $0.id, boundingBox: $0.boundingBox, displayName: "Person \($0.id)")
+      DetectedFace(
+        id: $0.id,
+        boundingBox: $0.boundingBox,
+        displayName: "Person \($0.id)",
+        mouthOpenRatio: $0.lastMouthOpenRatio,
+        mouthMovementScore: $0.mouthMovementScore
+      )
     }
+  }
+
+  private static func mouthOpenRatio(for observation: VNFaceObservation) -> Float? {
+    guard let landmarks = observation.landmarks else { return nil }
+    let points = landmarks.innerLips?.normalizedPoints ?? landmarks.outerLips?.normalizedPoints ?? []
+    guard points.count >= 4 else { return nil }
+    let minX = points.map(\.x).min() ?? 0
+    let maxX = points.map(\.x).max() ?? 0
+    let minY = points.map(\.y).min() ?? 0
+    let maxY = points.map(\.y).max() ?? 0
+    let width = maxX - minX
+    let height = maxY - minY
+    guard width > 0 else { return nil }
+    return Float(max(0, height / width))
+  }
+
+  private static func updatedMouthMovementScore(
+    previousRatio: Float?,
+    newRatio: Float?,
+    previousScore: Float
+  ) -> Float {
+    guard let newRatio, let previousRatio else {
+      return previousScore * 0.80
+    }
+    let instantaneous = min(1, abs(newRatio - previousRatio) * 8)
+    return min(1, max(0, previousScore * 0.65 + instantaneous * 0.35))
   }
 
   private func bestMatchingTrack(for box: CGRect, excluding usedTrackIDs: Set<Int>) -> Track? {
@@ -443,7 +924,7 @@ actor VisionFaceFrameProcessor {
   }
 }
 
-private extension CGImagePropertyOrientation {
+extension CGImagePropertyOrientation {
   init(_ orientation: UIImage.Orientation) {
     switch orientation {
     case .up:
@@ -489,7 +970,7 @@ private extension CGImagePropertyOrientation {
   }
 }
 
-private extension UIImage.Orientation {
+extension UIImage.Orientation {
   var debugName: String {
     switch self {
     case .up:

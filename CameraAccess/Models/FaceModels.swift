@@ -1,10 +1,41 @@
 import CoreGraphics
+import CoreMedia
+import CoreVideo
 import UIKit
+
+struct LiveFrameImageSource {
+  let pixelBuffer: CVPixelBuffer?
+  let sampleBuffer: CMSampleBuffer?
+  let uiImage: UIImage?
+  let width: Int
+  let height: Int
+  let orientation: CGImagePropertyOrientation
+  let mirrored: Bool
+  let timestamp: Date?
+  let frameIndex: UInt64
+  let sourceDescription: String
+}
 
 struct DetectedFace: Identifiable, Equatable {
   let id: Int
   let boundingBox: CGRect
   let displayName: String
+  let mouthOpenRatio: Float?
+  let mouthMovementScore: Float
+
+  init(
+    id: Int,
+    boundingBox: CGRect,
+    displayName: String,
+    mouthOpenRatio: Float? = nil,
+    mouthMovementScore: Float = 0
+  ) {
+    self.id = id
+    self.boundingBox = boundingBox
+    self.displayName = displayName
+    self.mouthOpenRatio = mouthOpenRatio
+    self.mouthMovementScore = mouthMovementScore
+  }
 }
 
 struct Person: Identifiable, Equatable {
@@ -19,6 +50,9 @@ struct TranscriptEntry: Identifiable, Equatable {
   let text: String
   let timestamp: TimeInterval
   let isFinal: Bool
+  var startedAt: Date? = nil
+  var endedAt: Date? = nil
+  var source: String = "AppleSpeech"
 }
 
 struct ProcessedVideoFrame {
@@ -28,6 +62,34 @@ struct ProcessedVideoFrame {
   let faces: [DetectedFace]
   let people: [Person]
   let processedAt: Date
+  let identityCandidates: [IdentityCandidate]
+  let pipelineContext: PipelineContext?
+  let faceDetectionEvent: FaceDetectionEvent?
+  let alignmentFailures: Int
+
+  init(
+    sequence: UInt64,
+    image: UIImage,
+    imageSize: CGSize,
+    faces: [DetectedFace],
+    people: [Person],
+    processedAt: Date,
+    identityCandidates: [IdentityCandidate] = [],
+    pipelineContext: PipelineContext? = nil,
+    faceDetectionEvent: FaceDetectionEvent? = nil,
+    alignmentFailures: Int = 0
+  ) {
+    self.sequence = sequence
+    self.image = image
+    self.imageSize = imageSize
+    self.faces = faces
+    self.people = people
+    self.processedAt = processedAt
+    self.identityCandidates = identityCandidates
+    self.pipelineContext = pipelineContext
+    self.faceDetectionEvent = faceDetectionEvent
+    self.alignmentFailures = alignmentFailures
+  }
 }
 
 enum StreamLifecycleState: String, Equatable {
@@ -51,16 +113,6 @@ enum StreamLifecycleState: String, Equatable {
 
 enum InputMode: String, CaseIterable, Equatable {
   case realGlasses = "REAL GLASSES"
-  case mockDeviceKit = "MOCK DEVICE KIT"
-  case simulation = "SIMULATION"
-
-  static var defaultMode: InputMode {
-    #if targetEnvironment(simulator)
-    return .simulation
-    #else
-    return .realGlasses
-    #endif
-  }
 }
 
 enum DATConfigurationMode: String, Equatable {
