@@ -5,6 +5,12 @@
 
 This project is the Meta Smart Glass Project. Keep work scoped to Swift, Apple frameworks, and the Meta Wearables Device Access Toolkit. Do not mix in unrelated project assumptions.
 
+## DAT Change Policy
+
+- For DAT connection, registration, permission, device selection, session lifecycle, and streaming code, follow Meta's sample code and documented guidelines as closely as possible.
+- Do not add defensive fallbacks, timing workarounds, retries, alternate lifecycle gates, or custom connection logic unless Meta's sample/docs include that behavior or the user explicitly approves the deviation.
+- If a DAT fix requires deviating from Meta's sample/docs, explain the deviation first and keep it isolated from the core DAT path.
+
 ## Architecture
 
 The SDK is organized into three modules:

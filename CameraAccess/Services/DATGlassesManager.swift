@@ -1,4 +1,6 @@
 import Combine
+import CoreMedia
+import CoreVideo
 import MWDATCamera
 import MWDATCore
 import SwiftUI
@@ -13,7 +15,7 @@ final class DATGlassesManager: ObservableObject {
   @Published private(set) var deviceCount = 0
   @Published private(set) var selectedDeviceIDText = "None"
   @Published private(set) var deviceSessionStateText = "None"
-  @Published private(set) var runtimeSessionStateText = "UNKNOWN"
+  @Published private(set) var runtimeSessionStateText = "StateStream only"
   @Published private(set) var streamSessionStateText = "STOPPED"
   @Published private(set) var cameraPermissionStatusText = "Not requested"
   @Published private(set) var connectionStageText = DATConnectionStage.sdkConfigured.rawValue
@@ -21,6 +23,7 @@ final class DATGlassesManager: ObservableObject {
   @Published private(set) var isSimulator = false
   @Published private(set) var isConnecting = false
   @Published private(set) var isWaitingForMetaAIReturn = false
+  @Published private(set) var hasActiveDevice = false
   @Published private(set) var isDeviceSessionReady = false
   @Published private(set) var isStreamRunning = false
   @Published private(set) var isAppActive = true
@@ -53,15 +56,16 @@ final class DATGlassesManager: ObservableObject {
   @Published private(set) var lastFrameTimestampText = "none"
   @Published private(set) var lastFrameErrorText = "none"
 
-  var onFrameImage: ((UIImage) -> Void)?
+  var onFrameImage: (@MainActor (UIImage) -> Void)?
+  var onFrameSampleBuffer: (@MainActor (CMSampleBuffer, UIImage?) -> Void)?
   var onError: ((String) -> Void)?
 
   private var didAttemptConfigure = false
   private var configureCallCount = 0
-  private var allowsMockDeviceKitConfiguration = false
   private var currentRegistrationState: RegistrationState?
   private var registrationTask: Task<Void, Never>?
   private var deviceTask: Task<Void, Never>?
+  private var devicesStreamListenerId = 0
   private var deviceSessionStateTask: Task<Void, Never>?
   private var activeDeviceTask: Task<Void, Never>?
   private var noDevicesTimeoutTask: Task<Void, Never>?
@@ -74,19 +78,30 @@ final class DATGlassesManager: ObservableObject {
   private var isStartingDeviceSession = false
   private var deviceSessionHadStarted = false
   private var deviceSessionStopRequestedByUser = false
+  private var suppressDeviceSessionErrorsUntil: Date?
   private var deviceSessionGenerationId = UUID()
-  private var streamSession: StreamSession?
+  private var lastDeviceSessionStartupErrorDetail: String?
+  private var streamSession: MWDATCamera.Stream?
   private var stateListenerToken: AnyListenerToken?
   private var frameListenerToken: AnyListenerToken?
   private var errorListenerToken: AnyListenerToken?
   private var compatibilityListenerTokens: [DeviceIdentifier: AnyListenerToken] = [:]
   private var linkStateListenerTokens: [DeviceIdentifier: AnyListenerToken] = [:]
-  private var runtimeSessionStateListenerToken: AnyListenerToken?
+  private var deviceSessionStartupErrorListenerToken: AnyListenerToken?
   private var deviceSessionErrorListenerToken: AnyListenerToken?
   private var selectedDeviceIsCompatible = false
   private var firstFrameSeen = false
+  private var totalFramesReceived: UInt64 = 0
+  private var totalFramesConvertedToUIImage: UInt64 = 0
+  private var totalFrameConversionFailures: UInt64 = 0
+  private var streamReachedStreaming = false
   private var didStartRegistrationHandoff = false
   private var didObserveRegisteringDuringCurrentHandoff = false
+  private struct DATFrameExtraction {
+    let frameType: String
+    let image: UIImage?
+    let errorText: String?
+  }
 
   private init() {}
 
@@ -98,15 +113,7 @@ final class DATGlassesManager: ObservableObject {
     ensureConfigured()
   }
 
-  func configureForMockDeviceKit() {
-    allowsMockDeviceKitConfiguration = true
-    if !isConfigured {
-      didAttemptConfigure = false
-    }
-    ensureConfigured(allowSimulatorMock: true)
-  }
-
-  func ensureConfigured(allowSimulatorMock: Bool = false) {
+  func ensureConfigured() {
     guard !didAttemptConfigure else {
       updateStartReadinessReason()
       return
@@ -115,14 +122,11 @@ final class DATGlassesManager: ObservableObject {
 
     #if targetEnvironment(simulator)
     isSimulator = true
-    if !allowSimulatorMock && !allowsMockDeviceKitConfiguration {
-      sdkStatusText = "Simulator: DAT disabled"
-      registrationStateText = "Unavailable on simulator"
-      AppLogger.log(.stream, "Real Meta glasses connection requires a physical iPhone. Use Mock Device Kit on simulator.")
-      updateStartReadinessReason()
-      return
-    }
-    AppLogger.log(.sdk, "DAT configure allowed on simulator for Mock Device Kit")
+    sdkStatusText = "Simulator: DAT disabled"
+    registrationStateText = "Unavailable on simulator"
+    AppLogger.log(.stream, "Real Meta glasses connection requires a physical iPhone.")
+    updateStartReadinessReason()
+    return
     #endif
 
     let mode = detectConfigurationMode()
@@ -157,6 +161,10 @@ final class DATGlassesManager: ObservableObject {
       self.deviceCount = wearables.devices.count
       AppLogger.log(.sdk, "Wearables SDK configured. registrationState=\(wearables.registrationState), initialDeviceCount=\(wearables.devices.count)")
       observeRegistration(wearables: wearables)
+      if wearables.registrationState == .registered {
+        restartDiscovery(reason: "startup-registered")
+        refreshCurrentDevices(reason: "startup-registered")
+      }
       updateStartReadinessReason()
     } catch {
       isConfigured = false
@@ -170,7 +178,7 @@ final class DATGlassesManager: ObservableObject {
   }
 
   func connectRealGlasses() async {
-    AppLogger.log(.registration, "Connect Real Glasses tapped. simulator=\(isSimulator), configured=\(isConfigured), mode=\(configurationModeText), waitingForMetaAIReturn=\(isWaitingForMetaAIReturn)")
+    AppLogger.log(.registration, "Connect my glasses tapped. simulator=\(isSimulator), configured=\(isConfigured), mode=\(configurationModeText), waitingForMetaAIReturn=\(isWaitingForMetaAIReturn)")
     ensureConfigured()
     guard let wearables = wearables, isConfigured, !isSimulator else {
       emitUnavailable()
@@ -179,7 +187,7 @@ final class DATGlassesManager: ObservableObject {
 
     if isWaitingForMetaAIReturn || wearables.registrationState == .registering || currentRegistrationState == .registering {
       let message = "Registration in progress. Complete the Meta AI flow or wait."
-      AppLogger.log(.registration, "Blocked duplicate Connect Real Glasses tap. state=\(wearables.registrationState), waitingForMetaAIReturn=\(isWaitingForMetaAIReturn)")
+      AppLogger.log(.registration, "Blocked duplicate Connect my glasses tap. state=\(wearables.registrationState), waitingForMetaAIReturn=\(isWaitingForMetaAIReturn)")
       lastDATErrorText = message
       onError?(message)
       updateStartReadinessReason()
@@ -192,15 +200,7 @@ final class DATGlassesManager: ObservableObject {
 
     if wearables.registrationState == .registered {
       applyRegistrationState(wearables.registrationState)
-      if isDeviceSessionReady, let activeDeviceSessionDeviceId {
-        let message = "Already connected to Meta glasses device \(activeDeviceSessionDeviceId)."
-        lastDATErrorText = message
-        AppLogger.log(.devices, message)
-        isConnecting = false
-        updateStartReadinessReason()
-        return
-      }
-      AppLogger.log(.registration, "Already registered; continuing to camera permission stage")
+      AppLogger.log(.registration, "Already registered; continuing to device discovery stage")
       await continueAfterRegistration(reason: "already-registered-connect")
       isConnecting = false
       updateStartReadinessReason()
@@ -234,7 +234,7 @@ final class DATGlassesManager: ObservableObject {
         isWaitingForMetaAIReturn = false
         cancelRegistrationHandoffTimeout()
         applyRegistrationState(wearables.registrationState)
-        AppLogger.log(.registration, "Registration already complete; continuing to camera permission stage")
+        AppLogger.log(.registration, "Registration already complete; continuing to device discovery stage")
         await continueAfterRegistration(reason: "already-registered-error")
       } else {
         isWaitingForMetaAIReturn = false
@@ -257,9 +257,13 @@ final class DATGlassesManager: ObservableObject {
     applyRegistrationState(wearables.registrationState)
     AppLogger.log(.registration, "Resume registration state=\(wearables.registrationState)")
 
-    if wearables.registrationState == .registered {
+    if wearables.registrationState == .registered && (isWaitingForMetaAIReturn || didStartRegistrationHandoff) {
       isWaitingForMetaAIReturn = false
       await continueAfterRegistration(reason: "app-active-registered")
+    } else if wearables.registrationState == .registered {
+      restartDiscovery(reason: "app-active-registered")
+      refreshCurrentDevices(reason: "app-active-registered")
+      AppLogger.log(.registration, "App active with registered DAT state; observing active device and waiting for Start streaming before preparing DeviceSession.")
     } else if isWaitingForMetaAIReturn {
       AppLogger.log(.registration, "Returned active but DAT is not registered yet. Waiting for registrationStateStream or callback URL.")
     }
@@ -313,7 +317,21 @@ final class DATGlassesManager: ObservableObject {
       return status == .granted
     } catch {
       cameraPermissionStatusText = "Permission error"
-      emitError("Camera permission failed: \(error.description)")
+      let detail = error.description
+      if detail.localizedCaseInsensitiveContains("No wearable devices")
+        || detail.localizedCaseInsensitiveContains("discovered or registered")
+        || detail.localizedCaseInsensitiveContains("powered off or disconnected")
+        || detail.localizedCaseInsensitiveContains("connection error occurred while communicating with the device") {
+        cameraPermissionStatusText = "Waiting for device discovery"
+        connectionStageText = DATConnectionStage.discoveringDevices.rawValue
+        lastDATErrorText = "Waiting for connected glasses before camera permission can be confirmed. Keep the glasses awake/open and retry Connect."
+        restartDiscovery(reason: "camera-permission-transient-error")
+        refreshCurrentDevices(reason: "camera-permission-transient-error")
+        scheduleNoDevicesTimeout(reason: "camera-permission-transient-error")
+        AppLogger.log(.permissions, "Camera permission temporarily unavailable while waiting for DAT device discovery/connectivity: \(detail)")
+      } else {
+        emitError("Camera permission failed: \(detail)")
+      }
       updateStartReadinessReason()
       return false
     }
@@ -326,49 +344,59 @@ final class DATGlassesManager: ObservableObject {
     }
     guard canStartStream else {
       let reason = startReadinessBlocker() ?? "unknown readiness failure"
-      emitError("Start Real Stream blocked: \(reason)")
+      emitError("Start streaming blocked: \(reason)")
       AppLogger.log(.stream, "Start stream blocked: \(reason)")
       return false
     }
     guard await requestCameraPermission() else { return false }
-    guard let session = deviceSession, session.state == .started else {
-      isDeviceSessionReady = false
-      deviceSessionStateText = deviceSession.map { "\($0.state)" } ?? "None"
-      emitError("Start Real Stream blocked: DeviceSession not started.")
+
+    if let existingStream = streamSession {
+      let stateText = streamSessionStateText.lowercased()
+      if stateText.contains("waiting") || stateText.contains("starting") || stateText.contains("paused") {
+        AppLogger.log(.stream, "Start stream ignored because existing DAT Stream is still \(streamSessionStateText). Waiting for SDK state transition.")
+        return true
+      }
+      if isStreamRunning || stateText.contains("streaming") {
+        AppLogger.log(.stream, "Start stream ignored because existing DAT Stream is already streaming.")
+        return true
+      }
+      AppLogger.log(.stream, "Clearing stopped DAT Stream before creating a new stream. state=\(streamSessionStateText)")
+      clearStreamListeners()
+      streamSession = nil
+      _ = existingStream
+    }
+
+    guard await prepareDeviceSession(reason: "start-stream") else {
+      emitError("Start streaming blocked: DeviceSession did not reach started.")
       updateStartReadinessReason()
       return false
     }
 
-    await stopStream()
     guard let currentSession = deviceSession, currentSession.state == .started else {
-      emitError("DeviceSession was lost before stream start. Connect Real Glasses again.")
+      emitError("DeviceSession was lost before stream start. Connect my glasses again.")
       updateStartReadinessReason()
       return false
     }
 
-    if await startStream(session: currentSession, frameRate: 24) {
-      return true
-    }
-    AppLogger.log(.stream, "Primary stream config .raw/.low/24 failed; retrying .raw/.low/15 once")
-    return await startStream(session: currentSession, frameRate: 15)
+    return await startStream(session: currentSession, resolution: .low, frameRate: 24)
   }
 
-  private func startStream(session: DeviceSession, frameRate: UInt) async -> Bool {
+  private func startStream(session: DeviceSession, resolution: StreamingResolution, frameRate: UInt) async -> Bool {
     guard session.state == .started else {
       emitError("Cannot start stream because DeviceSession state is \(session.state)")
       return false
     }
 
-    let config = StreamSessionConfig(
+    let config = StreamConfiguration(
       videoCodec: VideoCodec.raw,
-      resolution: StreamingResolution.low,
+      resolution: resolution,
       frameRate: frameRate
     )
 
     do {
-      AppLogger.log(.stream, "Calling addStream(config:) codec=raw resolution=low frameRate=\(frameRate) on DeviceSession state=\(session.state)")
+      AppLogger.log(.stream, "Calling addStream(config:) codec=raw resolution=\(resolution) frameRate=\(frameRate) on DeviceSession state=\(session.state) configSource=MetaCameraAccessSample")
       guard let stream = try session.addStream(config: config) else {
-        emitError("Failed to create DAT StreamSession.")
+        emitError("Failed to create DAT Stream.")
         return false
       }
       streamSession = stream
@@ -376,24 +404,30 @@ final class DATGlassesManager: ObservableObject {
       setupStreamListeners(for: stream)
       streamSessionStateText = "STARTING"
       firstFrameSeen = false
-      AppLogger.log(.stream, "Starting real DAT StreamSession with listeners attached")
+      streamReachedStreaming = false
+      AppLogger.log(.stream, "Starting real DAT Stream with listeners attached")
       await stream.start()
+      AppLogger.log(.stream, "Real DAT Stream start requested; waiting for SDK statePublisher to report streaming or stopped")
       return true
     } catch {
-      emitError("Failed to create DAT StreamSession: \(error.localizedDescription)")
+      emitError("Failed to create DAT Stream: \(error.localizedDescription)")
       return false
     }
   }
 
-  func stopStream() async {
+  func stopStream(reason: String = "callerRequested") async {
+    suppressDeviceSessionErrorsAfterUserStopIfNeeded(reason: reason)
     let stream = streamSession
     clearStreamListeners()
     streamSession = nil
     isStreamRunning = false
+    streamReachedStreaming = false
     streamSessionStateText = "STOPPED"
     if let stream {
-      AppLogger.log(.stream, "Stopping real DAT StreamSession")
+      AppLogger.log(.stream, "Stopping real DAT Stream reason=\(reason)")
       await stream.stop()
+    } else {
+      AppLogger.log(.stream, "Stop real DAT Stream requested with no active stream reason=\(reason)")
     }
     updateStartReadinessReason()
   }
@@ -434,8 +468,11 @@ final class DATGlassesManager: ObservableObject {
       applyRegistrationState(wearables.registrationState)
       deviceTask?.cancel()
       deviceTask = nil
+      activeDeviceTask?.cancel()
+      activeDeviceTask = nil
       devicesStreamActive = false
       deviceCount = 0
+      hasActiveDevice = false
       selectedDeviceIDText = "None"
       selectedDeviceCompatibilityText = "unknown"
       selectedDeviceLinkStateText = "unknown"
@@ -447,7 +484,7 @@ final class DATGlassesManager: ObservableObject {
       deviceSessionHadStarted = false
       isDeviceSessionReady = false
       connectionStageText = DATConnectionStage.registrationAvailable.rawValue
-      lastDATErrorText = "DAT app unregistered. Tap Connect Real Glasses to register again."
+      lastDATErrorText = "DAT app unregistered. Tap Connect my glasses to register again."
       updateStartReadinessReason()
     } catch {
       let detail = detailedErrorDescription(error)
@@ -458,7 +495,7 @@ final class DATGlassesManager: ObservableObject {
   func resetDeviceSession() async {
     AppLogger.log(.devices, "Stop/Reset Session requested by user")
     deviceSessionStopRequestedByUser = true
-    await stopStream()
+    await stopStream(reason: "resetDeviceSession")
     if let session = deviceSession {
       AppLogger.log(.devices, "Stopping DeviceSession for reset. deviceId=\(session.deviceId), state=\(session.state)")
       session.stop()
@@ -472,25 +509,60 @@ final class DATGlassesManager: ObservableObject {
     deviceSessionHadStarted = false
     isDeviceSessionReady = false
     deviceSessionStateText = "None"
-    runtimeSessionStateText = SessionState.stopped.description.uppercased()
+    runtimeSessionStateText = "StateStream only"
     deviceSessionGenerationId = UUID()
     deviceSessionStateTask?.cancel()
     deviceSessionStateTask = nil
-    runtimeSessionStateListenerToken = nil
+    deviceSessionStartupErrorListenerToken = nil
     deviceSessionErrorListenerToken = nil
-    lastDATErrorText = "DeviceSession reset. Keep glasses open/worn and connected in Meta AI, then tap Connect Real Glasses."
+    lastDATErrorText = "DeviceSession reset. Keep glasses open/worn and connected in Meta AI, then tap Connect my glasses."
     updateStartReadinessReason()
+  }
+
+  private func releaseLocalDeviceSession(reason: String) {
+    AppLogger.log(.devices, "Releasing local DeviceSession reference reason=\(reason), deviceId=\(activeDeviceSessionDeviceId ?? "nil"), state=\(deviceSession.map { "\($0.state)" } ?? "nil")")
+    deviceSession = nil
+    activeDeviceSessionDeviceId = nil
+    isPreparingDeviceSession = false
+    isStartingDeviceSession = false
+    deviceSessionHadStarted = false
+    isDeviceSessionReady = false
+    deviceSessionStateText = "None"
+    runtimeSessionStateText = "StateStream only"
+    deviceSessionGenerationId = UUID()
+    deviceSessionStateTask?.cancel()
+    deviceSessionStateTask = nil
+    deviceSessionStartupErrorListenerToken = nil
+    deviceSessionErrorListenerToken = nil
   }
 
   @discardableResult
   func prepareDeviceSession(reason: String) async -> Bool {
-    AppLogger.log(.devices, "Preparing DeviceSession reason=\(reason), deviceCount=\(deviceCount), selectedDevice=\(selectedDeviceIDText)")
-    let selectedDeviceId = selectedDeviceIDText == "None" ? deviceSelector?.activeDevice : selectedDeviceIDText
-    if let existing = reusableDeviceSession(for: selectedDeviceId, reason: reason) {
-      return existing.state == .started && isDeviceSessionReady
+    AppLogger.log(.devices, "Preparing DeviceSession reason=\(reason), deviceCount=\(deviceCount), activeDevice=\(deviceSelector?.activeDevice ?? "nil")")
+    if let existing = deviceSession {
+      switch existing.state {
+      case .started:
+        isDeviceSessionReady = true
+        activeDeviceSessionDeviceId = existing.deviceId
+        selectedDeviceIDText = existing.deviceId
+        deviceSessionStateText = "\(existing.state)"
+        AppLogger.log(.devices, "Reusing started DeviceSession deviceId=\(existing.deviceId), reason=\(reason)")
+        updateStartReadinessReason()
+        return true
+      case .starting, .paused, .stopping:
+        isDeviceSessionReady = false
+        deviceSessionStateText = "\(existing.state)"
+        AppLogger.log(.devices, "DeviceSession is \(existing.state); waiting for SDK state transition. deviceId=\(existing.deviceId), reason=\(reason)")
+        updateStartReadinessReason()
+        return false
+      case .idle, .stopped:
+        releaseLocalDeviceSession(reason: "existing-\(existing.state)-before-\(reason)")
+      @unknown default:
+        releaseLocalDeviceSession(reason: "unknown-existing-state-\(existing.state)-before-\(reason)")
+      }
     }
     if isPreparingDeviceSession || isStartingDeviceSession {
-      AppLogger.log(.devices, "Skipping DeviceSession prepare; existing session for selected device is already starting/ready. reason=\(reason), selected=\(selectedDeviceId ?? "nil"), activeSessionDevice=\(activeDeviceSessionDeviceId ?? "nil"), localState=\(deviceSession.map { "\($0.state)" } ?? "nil"), preparing=\(isPreparingDeviceSession), starting=\(isStartingDeviceSession)")
+      AppLogger.log(.devices, "Skipping DeviceSession prepare; session is already starting. reason=\(reason), activeSessionDevice=\(activeDeviceSessionDeviceId ?? "nil"), localState=\(deviceSession.map { "\($0.state)" } ?? "nil"), preparing=\(isPreparingDeviceSession), starting=\(isStartingDeviceSession)")
       updateStartReadinessReason()
       return false
     }
@@ -517,16 +589,8 @@ final class DATGlassesManager: ObservableObject {
   }
 
   private func getDeviceSession(reason: String) async -> DeviceSession? {
-    let selectedDeviceId = selectedDeviceIDText == "None" ? deviceSelector?.activeDevice : selectedDeviceIDText
-    if let existing = reusableDeviceSession(for: selectedDeviceId, reason: reason) {
+    if let existing = deviceSession, existing.state == .started {
       return existing
-    }
-    if deviceSession?.state == .stopped, !isStartingDeviceSession, !isPreparingDeviceSession, deviceSessionHadStarted {
-      AppLogger.log(.devices, "Clearing stopped DeviceSession after previously started session. deviceId=\(activeDeviceSessionDeviceId ?? "nil"), reason=\(reason)")
-      deviceSession = nil
-      activeDeviceSessionDeviceId = nil
-      deviceSessionHadStarted = false
-      isDeviceSessionReady = false
     }
     guard let wearables, let deviceSelector, deviceSession == nil else {
       AppLogger.log(.devices, "DeviceSession not created: wearables=\(wearables != nil), selector=\(deviceSelector != nil), existingState=\(deviceSession.map { "\($0.state)" } ?? "nil")")
@@ -543,15 +607,28 @@ final class DATGlassesManager: ObservableObject {
       activeDeviceSessionDeviceId = session.deviceId
       deviceSessionHadStarted = false
       deviceSessionStopRequestedByUser = false
+      lastDeviceSessionStartupErrorDetail = nil
       selectedDeviceIDText = session.deviceId
-      await observeRuntimeSessionState(for: session.deviceId)
+      runtimeSessionStateText = "StateStream only"
+      AppLogger.log(.devices, "Using DeviceSession.stateStream() and errorPublisher for startup lifecycle before camera streaming. deviceId=\(session.deviceId)")
       let stateStream = session.stateStream()
+      deviceSessionStartupErrorListenerToken = session.errorPublisher.listen { [weak self] error in
+        Task { @MainActor in
+          guard let self else { return }
+          let detail = self.detailedErrorDescription(error)
+          self.lastDeviceSessionStartupErrorDetail = detail
+          self.lastDATErrorText = "DeviceSession startup error: \(detail)"
+          AppLogger.log(.devices, "DeviceSession startup error observed before ready. deviceId=\(session.deviceId), detail=\(detail)")
+          self.updateStartReadinessReason()
+        }
+      }
       isStartingDeviceSession = true
       try session.start()
       isPreparingDeviceSession = false
       deviceSessionStateText = "\(session.state)"
       AppLogger.log(.devices, "DeviceSession.start() called for deviceId=\(session.deviceId), initialState=\(session.state)")
 
+      var observedStartupProgress = session.state == .starting
       for await state in stateStream {
         guard generation == deviceSessionGenerationId else {
           AppLogger.log(.devices, "Ignoring stale DeviceSession state \(state), generation=\(generation)")
@@ -560,29 +637,46 @@ final class DATGlassesManager: ObservableObject {
         deviceSessionStateText = "\(state)"
         isDeviceSessionReady = state == .started
         AppLogger.log(.devices, "DeviceSession state changed: \(state)")
+        if state == .starting {
+          observedStartupProgress = true
+        }
         if state == .started {
           isStartingDeviceSession = false
           isPreparingDeviceSession = false
           deviceSessionHadStarted = true
+          lastDeviceSessionStartupErrorDetail = nil
+          deviceSessionStartupErrorListenerToken = nil
           activeDeviceSessionDeviceId = session.deviceId
-          if runtimeSessionStateText.lowercased().contains("stopped") {
-            runtimeSessionStateText = "STARTED"
-          }
           observeDeviceSession(session)
           return session
         }
         if state == .stopped {
-          if isStartingDeviceSession || !deviceSessionHadStarted {
+          if !observedStartupProgress && !deviceSessionHadStarted {
             AppLogger.log(.devices, "Ignoring initial DeviceSession stopped during startup. deviceId=\(session.deviceId), starting=\(isStartingDeviceSession), hadStarted=\(deviceSessionHadStarted)")
             continue
           }
-          AppLogger.log(.devices, "DeviceSession stopped after running. deviceId=\(session.deviceId), userRequested=\(deviceSessionStopRequestedByUser)")
+          let hadStartedBeforeStop = deviceSessionHadStarted
+          let message = hadStartedBeforeStop
+            ? "DeviceSession stopped after running. deviceId=\(session.deviceId), userRequested=\(deviceSessionStopRequestedByUser)"
+            : "DeviceSession startup failed after start attempt. deviceId=\(session.deviceId), lastState=stopped"
+          AppLogger.log(.devices, message)
+          if let startupError = lastDeviceSessionStartupErrorDetail {
+            AppLogger.log(.devices, "DeviceSession startup failed with SDK error detail: \(startupError)")
+          }
           isStartingDeviceSession = false
           isPreparingDeviceSession = false
           deviceSession = nil
+          deviceSessionStartupErrorListenerToken = nil
           activeDeviceSessionDeviceId = nil
           deviceSessionHadStarted = false
           isDeviceSessionReady = false
+          if !hadStartedBeforeStop {
+            if let startupError = lastDeviceSessionStartupErrorDetail {
+              lastDATErrorText = "DeviceSession startup stopped before becoming ready: \(startupError)"
+            } else {
+              lastDATErrorText = "DeviceSession startup stopped before becoming ready. Keep glasses open/worn, confirm connected in Meta AI, then tap Connect my glasses again."
+            }
+          }
           updateStartReadinessReason()
           return nil
         }
@@ -591,9 +685,11 @@ final class DATGlassesManager: ObservableObject {
       isPreparingDeviceSession = false
       isStartingDeviceSession = false
       isDeviceSessionReady = false
+      deviceSessionStartupErrorListenerToken = nil
       if error == .sessionAlreadyExists {
-        AppLogger.log(.devices, "Duplicate DeviceSession creation blocked by SDK for selected device=\(selectedDeviceId ?? "nil"). Treating as non-fatal while existing SDK session settles.")
-        lastDATErrorText = "DeviceSession already exists for this device. Waiting for existing session state; use Stop/Reset if it does not become ready."
+        AppLogger.log(.devices, "Duplicate DeviceSession creation blocked by SDK. Treating as non-fatal while existing SDK session settles.")
+        refreshCurrentDevices(reason: "session-already-exists-\(reason)")
+        lastDATErrorText = "Previous DeviceSession is still settling inside the SDK. Wait for the active device to return, then tap Start streaming again."
       } else {
         deviceSession = nil
         activeDeviceSessionDeviceId = nil
@@ -605,57 +701,6 @@ final class DATGlassesManager: ObservableObject {
     return nil
   }
 
-  private func reusableDeviceSession(for selectedDeviceId: DeviceIdentifier?, reason: String) -> DeviceSession? {
-    guard let session = deviceSession else { return nil }
-    let sameDevice = selectedDeviceId == nil || selectedDeviceId == "None" || session.deviceId == selectedDeviceId
-    guard sameDevice else {
-      AppLogger.log(.devices, "Existing DeviceSession is for a different device. existing=\(session.deviceId), selected=\(selectedDeviceId ?? "nil"), reason=\(reason)")
-      return nil
-    }
-
-    switch session.state {
-    case .starting:
-      isStartingDeviceSession = true
-      isDeviceSessionReady = false
-      deviceSessionStateText = "\(session.state)"
-      AppLogger.log(.devices, "Skipping DeviceSession prepare; existing session for selected device is already starting/ready. reason=\(reason), deviceId=\(session.deviceId), state=\(session.state)")
-      return session
-    case .started:
-      isStartingDeviceSession = false
-      isPreparingDeviceSession = false
-      isDeviceSessionReady = true
-      deviceSessionHadStarted = true
-      activeDeviceSessionDeviceId = session.deviceId
-      deviceSessionStateText = "\(session.state)"
-      AppLogger.log(.devices, "Reusing ready DeviceSession deviceId=\(session.deviceId), reason=\(reason)")
-      return session
-    case .paused:
-      isStartingDeviceSession = false
-      isPreparingDeviceSession = false
-      isDeviceSessionReady = false
-      deviceSessionHadStarted = true
-      activeDeviceSessionDeviceId = session.deviceId
-      deviceSessionStateText = "\(session.state)"
-      AppLogger.log(.devices, "Skipping DeviceSession prepare; existing session for selected device is paused. Waiting for resume or stopped. reason=\(reason), deviceId=\(session.deviceId)")
-      return session
-    case .idle:
-      AppLogger.log(.devices, "Reusing idle DeviceSession shell for selected device if start is requested. reason=\(reason), deviceId=\(session.deviceId)")
-      return nil
-    case .stopping:
-      AppLogger.log(.devices, "Skipping DeviceSession prepare; existing session is stopping. reason=\(reason), deviceId=\(session.deviceId)")
-      return session
-    case .stopped:
-      if isStartingDeviceSession || isPreparingDeviceSession || !deviceSessionHadStarted {
-        AppLogger.log(.devices, "Skipping DeviceSession prepare; existing session reported initial stopped during startup. reason=\(reason), deviceId=\(session.deviceId), preparing=\(isPreparingDeviceSession), starting=\(isStartingDeviceSession), hadStarted=\(deviceSessionHadStarted)")
-        return session
-      }
-      return nil
-    @unknown default:
-      AppLogger.log(.devices, "Existing DeviceSession has unknown state \(session.state). reason=\(reason)")
-      return session
-    }
-  }
-
   private func observeRegistration(wearables: WearablesInterface) {
     registrationTask?.cancel()
     registrationTask = Task { [weak self] in
@@ -664,10 +709,14 @@ final class DATGlassesManager: ObservableObject {
         self.applyRegistrationState(state)
         AppLogger.log(.registration, "Registration state changed: \(state)")
         self.updateStartReadinessReason()
-        if state == .registered {
+        if state == .registered && (self.isWaitingForMetaAIReturn || self.didStartRegistrationHandoff) {
           self.isWaitingForMetaAIReturn = false
           self.cancelRegistrationHandoffTimeout()
           await self.continueAfterRegistration(reason: "registration-state-registered")
+        } else if state == .registered {
+          self.restartDiscovery(reason: "registration-state-registered-observed")
+          self.refreshCurrentDevices(reason: "registration-state-registered-observed")
+          AppLogger.log(.registration, "Registration stream is registered; observing active device and waiting for Start streaming before preparing DeviceSession.")
         } else if state == .available,
                   self.isWaitingForMetaAIReturn,
                   self.didStartRegistrationHandoff,
@@ -693,28 +742,32 @@ final class DATGlassesManager: ObservableObject {
       return
     }
 
-    guard await requestCameraPermission() else {
-      AppLogger.log(.permissions, "Camera permission not granted; stopping staged flow reason=\(reason), status=\(cameraPermissionStatusText)")
-      updateStartReadinessReason()
-      return
-    }
-
-    restartDiscovery(reason: "post-permission-\(reason)")
-    refreshCurrentDevices(reason: "post-permission-\(reason)")
-    scheduleNoDevicesTimeout(reason: "post-permission-\(reason)")
-    _ = await prepareDeviceSession(reason: "post-permission-\(reason)")
+    restartDiscovery(reason: "registered-\(reason)")
+    refreshCurrentDevices(reason: "registered-\(reason)")
+    scheduleNoDevicesTimeout(reason: "registered-\(reason)")
+    connectionStageText = DATConnectionStage.streamReady.rawValue
+    updateStartReadinessReason()
   }
 
-  private func observeDevices(wearables: WearablesInterface) {
+  private func observeDevices(wearables: WearablesInterface, reason: String) {
+    let canceledPrevious = deviceTask != nil && deviceTask?.isCancelled == false
     deviceTask?.cancel()
+    devicesStreamListenerId += 1
+    let listenerId = devicesStreamListenerId
     devicesStreamActive = true
     connectionStageText = DATConnectionStage.discoveringDevices.rawValue
-    AppLogger.log(.devices, "devicesStream started")
+    AppLogger.log(.devices, "devicesStream start listenerId=\(listenerId) reason=\(reason) canceledPrevious=\(canceledPrevious)")
     updateStartReadinessReason()
     deviceTask = Task { [weak self] in
       for await devices in wearables.devicesStream() {
         guard let self else { return }
+        guard !Task.isCancelled else { return }
         self.applyDevices(devices, reason: "devicesStream")
+      }
+      guard let self else { return }
+      if self.devicesStreamListenerId == listenerId {
+        self.devicesStreamActive = false
+        AppLogger.log(.devices, "devicesStream ended listenerId=\(listenerId)")
       }
     }
   }
@@ -725,14 +778,20 @@ final class DATGlassesManager: ObservableObject {
     activeDeviceTask = Task { [weak self] in
       for await device in deviceSelector.activeDeviceStream() {
         guard let self else { return }
+        self.hasActiveDevice = device != nil
         if let device {
           self.selectedDeviceIDText = "\(device)"
           AppLogger.log(.devices, "Active DAT device selected: \(device)")
           self.refreshSelectedDeviceDiagnostics(deviceId: device)
         } else {
           self.selectedDeviceIDText = "None"
-          self.selectedDeviceCompatibilityText = "unknown"
-          self.selectedDeviceLinkStateText = "unknown"
+          if self.deviceCount > 0 {
+            self.selectedDeviceCompatibilityText = "AutoDeviceSelector pending"
+            self.selectedDeviceLinkStateText = "AutoDeviceSelector pending"
+          } else {
+            self.selectedDeviceCompatibilityText = "unknown"
+            self.selectedDeviceLinkStateText = "unknown"
+          }
           self.selectedDeviceIsCompatible = false
           AppLogger.log(.devices, "No active DAT device selected")
         }
@@ -754,9 +813,6 @@ final class DATGlassesManager: ObservableObject {
           self.isPreparingDeviceSession = false
           self.deviceSessionHadStarted = true
           self.activeDeviceSessionDeviceId = session.deviceId
-          if self.runtimeSessionStateText.lowercased().contains("stopped") {
-            self.runtimeSessionStateText = "STARTED"
-          }
         }
         self.updateStartReadinessReason()
         if state == .stopped {
@@ -764,100 +820,57 @@ final class DATGlassesManager: ObservableObject {
             AppLogger.log(.devices, "Ignoring initial observed DeviceSession stopped before startup completed. deviceId=\(session.deviceId), starting=\(self.isStartingDeviceSession), hadStarted=\(self.deviceSessionHadStarted)")
             continue
           }
-          AppLogger.log(.devices, "Observed DeviceSession stopped after running. deviceId=\(session.deviceId), userRequested=\(self.deviceSessionStopRequestedByUser)")
-          self.deviceSession = nil
-          self.activeDeviceSessionDeviceId = nil
-          self.isStartingDeviceSession = false
-          self.isPreparingDeviceSession = false
-          self.deviceSessionHadStarted = false
-          self.isDeviceSessionReady = false
+          let wasUserRequested = self.deviceSessionStopRequestedByUser
+          AppLogger.log(.devices, "Observed DeviceSession stopped after running. deviceId=\(session.deviceId), userRequested=\(wasUserRequested)")
+          self.releaseLocalDeviceSession(reason: "observed-stopped-after-running")
+          self.refreshCurrentDevices(reason: "device-session-stopped-after-running")
           self.updateStartReadinessReason()
+          if !wasUserRequested {
+            AppLogger.log(
+              .devices,
+              "DeviceSession stopped by SDK/device. Released local session and refreshed discovery; waiting for user to start again after AutoDeviceSelector reports an active device. deviceId=\(session.deviceId)"
+            )
+          }
           return
         }
       }
     }
     deviceSessionErrorListenerToken = session.errorPublisher.listen { [weak self] error in
       Task { @MainActor in
-        self?.emitError("DeviceSession error: \(error.localizedDescription)")
-        self?.updateStartReadinessReason()
-      }
-    }
-  }
-
-  private func observeRuntimeSessionState(for deviceId: DeviceIdentifier) async {
-    guard let wearables else { return }
-    runtimeSessionStateListenerToken = await wearables.addDeviceSessionStateListener(forDeviceId: deviceId) { [weak self] state in
-      Task { @MainActor in
-        self?.handleRuntimeSessionState(state, deviceId: deviceId)
-      }
-    }
-    AppLogger.log(.devices, "DeviceSession runtime state listener attached for deviceId=\(deviceId)")
-  }
-
-  private func handleRuntimeSessionState(_ state: SessionState, deviceId: DeviceIdentifier) {
-    runtimeSessionStateText = state.description.uppercased()
-    AppLogger.log(.devices, "DAT runtime DeviceSession state for \(deviceId): \(state.description)")
-    switch state {
-    case .running:
-      deviceSessionHadStarted = true
-      isStartingDeviceSession = false
-      isPreparingDeviceSession = false
-      isDeviceSessionReady = deviceSession?.state == .started
-      if isDeviceSessionReady {
-        AppLogger.log(.devices, "DAT runtime session RUNNING; Start Stream may proceed")
-      }
-    case .paused:
-      isDeviceSessionReady = false
-      AppLogger.log(.devices, "DAT runtime session PAUSED; holding session and not restarting")
-    case .stopped:
-      if isStartingDeviceSession || isPreparingDeviceSession || !deviceSessionHadStarted {
-        isDeviceSessionReady = false
-        AppLogger.log(.devices, "DAT runtime session STOPPED before startup completed; preserving local DeviceSession. deviceId=\(deviceId), preparing=\(isPreparingDeviceSession), starting=\(isStartingDeviceSession), hadStarted=\(deviceSessionHadStarted)")
-        updateStartReadinessReason()
-        return
-      }
-      isDeviceSessionReady = false
-      if isStreamRunning {
-        Task {
-          await self.stopStream()
+        guard let self else { return }
+        let message = "DeviceSession error: \(error.localizedDescription)"
+        guard self.deviceSession != nil,
+              self.activeDeviceSessionDeviceId == session.deviceId else {
+          AppLogger.log(.devices, "Ignoring stale \(message) from released DeviceSession deviceId=\(session.deviceId)")
+          self.updateStartReadinessReason()
+          return
         }
+        if self.shouldSuppressDeviceSessionErrorForUserStop() {
+          AppLogger.log(.devices, "Suppressed user-facing \(message) during user-initiated stop")
+          self.updateStartReadinessReason()
+          return
+        }
+        self.emitError(message)
+        self.updateStartReadinessReason()
       }
-      deviceSession = nil
-      activeDeviceSessionDeviceId = nil
-      isStartingDeviceSession = false
-      isPreparingDeviceSession = false
-      deviceSessionHadStarted = false
-      deviceSessionStateText = "stopped"
-      runtimeSessionStateListenerToken = nil
-      deviceSessionErrorListenerToken = nil
-      AppLogger.log(.devices, "DAT runtime session STOPPED after running; released DeviceSession and stream resources. userRequested=\(deviceSessionStopRequestedByUser)")
-    case .waitingForDevice:
-      isDeviceSessionReady = false
-      AppLogger.log(.devices, "DAT runtime session waitingForDevice; check glasses power, hinge state, range, and Developer Mode")
-    case .unknown:
-      isDeviceSessionReady = false
-      AppLogger.log(.devices, "DAT runtime session unknown")
-    @unknown default:
-      isDeviceSessionReady = false
-      AppLogger.log(.devices, "DAT runtime session unknown future state: \(state.description)")
     }
-    updateStartReadinessReason()
   }
 
-  private func setupStreamListeners(for stream: StreamSession) {
+  private func setupStreamListeners(for stream: MWDATCamera.Stream) {
     stateListenerToken = stream.statePublisher.listen { [weak self] state in
       Task { @MainActor in
         self?.handleStreamState(state)
       }
     }
     frameListenerToken = stream.videoFramePublisher.listen { [weak self] frame in
+      let extraction = Self.extractVideoFrame(frame)
       Task { @MainActor in
-        self?.handleVideoFrame(frame)
+        self?.handleVideoFrame(extraction)
       }
     }
     errorListenerToken = stream.errorPublisher.listen { [weak self] error in
       Task { @MainActor in
-        self?.emitError(self?.formatStreamError(error) ?? "\(error)")
+        self?.handleStreamError(error)
       }
     }
   }
@@ -868,39 +881,66 @@ final class DATGlassesManager: ObservableObject {
     errorListenerToken = nil
   }
 
-  private func handleVideoFrame(_ frame: VideoFrame) {
-    framesReceived += 1
-    let frameNumber = framesReceived
+  nonisolated private static func extractVideoFrame(_ frame: VideoFrame) -> DATFrameExtraction {
     let frameType = String(describing: type(of: frame))
-    let timestamp = Self.timestampText()
-    lastFrameTimestampText = timestamp
-
     guard let image = frame.makeUIImage() else {
-      frameConversionFailures += 1
-      lastFrameErrorText = "makeUIImage returned nil for \(frameType)"
+      return DATFrameExtraction(
+        frameType: frameType,
+        image: nil,
+        errorText: "makeUIImage returned nil for \(frameType)"
+      )
+    }
+    return DATFrameExtraction(
+      frameType: frameType,
+      image: image,
+      errorText: nil
+    )
+  }
+
+  private func handleVideoFrame(_ extraction: DATFrameExtraction) {
+    totalFramesReceived += 1
+    let frameNumber = totalFramesReceived
+    let frameType = extraction.frameType
+    let timestamp = Self.timestampText()
+    let shouldPublishDiagnostics = frameNumber <= 3 || frameNumber % 30 == 0
+    if shouldPublishDiagnostics {
+      framesReceived = totalFramesReceived
+      lastFrameTimestampText = timestamp
+    }
+
+    guard let image = extraction.image else {
+      totalFrameConversionFailures += 1
+      if shouldPublishDiagnostics {
+        frameConversionFailures = totalFrameConversionFailures
+      }
+      lastFrameErrorText = extraction.errorText ?? "makeUIImage returned nil for \(frameType)"
       lastDATErrorText = "DAT video frame could not be converted for display"
       logFrameDiagnostic(
         frameNumber: frameNumber,
         frameType: frameType,
         timestamp: timestamp,
         image: nil,
-        sentToPreview: false,
-        sentToVision: false,
+        selectedForApp: false,
         error: lastFrameErrorText
       )
       updateStartReadinessReason()
       return
     }
 
-    framesConvertedToUIImage += 1
+    totalFramesConvertedToUIImage += 1
     let pixelWidth = Int(image.size.width * image.scale)
     let pixelHeight = Int(image.size.height * image.scale)
-    lastFrameWidthText = "\(pixelWidth)"
-    lastFrameHeightText = "\(pixelHeight)"
-    lastFrameErrorText = "none"
+    if shouldPublishDiagnostics {
+      framesConvertedToUIImage = totalFramesConvertedToUIImage
+      lastFrameWidthText = "\(pixelWidth)"
+      lastFrameHeightText = "\(pixelHeight)"
+      lastFrameErrorText = "none"
+    }
 
     if !firstFrameSeen {
       firstFrameSeen = true
+      framesReceived = totalFramesReceived
+      framesConvertedToUIImage = totalFramesConvertedToUIImage
       firstFrameTimestampText = timestamp
       AppLogger.log(.frames, "First DAT video frame received at \(timestamp)")
     }
@@ -910,10 +950,15 @@ final class DATGlassesManager: ObservableObject {
       frameType: frameType,
       timestamp: timestamp,
       image: image,
-      sentToPreview: true,
-      sentToVision: true,
+      selectedForApp: true,
       error: nil
     )
+    if frameNumber <= 5 || frameNumber % 120 == 0 {
+      AppLogger.log(
+        .frameSource,
+        "frame=\(frameNumber) hasPixelBuffer=false hasUIImage=true preferred=UIImage reason=copiedInsideDATCallback width=\(pixelWidth) height=\(pixelHeight) orientation=up mirrored=false"
+      )
+    }
     onFrameImage?(image)
   }
 
@@ -922,8 +967,7 @@ final class DATGlassesManager: ObservableObject {
     frameType: String,
     timestamp: String,
     image: UIImage?,
-    sentToPreview: Bool,
-    sentToVision: Bool,
+    selectedForApp: Bool,
     error: String?
   ) {
     guard frameNumber <= 20 else { return }
@@ -932,17 +976,20 @@ final class DATGlassesManager: ObservableObject {
       let pixelHeight = Int(image.size.height * image.scale)
       AppLogger.log(
         .frames,
-        "Video frame received count=\(frameNumber), type=\(frameType), makeUIImage=succeeded, width=\(pixelWidth), height=\(pixelHeight), timestamp=\(timestamp), sentToPreview=\(sentToPreview), sentToVision=\(sentToVision)"
+        "Video frame received count=\(frameNumber), type=\(frameType), makeUIImage=succeeded, width=\(pixelWidth), height=\(pixelHeight), timestamp=\(timestamp), selectedForApp=\(selectedForApp), selectedForVision=deferredToViewModel, visionEnqueued=deferredToViewModel"
       )
     } else {
       AppLogger.log(
         .frames,
-        "Video frame received count=\(frameNumber), type=\(frameType), makeUIImage=failed, timestamp=\(timestamp), sentToPreview=\(sentToPreview), sentToVision=\(sentToVision), error=\(error ?? "unknown")"
+        "Video frame received count=\(frameNumber), type=\(frameType), makeUIImage=failed, timestamp=\(timestamp), selectedForApp=\(selectedForApp), selectedForVision=false, visionEnqueued=false, visionSkippedReason=makeUIImageFailed, error=\(error ?? "unknown")"
       )
     }
   }
 
   private func resetFrameDiagnostics() {
+    totalFramesReceived = 0
+    totalFramesConvertedToUIImage = 0
+    totalFrameConversionFailures = 0
     framesReceived = 0
     framesConvertedToUIImage = 0
     frameConversionFailures = 0
@@ -952,16 +999,91 @@ final class DATGlassesManager: ObservableObject {
     lastFrameErrorText = "none"
   }
 
-  private func handleStreamState(_ state: StreamSessionState) {
+  private func handleStreamState(_ state: StreamState) {
     streamSessionStateText = "\(state)"
     isStreamRunning = state == .streaming
     if state == .streaming {
+      streamReachedStreaming = true
       connectionStageText = DATConnectionStage.streaming.rawValue
     } else if state == .stopped && connectionStageText == DATConnectionStage.streaming.rawValue {
       connectionStageText = DATConnectionStage.streamReady.rawValue
     }
-    AppLogger.log(.stream, "StreamSession state: \(state)")
+    AppLogger.log(.stream, "Stream state: \(state)")
+    if state == .stopped, streamSession != nil, !streamReachedStreaming {
+      releaseStreamAfterPreStreamingFailure(reason: "streamStateStoppedBeforeStreaming")
+      return
+    }
+    if state == .stopped, streamReachedStreaming, framesConvertedToUIImage == 0 {
+      lastDATErrorText = "DAT stream reached streaming but delivered no video frames before stopping. This matches FrameStallDetectorServiceError; keep the glasses awake/worn and retry Start streaming."
+      AppLogger.log(.stream, lastDATErrorText)
+    }
     updateStartReadinessReason()
+  }
+
+  private func handleStreamError(_ error: StreamError) {
+    let message = formatStreamError(error)
+    emitError(message)
+    if streamSession != nil, !streamReachedStreaming {
+      releaseStreamAfterPreStreamingFailure(reason: "streamErrorBeforeStreaming error=\(error)")
+    }
+  }
+
+  private func releaseStreamAfterPreStreamingFailure(reason: String) {
+    let previousError = lastDATErrorText
+    let streamState = streamSessionStateText
+    let session = deviceSession
+    let deviceId = session?.deviceId ?? activeDeviceSessionDeviceId ?? "nil"
+    clearStreamListeners()
+    streamSession = nil
+    isStreamRunning = false
+    streamReachedStreaming = false
+    streamSessionStateText = "STOPPED"
+    if let session {
+      deviceSessionStateText = "\(session.state)"
+      activeDeviceSessionDeviceId = session.deviceId
+      isDeviceSessionReady = session.state == .started
+      deviceSessionHadStarted = deviceSessionHadStarted || session.state == .started
+      AppLogger.log(.devices, "DAT stream failed before streaming; keeping DeviceSession for SDK-managed retry. deviceId=\(session.deviceId), state=\(session.state), streamState=\(streamState), reason=\(reason)")
+    } else {
+      isDeviceSessionReady = false
+      AppLogger.log(.devices, "DAT stream failed before streaming with no local DeviceSession. deviceId=\(deviceId), streamState=\(streamState), reason=\(reason)")
+    }
+    isStartingDeviceSession = false
+    isPreparingDeviceSession = false
+    if previousError == "None" || previousError.isEmpty {
+      lastDATErrorText = "DAT stream failed before video reached streaming. Retry Start streaming; the current DeviceSession is being kept if the SDK still reports it started."
+    } else {
+      lastDATErrorText = "\(previousError) Retry Start streaming; the current DeviceSession is being kept if the SDK still reports it started."
+    }
+    updateStartReadinessReason()
+  }
+
+  private func suppressDeviceSessionErrorsAfterUserStopIfNeeded(reason: String) {
+    guard isUserInitiatedStopReason(reason) else { return }
+    suppressDeviceSessionErrorsUntil = Date().addingTimeInterval(8)
+    AppLogger.log(.devices, "Suppressing user-facing DeviceSession errors after user stop reason=\(reason)")
+  }
+
+  private func shouldSuppressDeviceSessionErrorForUserStop() -> Bool {
+    let streamIsStopped = streamSession == nil
+      && !isStreamRunning
+      && streamSessionStateText.lowercased().contains("stopped")
+    if deviceSessionStopRequestedByUser {
+      return streamIsStopped
+    }
+    guard let suppressDeviceSessionErrorsUntil else { return false }
+    if streamIsStopped, Date() <= suppressDeviceSessionErrorsUntil {
+      return true
+    }
+    self.suppressDeviceSessionErrorsUntil = nil
+    return false
+  }
+
+  private func isUserInitiatedStopReason(_ reason: String) -> Bool {
+    reason == "stopButton"
+      || reason == "callerRequested"
+      || reason == "streamView.onDisappear"
+      || reason == "resetDeviceSession"
   }
 
   private func emitUnavailable() {
@@ -988,6 +1110,7 @@ final class DATGlassesManager: ObservableObject {
     let clientToken = stringValue(mwdat?["ClientToken"])
     let hasClientToken = !clientToken.isEmpty
     let hasTeamID = !stringValue(mwdat?["TeamID"]).isEmpty
+    let damEnabled = (mwdat?["DAMEnabled"] as? Bool) == true
     let mwdatKeys = mwdat?.keys.sorted().joined(separator: ",") ?? "none"
     let urlTypeSummaries = bundleURLTypeSummaries()
     let schemes = bundleURLSchemes()
@@ -995,7 +1118,7 @@ final class DATGlassesManager: ObservableObject {
     let associatedDomains = associatedDomainsEntitlement()
     let devModeFlag = UserDefaults.standard.bool(forKey: "com.meta.wearable.dat.isDevMode")
 
-    runtimeBundleConfigurationText = "bundleID=\(bundleID) | hasMWDAT=\(mwdat != nil ? "yes" : "no") | keys=\(mwdatKeys) | MetaAppID=\(metaAppID.isEmpty ? "nil" : metaAppID) | AppLinkURLScheme=\(appLinkURLScheme.isEmpty ? "nil" : appLinkURLScheme) | ClientToken=\(hasClientToken ? "present length=\(clientToken.count)" : "absent") | TeamID=\(hasTeamID ? "present" : "absent")"
+    runtimeBundleConfigurationText = "bundleID=\(bundleID) | hasMWDAT=\(mwdat != nil ? "yes" : "no") | keys=\(mwdatKeys) | MetaAppID=\(metaAppID.isEmpty ? "nil" : metaAppID) | AppLinkURLScheme=\(appLinkURLScheme.isEmpty ? "nil" : appLinkURLScheme) | ClientToken=\(hasClientToken ? "present length=\(clientToken.count)" : "absent") | TeamID=\(hasTeamID ? "present" : "absent") | DAMEnabled=\(damEnabled)"
     runtimeURLTypesText = urlTypeSummaries.isEmpty ? "none" : urlTypeSummaries.joined(separator: " ; ")
     runtimeCameraAccessSchemeText = hasCameraAccessScheme ? "registered" : "missing"
     runtimeAssociatedDomainsText = associatedDomains
@@ -1057,7 +1180,8 @@ final class DATGlassesManager: ObservableObject {
     let clientToken = mwdat?["ClientToken"] as? String ?? ""
     let hasClientToken = !clientToken.isEmpty
     let teamID = mwdat?["TeamID"] as? String ?? "Missing TeamID"
-    AppLogger.log(.sdk, "DAT config inputs: bundleID=\(bundleID), mode=\(mode.rawValue), hasMWDAT=\(mwdat != nil), appLinkURLScheme=\(appLinkURLScheme), metaAppID=\(metaAppID.isEmpty ? "missing" : metaAppID), teamID=\(teamID), hasMetaAppID=\(hasMetaAppID), hasClientToken=\(hasClientToken), clientTokenLength=\(clientToken.count)")
+    let damEnabled = (mwdat?["DAMEnabled"] as? Bool) == true
+    AppLogger.log(.sdk, "DAT config inputs: bundleID=\(bundleID), mode=\(mode.rawValue), hasMWDAT=\(mwdat != nil), appLinkURLScheme=\(appLinkURLScheme), metaAppID=\(metaAppID.isEmpty ? "missing" : metaAppID), teamID=\(teamID), hasMetaAppID=\(hasMetaAppID), hasClientToken=\(hasClientToken), clientTokenLength=\(clientToken.count), damEnabled=\(damEnabled)")
   }
 
   private func bundleURLSchemes() -> [String] {
@@ -1119,8 +1243,15 @@ final class DATGlassesManager: ObservableObject {
 
   private func restartDiscovery(reason: String) {
     guard let wearables else { return }
+    if devicesStreamActive, let deviceTask, !deviceTask.isCancelled {
+      AppLogger.log(.devices, "devicesStream already active; skipping restart reason=\(reason) listenerId=\(devicesStreamListenerId)")
+      if activeDeviceTask == nil || activeDeviceTask?.isCancelled == true {
+        observeActiveDevice()
+      }
+      return
+    }
     AppLogger.log(.devices, "Restarting device discovery stream, reason=\(reason)")
-    observeDevices(wearables: wearables)
+    observeDevices(wearables: wearables, reason: reason)
     observeActiveDevice()
   }
 
@@ -1132,7 +1263,6 @@ final class DATGlassesManager: ObservableObject {
   private func applyDevices(_ devices: [DeviceIdentifier], reason: String) {
     let nowText = Self.timestampText()
     deviceCount = devices.count
-    selectedDeviceIDText = devices.first.map { "\($0)" } ?? "None"
     lastDevicesEventTimestampText = nowText
     if reason == "devicesStream", firstDevicesStreamEventTimestampText == "never" {
       firstDevicesStreamEventTimestampText = nowText
@@ -1142,15 +1272,29 @@ final class DATGlassesManager: ObservableObject {
     monitorCompatibility(for: devices)
     if devices.isEmpty {
       isDeviceSessionReady = false
+      hasActiveDevice = false
       deviceSessionStateText = deviceSession.map { "\($0.state)" } ?? "None"
+      selectedDeviceIDText = "None"
       selectedDeviceCompatibilityText = "unknown"
       selectedDeviceLinkStateText = "unknown"
       selectedDeviceIsCompatible = false
       AppLogger.log(.devices, "No device selected because devices list is empty")
     } else {
       noDevicesTimeoutTask?.cancel()
-      connectionStageText = DATConnectionStage.deviceSelected.rawValue
-      refreshSelectedDeviceDiagnostics(deviceId: devices[0])
+      if let activeDevice = deviceSelector?.activeDevice, devices.contains(activeDevice) {
+        hasActiveDevice = true
+        connectionStageText = DATConnectionStage.deviceSelected.rawValue
+        selectedDeviceIDText = "\(activeDevice)"
+        refreshSelectedDeviceDiagnostics(deviceId: activeDevice)
+      } else {
+        hasActiveDevice = false
+        connectionStageText = DATConnectionStage.discoveringDevices.rawValue
+        selectedDeviceIDText = "None"
+        selectedDeviceCompatibilityText = "AutoDeviceSelector pending"
+        selectedDeviceLinkStateText = "AutoDeviceSelector pending"
+        selectedDeviceIsCompatible = false
+        AppLogger.log(.devices, "DAT devices are available, waiting for AutoDeviceSelector activeDevice. count=\(devices.count)")
+      }
     }
     updateStartReadinessReason()
   }
@@ -1192,22 +1336,6 @@ final class DATGlassesManager: ObservableObject {
     AppLogger.log(.devices, "Device link state changed id=\(deviceId): \(linkState)")
     guard selectedDeviceIDText == deviceId else { return }
     selectedDeviceLinkStateText = "\(linkState)"
-    if linkState == .disconnected {
-      isDeviceSessionReady = false
-      emitError("Selected glasses disconnected. Open the glasses, confirm they are connected in Meta AI, then reconnect.")
-      if isStreamRunning {
-        Task {
-          await self.stopStream()
-        }
-      }
-      deviceSession = nil
-      activeDeviceSessionDeviceId = nil
-      isPreparingDeviceSession = false
-      isStartingDeviceSession = false
-      deviceSessionHadStarted = false
-      deviceSessionStateText = "stopped"
-      runtimeSessionStateText = SessionState.stopped.description.uppercased()
-    }
     updateStartReadinessReason()
   }
 
@@ -1287,7 +1415,7 @@ final class DATGlassesManager: ObservableObject {
     if !isConfigured {
       return "SDK not configured"
     }
-    if isSimulator && !allowsMockDeviceKitConfiguration {
+    if isSimulator {
       return "real glasses require a physical iPhone"
     }
     if !isAppActive {
@@ -1302,45 +1430,20 @@ final class DATGlassesManager: ObservableObject {
     if currentRegistrationState != .registered {
       return "registration not ready: \(registrationStateText)"
     }
-    if !cameraPermissionStatusText.lowercased().contains("granted") {
-      return "camera permission missing: \(cameraPermissionStatusText)"
+    if !hasActiveDevice {
+      return "waiting for an active device"
     }
-    if !devicesStreamActive {
-      return "devicesStream not active"
-    }
-    if deviceCount == 0 {
-      return "no device discovered"
-    }
-    if selectedDeviceIDText == "None" {
-      return "selected device missing"
-    }
-    if !selectedDeviceIsCompatible {
-      return "device discovered but incompatible: \(selectedDeviceCompatibilityText)"
-    }
-    if selectedDeviceLinkStateText.lowercased() != "connected" {
-      return "device unavailable/disconnected: \(selectedDeviceLinkStateText)"
-    }
-    if deviceSession == nil {
-      return "DeviceSession missing"
-    }
-    if runtimeSessionStateText.lowercased().contains("paused") {
-      return "DeviceSession paused"
-    }
-    if runtimeSessionStateText.lowercased().contains("stopped") {
-      if let deviceSession, deviceSession.state == .started, deviceSessionHadStarted {
-        AppLogger.log(.devices, "Ignoring stale runtime STOPPED readiness blocker because local DeviceSession is started")
-      } else {
-        return "DeviceSession stopped"
-      }
-    }
-    if let deviceSession, deviceSession.state != .started {
+    if let deviceSession, deviceSession.state == .starting || deviceSession.state == .stopping || deviceSession.state == .paused {
       return "DeviceSession not started: \(deviceSession.state)"
-    }
-    if !isDeviceSessionReady {
-      return "DeviceSession not running/ready"
     }
     if isStreamRunning {
       return "stream already running"
+    }
+    if streamSession != nil {
+      let state = streamSessionStateText.lowercased()
+      if state.contains("waiting") || state.contains("starting") || state.contains("paused") {
+        return "stream session is \(streamSessionStateText); wait for it to finish"
+      }
     }
     return nil
   }
@@ -1392,10 +1495,10 @@ final class DATGlassesManager: ObservableObject {
     ISO8601DateFormatter().string(from: Date())
   }
 
-  private func formatStreamError(_ error: StreamSessionError) -> String {
+  private func formatStreamError(_ error: StreamError) -> String {
     switch error {
     case .internalError:
-      return "An internal DAT streaming error occurred."
+      return "Glasses camera failed to start (ActivityManager error). Close and reopen the glasses hinges to reset the camera, then tap Start streaming again. If it repeats, force-quit Meta AI and reopen it, or power-cycle the glasses."
     case .deviceNotFound:
       return "Device not found. Confirm glasses are paired in Meta AI."
     case .deviceNotConnected:
@@ -1410,6 +1513,12 @@ final class DATGlassesManager: ObservableObject {
       return "Glasses hinges are closed."
     case .thermalCritical:
       return "Glasses are too warm; streaming paused."
+    case .thermalEmergency:
+      return "Glasses thermal emergency; stop streaming and let the device cool down."
+    case .peakPowerShutdown:
+      return "Glasses stopped streaming because peak power protection was triggered."
+    case .batteryCritical:
+      return "Glasses battery is critically low; charge the device before streaming."
     @unknown default:
       return "Unknown DAT streaming error: \(error)"
     }

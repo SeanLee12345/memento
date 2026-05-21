@@ -18,5 +18,8 @@ struct StreamSessionView: View {
     } message: {
       Text(viewModel.errorMessage)
     }
+    .sheet(isPresented: $viewModel.showPeopleDictionary) {
+      PeopleDictionaryView(viewModel: viewModel)
+    }
   }
 }
