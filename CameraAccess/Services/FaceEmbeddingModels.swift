@@ -52,41 +52,83 @@ enum FaceEmbeddingError: LocalizedError {
 }
 
 enum FaceEmbeddingModelFactory {
-  static let sourceName = "Xiaoccer/MobileFaceNet_Pytorch"
-  static let sourceDescription = "MobileFaceNet Core ML face embedding model converted from Xiaoccer/MobileFaceNet_Pytorch"
-  static let preferredModelName = "MobileFaceNet"
+  static let sourceName = "AWS/AdaFace + Xiaoccer/MobileFaceNet_Pytorch"
+  static let sourceDescription = "AWS AdaFace face embedding worker with MobileFaceNet Core ML local fallback"
+  static let preferredModelName = "AdaFace"
+  static let localFallbackModelName = "MobileFaceNet"
+  static let localSourceName = "Xiaoccer/MobileFaceNet_Pytorch"
+  static let cloudPreprocessingVersion = "adaface-ir101-webface12m-v1"
   static let preprocessingVersion = "xiaoccer-mobilefacenet-rgb-minus-127p5-div-128-v1"
-  static let expectedModelNames = ["MobileFaceNet", "FaceNet", "FaceEmbedding"]
+  static let expectedModelNames = ["AdaFace", "MobileFaceNet", "FaceNet", "FaceEmbedding"]
+  static let defaultInputImageSize = CGSize(width: 96, height: 112)
 
   static func makeModel() -> FaceEmbeddingModel {
     if IdentityConfig.useMockEmbeddingModel {
+      IdentityConfig.activeEmbeddingModelInputSize = MockFaceEmbeddingModel.defaultInputImageSize
       return MockFaceEmbeddingModel()
     }
     let cloudSettings = CloudFaceEmbeddingSettings.load()
-    guard let modelURL = CoreMLFaceNetEmbeddingModel.findBundledModelURL() else {
+    let local = makeBundledLocalModel()
+    if cloudSettings.enabled, cloudSettings.hasUsableEndpoint {
+      if let local {
+        AppLogger.log(.faceEmbeddingModel, "Using AWS AdaFace face embedding model with local MobileFaceNet fallback endpoint=\(cloudSettings.endpoint)")
+        IdentityConfig.activeEmbeddingModelInputSize = CloudFaceEmbeddingModel.defaultInputImageSize
+        return CloudFallbackFaceEmbeddingModel(settings: cloudSettings, local: local)
+      }
+      AppLogger.log(.faceEmbeddingModel, "Using AWS AdaFace face embedding model without local fallback endpoint=\(cloudSettings.endpoint)")
+      IdentityConfig.activeEmbeddingModelInputSize = CloudFaceEmbeddingModel.defaultInputImageSize
+      return CloudFaceEmbeddingModel(settings: cloudSettings)
+    }
+
+    if let local {
+      if cloudSettings.enabled {
+        AppLogger.log(.faceEmbeddingModel, "AWS AdaFace enabled but endpoint is not ready; using local MobileFaceNet until cloud worker is configured.")
+      }
+      IdentityConfig.activeEmbeddingModelInputSize = local.inputImageSize
+      return local
+    }
+
+    if cloudSettings.enabled {
       let error = FaceEmbeddingError.coreMLModelMissing(expectedNames: expectedModelResourceNames())
       AppLogger.log(.faceEmbedding, "MobileFaceNet/Core ML model unavailable: \(error.localizedDescription)")
-      if cloudSettings.enabled {
-        AppLogger.log(.faceEmbeddingModel, "Using cloud AdaFace face embedding model without local fallback endpoint=\(cloudSettings.endpoint)")
-        return CloudFaceEmbeddingModel(settings: cloudSettings)
-      }
+      AppLogger.log(.faceEmbeddingModel, "warning...---- AWS AdaFace enabled but no usable endpoint is configured and local MobileFaceNet is missing; face recognition is disabled.")
+    }
+    IdentityConfig.activeEmbeddingModelInputSize = defaultInputImageSize
+    return MissingFaceEmbeddingModel(expectedNames: expectedModelNames)
+  }
+
+  static func makeLocalModelOnly() -> FaceEmbeddingModel {
+    if IdentityConfig.useMockEmbeddingModel {
+      IdentityConfig.activeEmbeddingModelInputSize = MockFaceEmbeddingModel.defaultInputImageSize
+      return MockFaceEmbeddingModel()
+    }
+    guard let local = makeBundledLocalModel() else {
+      IdentityConfig.activeEmbeddingModelInputSize = defaultInputImageSize
       return MissingFaceEmbeddingModel(expectedNames: expectedModelNames)
     }
-    let local = LazyCoreMLFaceNetEmbeddingModel(modelURL: modelURL)
-    if cloudSettings.enabled {
-      AppLogger.log(.faceEmbeddingModel, "Using cloud AdaFace face embedding model with local MobileFaceNet fallback endpoint=\(cloudSettings.endpoint)")
-      return CloudFallbackFaceEmbeddingModel(settings: cloudSettings, local: local)
-    }
+    IdentityConfig.activeEmbeddingModelInputSize = local.inputImageSize
     return local
+  }
+
+  private static func makeBundledLocalModel() -> FaceEmbeddingModel? {
+    guard let modelURL = CoreMLFaceNetEmbeddingModel.findBundledModelURL() else {
+      return nil
+    }
+    return LazyCoreMLFaceNetEmbeddingModel(modelURL: modelURL)
   }
 
   static func statusText() -> String {
     if IdentityConfig.useMockEmbeddingModel {
       return "Debug stub embeddings enabled"
     }
-    return CoreMLFaceNetEmbeddingModel.findBundledModelURL(logSearch: false) == nil
-      ? "Face recognition model missing"
-      : "Face recognition model found; loading on demand"
+    let localStatus = CoreMLFaceNetEmbeddingModel.findBundledModelURL(logSearch: false) == nil
+      ? "MobileFaceNet missing"
+      : "MobileFaceNet ready"
+    let cloudSettings = CloudFaceEmbeddingSettings.load()
+    if cloudSettings.enabled, cloudSettings.hasUsableEndpoint {
+      return "AWS AdaFace configured; \(localStatus)"
+    }
+    return "\(localStatus); AWS AdaFace not configured"
   }
 
   static func expectedModelResourceInstructions() -> String {
@@ -97,7 +139,8 @@ enum FaceEmbeddingModelFactory {
     let resolved = CoreMLFaceNetEmbeddingModel.findBundledModelURL(in: bundle, logSearch: false)
     let candidates = CoreMLFaceNetEmbeddingModel.modelSearchCandidatePaths(in: bundle)
     let status = resolved == nil ? "modelLoaded=false" : "modelLoaded=pendingLoad"
-    return "\(status) source=\(sourceName) preferredModel=MobileFaceNet bundlePath=\(bundle.bundlePath) resolvedPath=\(resolved?.path ?? "none") searchedCandidatePaths=[\(candidates.joined(separator: ", "))] inputNames=unknownUntilLoad outputNames=unknownUntilLoad expectedInputShape=unknownUntilLoad outputEmbeddingDimension=unknownUntilLoad preprocessing=\(preprocessingVersion) lastModelLoadError=\(resolved == nil ? FaceEmbeddingError.coreMLModelMissing(expectedNames: expectedModelResourceNames()).localizedDescription : "none")"
+    let cloudSettings = CloudFaceEmbeddingSettings.load()
+    return "\(status) source=\(sourceName) preferredModel=\(preferredModelName) localFallback=\(localFallbackModelName) bundlePath=\(bundle.bundlePath) resolvedPath=\(resolved?.path ?? "none") searchedCandidatePaths=[\(candidates.joined(separator: ", "))] cloudEnabled=\(cloudSettings.enabled) endpointConfigured=\(cloudSettings.hasUsableEndpoint) inputNames=unknownUntilLoad outputNames=unknownUntilLoad expectedInputShape=unknownUntilLoad outputEmbeddingDimension=unknownUntilLoad cloudPreprocessing=\(cloudPreprocessingVersion) localPreprocessing=\(preprocessingVersion) lastModelLoadError=\(resolved == nil ? FaceEmbeddingError.coreMLModelMissing(expectedNames: expectedModelResourceNames()).localizedDescription : "none")"
   }
 
   static func expectedModelResourceNames() -> [String] {
@@ -201,7 +244,7 @@ struct CoreMLFaceNetEmbeddingModel: FaceEmbeddingModel {
 
     AppLogger.log(
       .faceEmbeddingModel,
-      "loaded name=\(modelName) source=\(FaceEmbeddingModelFactory.sourceName) path=\(modelURL.path) input=\(inputName) output=\(outputName) inputSize=\(Int(inputImageSize.width))x\(Int(inputImageSize.height)) dim=\(embeddingDimension) elapsedMs=\(String(format: "%.1f", Date().timeIntervalSince(loadStartedAt) * 1_000))"
+      "loaded name=\(modelName) source=\(FaceEmbeddingModelFactory.localSourceName) path=\(modelURL.path) input=\(inputName) output=\(outputName) inputSize=\(Int(inputImageSize.width))x\(Int(inputImageSize.height)) dim=\(embeddingDimension) elapsedMs=\(String(format: "%.1f", Date().timeIntervalSince(loadStartedAt) * 1_000))"
     )
     AppLogger.log(
       .faceEmbeddingModel,
@@ -209,7 +252,7 @@ struct CoreMLFaceNetEmbeddingModel: FaceEmbeddingModel {
     )
     AppLogger.log(
       .faceEmbedding,
-      "MobileFaceNet/Core ML model loaded modelName=\(modelName) modelVersion=\(modelVersion) source=\(FaceEmbeddingModelFactory.sourceName) embeddingDimension=\(embeddingDimension) inputImageSize=\(Int(inputImageSize.width))x\(Int(inputImageSize.height)) preprocessing=\(preprocessingMode.rawValue)"
+      "MobileFaceNet/Core ML model loaded modelName=\(modelName) modelVersion=\(modelVersion) source=\(FaceEmbeddingModelFactory.localSourceName) embeddingDimension=\(embeddingDimension) inputImageSize=\(Int(inputImageSize.width))x\(Int(inputImageSize.height)) preprocessing=\(preprocessingMode.rawValue)"
     )
   }
 
@@ -251,18 +294,18 @@ struct CoreMLFaceNetEmbeddingModel: FaceEmbeddingModel {
     let elapsedMS = Date().timeIntervalSince(startedAt) * 1_000
     AppLogger.log(
       .faceEmbedding,
-      "model=\(modelName) modelVersion=\(modelVersion) source=\(FaceEmbeddingModelFactory.sourceName) embeddingDimension=\(normalized.count) inputImageSize=\(Int(inputImageSize.width))x\(Int(inputImageSize.height)) preprocessing=\(preprocessingMode.rawValue) inferenceMs=\(String(format: "%.1f", elapsedMS))"
+      "model=\(modelName) modelVersion=\(modelVersion) source=\(FaceEmbeddingModelFactory.localSourceName) embeddingDimension=\(normalized.count) inputImageSize=\(Int(inputImageSize.width))x\(Int(inputImageSize.height)) preprocessing=\(preprocessingMode.rawValue) inferenceMs=\(String(format: "%.1f", elapsedMS))"
     )
     AppLogger.log(
       .faceEmbeddingVector,
-      "model=\(modelName) source=\(FaceEmbeddingModelFactory.sourceName) dim=\(normalized.count) normBefore=\(String(format: "%.5f", normBefore)) normAfter=\(String(format: "%.3f", normAfter)) valid=true"
+      "model=\(modelName) source=\(FaceEmbeddingModelFactory.localSourceName) dim=\(normalized.count) normBefore=\(String(format: "%.5f", normBefore)) normAfter=\(String(format: "%.3f", normAfter)) valid=true"
     )
     return FaceEmbedding(
       vector: normalized,
       dimension: normalized.count,
       modelName: modelName,
       modelVersion: modelVersion,
-      modelSource: FaceEmbeddingModelFactory.sourceName,
+      modelSource: FaceEmbeddingModelFactory.localSourceName,
       preprocessingVersion: FaceEmbeddingModelFactory.preprocessingVersion,
       createdAt: Date()
     )
@@ -357,7 +400,7 @@ struct CoreMLFaceNetEmbeddingModel: FaceEmbeddingModel {
     if logSearch {
       AppLogger.log(
         .faceEmbedding,
-        "MobileFaceNet/Core ML model search source=\(FaceEmbeddingModelFactory.sourceName) preferred=MobileFaceNet bundle=\(bundlePath) candidates=[\(candidates.joined(separator: ", "))]"
+        "MobileFaceNet/Core ML model search source=\(FaceEmbeddingModelFactory.localSourceName) preferred=MobileFaceNet bundle=\(bundlePath) candidates=[\(candidates.joined(separator: ", "))]"
       )
     }
     for candidate in modelResourceCandidates {
@@ -510,10 +553,47 @@ actor LazyCoreMLFaceNetEmbeddingModel: FaceEmbeddingModel {
   }
 }
 
+actor CloudFallbackFaceEmbeddingModel: FaceEmbeddingModel {
+  nonisolated let embeddingDimension = 512
+  nonisolated let inputImageSize = CloudFaceEmbeddingModel.defaultInputImageSize
+  nonisolated let modelName = "AdaFace"
+  nonisolated let modelVersion = "cvlface_adaface_ir101_webface12m"
+
+  private let cloud: CloudFaceEmbeddingModel
+  private let local: FaceEmbeddingModel
+
+  init(settings: CloudFaceEmbeddingSettings, local: FaceEmbeddingModel) {
+    cloud = CloudFaceEmbeddingModel(settings: settings)
+    self.local = local
+  }
+
+  func load() async throws {
+    do {
+      try await cloud.load()
+      IdentityConfig.activeEmbeddingModelInputSize = cloud.inputImageSize
+    } catch {
+      AppLogger.log(.faceEmbeddingModel, "warning...---- AWS AdaFace load failed; loading MobileFaceNet fallback. error=\(error.localizedDescription)")
+      try await local.load()
+      IdentityConfig.activeEmbeddingModelInputSize = local.inputImageSize
+    }
+  }
+
+  func embed(faceImage: CGImage) async throws -> FaceEmbeddingVector {
+    do {
+      IdentityConfig.activeEmbeddingModelInputSize = cloud.inputImageSize
+      return try await cloud.embed(faceImage: faceImage)
+    } catch {
+      AppLogger.log(.faceEmbeddingModel, "warning...---- AWS AdaFace embedding failed; falling back to MobileFaceNet. error=\(error.localizedDescription)")
+      IdentityConfig.activeEmbeddingModelInputSize = local.inputImageSize
+      return try await local.embed(faceImage: faceImage)
+    }
+  }
+}
+
 struct MissingFaceEmbeddingModel: FaceEmbeddingModel {
   let expectedNames: [String]
   let embeddingDimension = 0
-  let inputImageSize = CGSize(width: 96, height: 112)
+  let inputImageSize = FaceEmbeddingModelFactory.defaultInputImageSize
   let modelName = "MissingFaceEmbeddingModel"
   let modelVersion = "missing"
 
@@ -527,8 +607,10 @@ struct MissingFaceEmbeddingModel: FaceEmbeddingModel {
 }
 
 struct MockFaceEmbeddingModel: FaceEmbeddingModel {
+  static let defaultInputImageSize = FaceEmbeddingModelFactory.defaultInputImageSize
+
   let embeddingDimension = 128
-  let inputImageSize = CGSize(width: 96, height: 112)
+  let inputImageSize = defaultInputImageSize
   let modelName = "MockFaceEmbeddingModel"
   let modelVersion = "debug-stub-v1"
 

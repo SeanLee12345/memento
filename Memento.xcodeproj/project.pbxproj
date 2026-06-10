@@ -11,22 +11,36 @@
 		0B8F600EB43845AA511C0688 /* CloudTranscriptModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F7B053E0C646938D7B5A46C /* CloudTranscriptModels.swift */; };
 		0E97130F936BD3CC7750DD03 /* LocalIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF9DE5BEB701F62F4D10CB05 /* LocalIdentityStore.swift */; };
 		11E4C290B8D94E589A430101 /* CloudFaceEmbeddingClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11E4C28FB8D94E589A430101 /* CloudFaceEmbeddingClient.swift */; };
+		13C4AEB68C59474EA2D9AF11 /* CloudSpeakerEmbeddingService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13C4AEB58C59474EA2D9AF11 /* CloudSpeakerEmbeddingService.swift */; };
+		13C4AEC68C59474EA2D9AF12 /* AWSCognitoLambdaClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13C4AEC58C59474EA2D9AF12 /* AWSCognitoLambdaClient.swift */; };
+		13C4AED68C59474EA2D9AF13 /* CloudFaceEmbeddingLifecycleService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13C4AED58C59474EA2D9AF13 /* CloudFaceEmbeddingLifecycleService.swift */; };
 		185F70042F9A000000000004 /* AssistanceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 185F70032F9A000000000003 /* AssistanceModels.swift */; };
-		1E0D5E12F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E0D5E11F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift */; };
-		1E0D5E13F53E4C9AA73A0101 /* .env.local in Resources */ = {isa = PBXBuildFile; fileRef = 1E0D5E14F53E4C9AA73A0101 /* .env.local */; };
-		24AE205704D10E09A3E708CF /* SpeakerIdentityPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDF22D128E471F692906139D /* SpeakerIdentityPipeline.swift */; };
-		25025AFFA700912F76A7D988 /* FaceCropper.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB727D49817BF890F8C9AEB4 /* FaceCropper.swift */; };
-		45B41B236D6C01548084449B /* FaceVisionDebugPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CF435A8291677ED9672D195 /* FaceVisionDebugPipeline.swift */; };
+		185F70142F9A000000000014 /* ConversationPartnerModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 185F70132F9A000000000013 /* ConversationPartnerModels.swift */; };
+		C0DE00010000000000000001 /* SceneContextModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE10010000000000000001 /* SceneContextModels.swift */; };
+		C0DE00020000000000000002 /* SceneContextClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE10020000000000000002 /* SceneContextClient.swift */; };
+		C0DE00030000000000000003 /* SceneLocationProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE10030000000000000003 /* SceneLocationProvider.swift */; };
+		C0DE00040000000000000004 /* SceneContextPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE10040000000000000004 /* SceneContextPipeline.swift */; };
+			1E0D5E12F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E0D5E11F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift */; };
+			24AE205704D10E09A3E708CF /* SpeakerIdentityPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDF22D128E471F692906139D /* SpeakerIdentityPipeline.swift */; };
+			25025AFFA700912F76A7D988 /* FaceCropper.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB727D49817BF890F8C9AEB4 /* FaceCropper.swift */; };
+			4AA90001BEEF000000000001 /* AlibabaLiveTranscriptionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AA90002BEEF000000000002 /* AlibabaLiveTranscriptionService.swift */; };
+			45B41B236D6C01548084449B /* FaceVisionDebugPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CF435A8291677ED9672D195 /* FaceVisionDebugPipeline.swift */; };
 		7345B153C93627948A688CC4 /* FaceEmbeddingModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8655D69CB5066E0CC0520448 /* FaceEmbeddingModels.swift */; };
 		74479E7F4B18FC04588E759D /* FaceQualityFilter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61CCCE130E5C93B9DD72E942 /* FaceQualityFilter.swift */; };
 		75F85B56FDAC6A8D904B01B7 /* StreamAudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDB55B0A8DA1A990334F5D8F /* StreamAudioRecorder.swift */; };
 		8E5AE7382E172FC908AD04BF /* SpeakerModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = E29949D5A9A264D139722311 /* SpeakerModels.swift */; };
-		8FD96B7F2E6F0A9800F56AB1 /* CameraAccessApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FD96B792E6F0A9800F56AB1 /* CameraAccessApp.swift */; };
+		A10000012F9B000000000001 /* SupabaseClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000012F9B000000000001 /* SupabaseClient.swift */; };
+		A10000022F9B000000000002 /* SupabaseSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000022F9B000000000002 /* SupabaseSession.swift */; };
+		A10000032F9B000000000003 /* SupabaseRowEncoders.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000032F9B000000000003 /* SupabaseRowEncoders.swift */; };
+		A10000042F9B000000000004 /* SupabaseIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000042F9B000000000004 /* SupabaseIdentityStore.swift */; };
+		A10000052F9B000000000005 /* IdentitySyncQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000052F9B000000000005 /* IdentitySyncQueue.swift */; };
+		A10000062F9B000000000006 /* SyncingIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000062F9B000000000006 /* SyncingIdentityStore.swift */; };
+		8FD96B7F2E6F0A9800F56AB1 /* MementoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FD96B792E6F0A9800F56AB1 /* MementoApp.swift */; };
 		8FD96B872E6F0A9800F56AB1 /* StreamSessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FD96B6F2E6F0A9800F56AB1 /* StreamSessionViewModel.swift */; };
 		8FD96B882E6F0A9800F56AB1 /* StreamSessionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FD96B752E6F0A9800F56AB1 /* StreamSessionView.swift */; };
 		8FD96B8D2E6F0A9800F56AB1 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8FD96B772E6F0A9800F56AB1 /* Assets.xcassets */; };
-		AA000001ML000001AA000001 /* MobileFaceNet.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = AA000002ML000002AA000002 /* MobileFaceNet.mlpackage */; };
 		AA000003ML000003AA000003 /* SpeakerEmbedding.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = AA000004ML000004AA000004 /* SpeakerEmbedding.mlpackage */; };
+		AA000005ML000005AA000005 /* MobileFaceNet.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = AA000006ML000006AA000006 /* MobileFaceNet.mlpackage */; };
 		8FFD5FF52E8422580035E446 /* CircleButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFD5FF22E8422580035E446 /* CircleButton.swift */; };
 		8FFD5FF62E8422580035E446 /* CustomButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFD5FF32E8422580035E446 /* CustomButton.swift */; };
 		8FFD60352E8434070035E446 /* StatusText.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFD60332E8434070035E446 /* StatusText.swift */; };
@@ -36,14 +50,17 @@
 		AEDB0F715E80C88D1BCD0C77 /* VoiceActivityDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7D0874869BC01A8211FD834 /* VoiceActivityDetector.swift */; };
 		BAA1B8FCE3445656D62E9058 /* VoicePreviewPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4EDA8B87146525DBAEE798E /* VoicePreviewPlayer.swift */; };
 		C1DA506282C4A2AD8340B2D1 /* IdentityPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E6F2B1F1F5BB9614C8A96CE /* IdentityPipeline.swift */; };
+		C1DA507282C4A2AD8340B2D2 /* ConversationPartnerResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E6F2B2F1F5BB9614C8A96CF /* ConversationPartnerResolver.swift */; };
 		C8CE2F1CBA736DEEDC40C13D /* CloudDiarizationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A17E6A8076FECE48885AA7E /* CloudDiarizationService.swift */; };
 		D4B412BB5A2085E74C737204 /* IdentityModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1BE1A70C017498FF9E7054 /* IdentityModels.swift */; };
 		DE415D57253C5B680971ADE6 /* RollingIdentityConfirmor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3153C714D4DD1FBFCD68B1A3 /* RollingIdentityConfirmor.swift */; };
 		E40AC0D8B91F1BFE57957AAC /* PeopleDictionaryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD5B1C14C1DAB598479D586D /* PeopleDictionaryView.swift */; };
+		E40AC0E8B91F1BFE57957AAC /* StreamSummaryHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD5B1D14C1DAB598479D586D /* StreamSummaryHistoryView.swift */; };
 		E5FD150A5EA2ADAC88BD5813 /* PersonDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6D26D05BFAEA4D37E5EF099 /* PersonDetailView.swift */; };
 		E6A188482EB918740097D0E1 /* StreamView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6A188472EB918740097D0E1 /* StreamView.swift */; };
 		E6DA451E2E79A63100E3F688 /* CardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6DA45172E79A63100E3F688 /* CardView.swift */; };
 		E6FD3BCE2EB4D53A00E7FE5D /* NonStreamView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6FD3BCD2EB4D53A00E7FE5D /* NonStreamView.swift */; };
+		E7C010012E90100100A0C001 /* MementoTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7C010002E90100100A0C001 /* MementoTheme.swift */; };
 		F10000012F96000000000001 /* AppLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000012F96000000000001 /* AppLogger.swift */; };
 		F10000022F96000000000002 /* FaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000022F96000000000002 /* FaceModels.swift */; };
 		F10000042F96000000000004 /* VisionFaceFrameProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F20000042F96000000000004 /* VisionFaceFrameProcessor.swift */; };
@@ -55,6 +72,7 @@
 		F10000112F96000000000011 /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = F30000112F96000000000011 /* MWDATCore */; };
 		F10000122F96000000000012 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = F30000122F96000000000012 /* MWDATCamera */; };
 		F10000142F96000000000014 /* MWDATDisplay in Frameworks */ = {isa = PBXBuildFile; productRef = F30000142F96000000000014 /* MWDATDisplay */; };
+		F10000152F96000000000015 /* DebugBridgeUI in Frameworks */ = {isa = PBXBuildFile; productRef = F30000152F96000000000015 /* DebugBridgeUI */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -63,14 +81,14 @@
 			containerPortal = CCCCCCCCCCCCCCCCCCCCCC /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 8A8A8A8A8A8A8A8A8A8A8A8A;
-			remoteInfo = CameraAccess;
+			remoteInfo = Memento;
 		};
 		E699CC992E8150670052C240 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = CCCCCCCCCCCCCCCCCCCCCC /* Project object */;
 			proxyType = 1;
 			remoteGlobalIDString = 8A8A8A8A8A8A8A8A8A8A8A8A;
-			remoteInfo = CameraAccess;
+			remoteInfo = Memento;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -91,39 +109,56 @@
 		06EE842E424DF45A3C475BF3 /* LocalWorkerClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalWorkerClient.swift; sourceTree = "<group>"; };
 		0F7B053E0C646938D7B5A46C /* CloudTranscriptModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudTranscriptModels.swift; sourceTree = "<group>"; };
 		11E4C28FB8D94E589A430101 /* CloudFaceEmbeddingClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudFaceEmbeddingClient.swift; sourceTree = "<group>"; };
+		13C4AEB58C59474EA2D9AF11 /* CloudSpeakerEmbeddingService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudSpeakerEmbeddingService.swift; sourceTree = "<group>"; };
+		13C4AEC58C59474EA2D9AF12 /* AWSCognitoLambdaClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AWSCognitoLambdaClient.swift; sourceTree = "<group>"; };
+		13C4AED58C59474EA2D9AF13 /* CloudFaceEmbeddingLifecycleService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudFaceEmbeddingLifecycleService.swift; sourceTree = "<group>"; };
 		185F70032F9A000000000003 /* AssistanceModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AssistanceModels.swift; sourceTree = "<group>"; };
+		185F70132F9A000000000013 /* ConversationPartnerModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConversationPartnerModels.swift; sourceTree = "<group>"; };
 		1E0D5E11F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DeepSeekAssistanceClient.swift; sourceTree = "<group>"; };
-		1E0D5E14F53E4C9AA73A0101 /* .env.local */ = {isa = PBXFileReference; lastKnownFileType = text; path = .env.local; sourceTree = "<group>"; };
 		1B1BE1A70C017498FF9E7054 /* IdentityModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IdentityModels.swift; sourceTree = "<group>"; };
-		3153C714D4DD1FBFCD68B1A3 /* RollingIdentityConfirmor.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RollingIdentityConfirmor.swift; sourceTree = "<group>"; };
-		3A3A3A3A3A3A3A3A3A3A3A3A /* CameraAccess.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CameraAccess.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		3CF435A8291677ED9672D195 /* FaceVisionDebugPipeline.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FaceVisionDebugPipeline.swift; sourceTree = "<group>"; };
-		4C82CA48A7E43CF508851A7D /* PersonDayView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PersonDayView.swift; sourceTree = "<group>"; };
+		C0DE10010000000000000001 /* SceneContextModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SceneContextModels.swift; sourceTree = "<group>"; };
+		C0DE10020000000000000002 /* SceneContextClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SceneContextClient.swift; sourceTree = "<group>"; };
+		C0DE10030000000000000003 /* SceneLocationProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SceneLocationProvider.swift; sourceTree = "<group>"; };
+		C0DE10040000000000000004 /* SceneContextPipeline.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SceneContextPipeline.swift; sourceTree = "<group>"; };
+			3153C714D4DD1FBFCD68B1A3 /* RollingIdentityConfirmor.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RollingIdentityConfirmor.swift; sourceTree = "<group>"; };
+			3A3A3A3A3A3A3A3A3A3A3A3A /* Memento.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Memento.app; sourceTree = BUILT_PRODUCTS_DIR; };
+			3CF435A8291677ED9672D195 /* FaceVisionDebugPipeline.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FaceVisionDebugPipeline.swift; sourceTree = "<group>"; };
+			4AA90002BEEF000000000002 /* AlibabaLiveTranscriptionService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AlibabaLiveTranscriptionService.swift; sourceTree = "<group>"; };
+			4C82CA48A7E43CF508851A7D /* PersonDayView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PersonDayView.swift; sourceTree = "<group>"; };
 		61CCCE130E5C93B9DD72E942 /* FaceQualityFilter.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FaceQualityFilter.swift; sourceTree = "<group>"; };
 		6E6F2B1F1F5BB9614C8A96CE /* IdentityPipeline.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IdentityPipeline.swift; sourceTree = "<group>"; };
+		6E6F2B2F1F5BB9614C8A96CF /* ConversationPartnerResolver.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ConversationPartnerResolver.swift; sourceTree = "<group>"; };
 		8655D69CB5066E0CC0520448 /* FaceEmbeddingModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = FaceEmbeddingModels.swift; sourceTree = "<group>"; };
 		8FD96B6F2E6F0A9800F56AB1 /* StreamSessionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSessionViewModel.swift; sourceTree = "<group>"; };
 		8FD96B752E6F0A9800F56AB1 /* StreamSessionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamSessionView.swift; sourceTree = "<group>"; };
 		8FD96B772E6F0A9800F56AB1 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		AA000002ML000002AA000002 /* MobileFaceNet.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper.mlpackage; path = MobileFaceNet.mlpackage; sourceTree = "<group>"; };
 		AA000004ML000004AA000004 /* SpeakerEmbedding.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper.mlpackage; path = SpeakerEmbedding.mlpackage; sourceTree = "<group>"; };
+		AA000006ML000006AA000006 /* MobileFaceNet.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = wrapper.mlpackage; path = MobileFaceNet.mlpackage; sourceTree = "<group>"; };
 		8FD96B782E6F0A9800F56AB1 /* CameraAccess.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CameraAccess.entitlements; sourceTree = "<group>"; };
-		8FD96B792E6F0A9800F56AB1 /* CameraAccessApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraAccessApp.swift; sourceTree = "<group>"; };
+		8FD96B792E6F0A9800F56AB1 /* MementoApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MementoApp.swift; sourceTree = "<group>"; };
 		8FD96B7B2E6F0A9800F56AB1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		8FFD5FF22E8422580035E446 /* CircleButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CircleButton.swift; sourceTree = "<group>"; };
 		8FFD5FF32E8422580035E446 /* CustomButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomButton.swift; sourceTree = "<group>"; };
 		8FFD60332E8434070035E446 /* StatusText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusText.swift; sourceTree = "<group>"; };
 		9A17E6A8076FECE48885AA7E /* CloudDiarizationService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudDiarizationService.swift; sourceTree = "<group>"; };
+		A20000012F9B000000000001 /* SupabaseClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SupabaseClient.swift; sourceTree = "<group>"; };
+		A20000022F9B000000000002 /* SupabaseSession.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SupabaseSession.swift; sourceTree = "<group>"; };
+		A20000032F9B000000000003 /* SupabaseRowEncoders.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SupabaseRowEncoders.swift; sourceTree = "<group>"; };
+		A20000042F9B000000000004 /* SupabaseIdentityStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SupabaseIdentityStore.swift; sourceTree = "<group>"; };
+		A20000052F9B000000000005 /* IdentitySyncQueue.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = IdentitySyncQueue.swift; sourceTree = "<group>"; };
+		A20000062F9B000000000006 /* SyncingIdentityStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SyncingIdentityStore.swift; sourceTree = "<group>"; };
 		B6D26D05BFAEA4D37E5EF099 /* PersonDetailView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PersonDetailView.swift; sourceTree = "<group>"; };
 		B7D0874869BC01A8211FD834 /* VoiceActivityDetector.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VoiceActivityDetector.swift; sourceTree = "<group>"; };
 		D4EDA8B87146525DBAEE798E /* VoicePreviewPlayer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VoicePreviewPlayer.swift; sourceTree = "<group>"; };
 		DDB55B0A8DA1A990334F5D8F /* StreamAudioRecorder.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = StreamAudioRecorder.swift; sourceTree = "<group>"; };
 		E29949D5A9A264D139722311 /* SpeakerModels.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SpeakerModels.swift; sourceTree = "<group>"; };
-		E66CC00D2F3E05D900B07379 /* CameraAccessUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CameraAccessUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		E699CC952E8150670052C240 /* CameraAccessTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CameraAccessTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		E66CC00D2F3E05D900B07379 /* MementoUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MementoUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		E699CC952E8150670052C240 /* MementoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MementoTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		E6A188472EB918740097D0E1 /* StreamView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamView.swift; sourceTree = "<group>"; };
 		E6DA45172E79A63100E3F688 /* CardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardView.swift; sourceTree = "<group>"; };
 		E6FD3BCD2EB4D53A00E7FE5D /* NonStreamView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NonStreamView.swift; sourceTree = "<group>"; };
+		E7C010002E90100100A0C001 /* MementoTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MementoTheme.swift; sourceTree = "<group>"; };
+		FD5B1D14C1DAB598479D586D /* StreamSummaryHistoryView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = StreamSummaryHistoryView.swift; sourceTree = "<group>"; };
 		F20000012F96000000000001 /* AppLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLogger.swift; sourceTree = "<group>"; };
 		F20000022F96000000000002 /* FaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaceModels.swift; sourceTree = "<group>"; };
 		F20000042F96000000000004 /* VisionFaceFrameProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisionFaceFrameProcessor.swift; sourceTree = "<group>"; };
@@ -141,7 +176,7 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		E66CC00E2F3E05D900B07379 /* CameraAccessUITests */ = {
+		E66CC00E2F3E05D900B07379 /* MementoUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 			);
@@ -149,10 +184,10 @@
 			};
 			explicitFolders = (
 			);
-			path = CameraAccessUITests;
+			path = MementoUITests;
 			sourceTree = "<group>";
 		};
-		E699CC962E8150670052C240 /* CameraAccessTests */ = {
+		E699CC962E8150670052C240 /* MementoTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 			);
@@ -160,7 +195,7 @@
 			};
 			explicitFolders = (
 			);
-			path = CameraAccessTests;
+			path = MementoTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -173,6 +208,7 @@
 				F10000112F96000000000011 /* MWDATCore in Frameworks */,
 				F10000122F96000000000012 /* MWDATCamera in Frameworks */,
 				F10000142F96000000000014 /* MWDATDisplay in Frameworks */,
+				F10000152F96000000000015 /* DebugBridgeUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -189,21 +225,20 @@
 		5A5A5A5A5A5A5A5A5A5A5A5A = {
 			isa = PBXGroup;
 			children = (
-				1E0D5E14F53E4C9AA73A0101 /* .env.local */,
-				8FD96B7D2E6F0A9800F56AB1 /* CameraAccess */,
-				E66CC00E2F3E05D900B07379 /* CameraAccessUITests */,
+					8FD96B7D2E6F0A9800F56AB1 /* Memento */,
+				E66CC00E2F3E05D900B07379 /* MementoUITests */,
 				8F2A14F12DDBCEB900D4E5F2 /* Frameworks */,
 				7A7A7A7A7A7A7A7A7A7A7A7A /* Products */,
-				E699CC962E8150670052C240 /* CameraAccessTests */,
+				E699CC962E8150670052C240 /* MementoTests */,
 			);
 			sourceTree = "<group>";
 		};
 		7A7A7A7A7A7A7A7A7A7A7A7A /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				3A3A3A3A3A3A3A3A3A3A3A3A /* CameraAccess.app */,
-				E699CC952E8150670052C240 /* CameraAccessTests.xctest */,
-				E66CC00D2F3E05D900B07379 /* CameraAccessUITests.xctest */,
+				3A3A3A3A3A3A3A3A3A3A3A3A /* Memento.app */,
+				E699CC952E8150670052C240 /* MementoTests.xctest */,
+				E66CC00D2F3E05D900B07379 /* MementoUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -232,13 +267,15 @@
 				E6A188472EB918740097D0E1 /* StreamView.swift */,
 				E6FD3BCD2EB4D53A00E7FE5D /* NonStreamView.swift */,
 				FD5B1C14C1DAB598479D586D /* PeopleDictionaryView.swift */,
+				FD5B1D14C1DAB598479D586D /* StreamSummaryHistoryView.swift */,
 				4C82CA48A7E43CF508851A7D /* PersonDayView.swift */,
 				B6D26D05BFAEA4D37E5EF099 /* PersonDetailView.swift */,
+				E7C010002E90100100A0C001 /* MementoTheme.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
 		};
-		8FD96B7D2E6F0A9800F56AB1 /* CameraAccess */ = {
+		8FD96B7D2E6F0A9800F56AB1 /* Memento */ = {
 			isa = PBXGroup;
 			children = (
 				F30000022F96000000000002 /* Models */,
@@ -247,11 +284,11 @@
 				8FD96B702E6F0A9800F56AB1 /* ViewModels */,
 				8FD96B762E6F0A9800F56AB1 /* Views */,
 				8FD96B772E6F0A9800F56AB1 /* Assets.xcassets */,
-				AA000002ML000002AA000002 /* MobileFaceNet.mlpackage */,
 				AA000004ML000004AA000004 /* SpeakerEmbedding.mlpackage */,
+				AA000006ML000006AA000006 /* MobileFaceNet.mlpackage */,
 				F200000F2F9600000000000F /* Compressed Video.mp4 */,
 				8FD96B782E6F0A9800F56AB1 /* CameraAccess.entitlements */,
-				8FD96B792E6F0A9800F56AB1 /* CameraAccessApp.swift */,
+				8FD96B792E6F0A9800F56AB1 /* MementoApp.swift */,
 				8FD96B7B2E6F0A9800F56AB1 /* Info.plist */,
 			);
 			path = CameraAccess;
@@ -280,9 +317,11 @@
 			isa = PBXGroup;
 			children = (
 				185F70032F9A000000000003 /* AssistanceModels.swift */,
+				185F70132F9A000000000013 /* ConversationPartnerModels.swift */,
 				F20000022F96000000000002 /* FaceModels.swift */,
 				0F7B053E0C646938D7B5A46C /* CloudTranscriptModels.swift */,
 				1B1BE1A70C017498FF9E7054 /* IdentityModels.swift */,
+				C0DE10010000000000000001 /* SceneContextModels.swift */,
 				E29949D5A9A264D139722311 /* SpeakerModels.swift */,
 			);
 			path = Models;
@@ -291,12 +330,19 @@
 		F30000032F96000000000003 /* Services */ = {
 			isa = PBXGroup;
 			children = (
-				F20000102F96000000000010 /* DATGlassesManager.swift */,
-				1E0D5E11F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift */,
-				F200000B2F9600000000000B /* SpeechTranscriptionManager.swift */,
-				F200000D2F9600000000000D /* VideoFrameProvider.swift */,
+					F20000102F96000000000010 /* DATGlassesManager.swift */,
+					1E0D5E11F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift */,
+					4AA90002BEEF000000000002 /* AlibabaLiveTranscriptionService.swift */,
+					C0DE10020000000000000002 /* SceneContextClient.swift */,
+					C0DE10030000000000000003 /* SceneLocationProvider.swift */,
+					C0DE10040000000000000004 /* SceneContextPipeline.swift */,
+					F200000B2F9600000000000B /* SpeechTranscriptionManager.swift */,
+					F200000D2F9600000000000D /* VideoFrameProvider.swift */,
 				F20000042F96000000000004 /* VisionFaceFrameProcessor.swift */,
 				11E4C28FB8D94E589A430101 /* CloudFaceEmbeddingClient.swift */,
+				13C4AED58C59474EA2D9AF13 /* CloudFaceEmbeddingLifecycleService.swift */,
+				13C4AEC58C59474EA2D9AF12 /* AWSCognitoLambdaClient.swift */,
+				13C4AEB58C59474EA2D9AF11 /* CloudSpeakerEmbeddingService.swift */,
 				DDB55B0A8DA1A990334F5D8F /* StreamAudioRecorder.swift */,
 				9A17E6A8076FECE48885AA7E /* CloudDiarizationService.swift */,
 					FB727D49817BF890F8C9AEB4 /* FaceCropper.swift */,
@@ -305,7 +351,14 @@
 				61CCCE130E5C93B9DD72E942 /* FaceQualityFilter.swift */,
 				3CF435A8291677ED9672D195 /* FaceVisionDebugPipeline.swift */,
 				6E6F2B1F1F5BB9614C8A96CE /* IdentityPipeline.swift */,
+				6E6F2B2F1F5BB9614C8A96CF /* ConversationPartnerResolver.swift */,
 				FF9DE5BEB701F62F4D10CB05 /* LocalIdentityStore.swift */,
+				A20000062F9B000000000006 /* SyncingIdentityStore.swift */,
+				A20000052F9B000000000005 /* IdentitySyncQueue.swift */,
+				A20000042F9B000000000004 /* SupabaseIdentityStore.swift */,
+				A20000012F9B000000000001 /* SupabaseClient.swift */,
+				A20000022F9B000000000002 /* SupabaseSession.swift */,
+				A20000032F9B000000000003 /* SupabaseRowEncoders.swift */,
 				06EE842E424DF45A3C475BF3 /* LocalWorkerClient.swift */,
 				3153C714D4DD1FBFCD68B1A3 /* RollingIdentityConfirmor.swift */,
 				F3C6153B4815918DB8AA90ED /* SpeakerEmbeddingModels.swift */,
@@ -319,32 +372,33 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		8A8A8A8A8A8A8A8A8A8A8A8A /* CameraAccess */ = {
+		8A8A8A8A8A8A8A8A8A8A8A8A /* Memento */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 9A9A9A9A9A9A9A9A9A9A9A9A /* Build configuration list for PBXNativeTarget "CameraAccess" */;
+			buildConfigurationList = 9A9A9A9A9A9A9A9A9A9A9A9A /* Build configuration list for PBXNativeTarget "Memento" */;
 			buildPhases = (
 				AAAAAAAAAAAAAAAAAAAAAA /* Sources */,
 				4A4A4A4A4A4A4A4A4A4A4A4A /* Frameworks */,
 				BBBBBBBBBBBBBBBBBBBBBB /* Resources */,
-				8FD96B932E6F0C6E00F56AB1 /* Embed Frameworks */,
+					8FD96B932E6F0C6E00F56AB1 /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 			);
-			name = CameraAccess;
+			name = Memento;
 			packageProductDependencies = (
 				F30000112F96000000000011 /* MWDATCore */,
 				F30000122F96000000000012 /* MWDATCamera */,
 					F30000142F96000000000014 /* MWDATDisplay */,
+				F30000152F96000000000015 /* DebugBridgeUI */,
 			);
-			productName = CameraAccess;
-			productReference = 3A3A3A3A3A3A3A3A3A3A3A3A /* CameraAccess.app */;
+			productName = Memento;
+			productReference = 3A3A3A3A3A3A3A3A3A3A3A3A /* Memento.app */;
 			productType = "com.apple.product-type.application";
 		};
-		E66CC00C2F3E05D900B07379 /* CameraAccessUITests */ = {
+		E66CC00C2F3E05D900B07379 /* MementoUITests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = E66CC0172F3E05D900B07379 /* Build configuration list for PBXNativeTarget "CameraAccessUITests" */;
+			buildConfigurationList = E66CC0172F3E05D900B07379 /* Build configuration list for PBXNativeTarget "MementoUITests" */;
 			buildPhases = (
 				E66CC0092F3E05D900B07379 /* Sources */,
 				E66CC00A2F3E05D900B07379 /* Frameworks */,
@@ -356,16 +410,16 @@
 				E66CC0142F3E05D900B07379 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				E66CC00E2F3E05D900B07379 /* CameraAccessUITests */,
+				E66CC00E2F3E05D900B07379 /* MementoUITests */,
 			);
-			name = CameraAccessUITests;
-			productName = CameraAccessUITests;
-			productReference = E66CC00D2F3E05D900B07379 /* CameraAccessUITests.xctest */;
+			name = MementoUITests;
+			productName = MementoUITests;
+			productReference = E66CC00D2F3E05D900B07379 /* MementoUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
-		E699CC942E8150670052C240 /* CameraAccessTests */ = {
+		E699CC942E8150670052C240 /* MementoTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = E699CC9D2E8150670052C240 /* Build configuration list for PBXNativeTarget "CameraAccessTests" */;
+			buildConfigurationList = E699CC9D2E8150670052C240 /* Build configuration list for PBXNativeTarget "MementoTests" */;
 			buildPhases = (
 				E699CC912E8150670052C240 /* Sources */,
 				E699CC932E8150670052C240 /* Resources */,
@@ -376,11 +430,11 @@
 				E699CC9A2E8150670052C240 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				E699CC962E8150670052C240 /* CameraAccessTests */,
+				E699CC962E8150670052C240 /* MementoTests */,
 			);
-			name = CameraAccessTests;
-			productName = CameraAccessTests;
-			productReference = E699CC952E8150670052C240 /* CameraAccessTests.xctest */;
+			name = MementoTests;
+			productName = MementoTests;
+			productReference = E699CC952E8150670052C240 /* MementoTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
@@ -405,7 +459,7 @@
 					};
 				};
 			};
-			buildConfigurationList = DDDDDDDDDDDDDDDDDDDDDD /* Build configuration list for PBXProject "CameraAccess" */;
+			buildConfigurationList = DDDDDDDDDDDDDDDDDDDDDD /* Build configuration list for PBXProject "Memento" */;
 			compatibilityVersion = "Xcode 9.3";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -416,14 +470,15 @@
 			mainGroup = 5A5A5A5A5A5A5A5A5A5A5A5A;
 			packageReferences = (
 				F30000102F96000000000010 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */,
+				F30000162F96000000000016 /* XCLocalSwiftPackageReference "DebugBridge" */,
 			);
 			productRefGroup = 7A7A7A7A7A7A7A7A7A7A7A7A /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				8A8A8A8A8A8A8A8A8A8A8A8A /* CameraAccess */,
-				E699CC942E8150670052C240 /* CameraAccessTests */,
-				E66CC00C2F3E05D900B07379 /* CameraAccessUITests */,
+				8A8A8A8A8A8A8A8A8A8A8A8A /* Memento */,
+				E699CC942E8150670052C240 /* MementoTests */,
+				E66CC00C2F3E05D900B07379 /* MementoUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -434,13 +489,12 @@
 			buildActionMask = 2147483647;
 			files = (
 				8FD96B8D2E6F0A9800F56AB1 /* Assets.xcassets in Resources */,
-				AA000001ML000001AA000001 /* MobileFaceNet.mlpackage in Resources */,
 				AA000003ML000003AA000003 /* SpeakerEmbedding.mlpackage in Resources */,
+				AA000005ML000005AA000005 /* MobileFaceNet.mlpackage in Resources */,
 				F100000F2F9600000000000F /* Compressed Video.mp4 in Resources */,
-				1E0D5E13F53E4C9AA73A0101 /* .env.local in Resources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
+				);
+				runOnlyForDeploymentPostprocessing = 0;
+			};
 		E66CC00B2F3E05D900B07379 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -464,7 +518,7 @@
 			files = (
 				F10000012F96000000000001 /* AppLogger.swift in Sources */,
 				F10000022F96000000000002 /* FaceModels.swift in Sources */,
-				8FD96B7F2E6F0A9800F56AB1 /* CameraAccessApp.swift in Sources */,
+				8FD96B7F2E6F0A9800F56AB1 /* MementoApp.swift in Sources */,
 				F100000B2F9600000000000B /* SpeechTranscriptionManager.swift in Sources */,
 				F10000042F96000000000004 /* VisionFaceFrameProcessor.swift in Sources */,
 				F100000D2F9600000000000D /* VideoFrameProvider.swift in Sources */,
@@ -475,23 +529,40 @@
 				8FD96B882E6F0A9800F56AB1 /* StreamSessionView.swift in Sources */,
 				F10000072F96000000000007 /* FaceOverlayView.swift in Sources */,
 				E6A188482EB918740097D0E1 /* StreamView.swift in Sources */,
+				E7C010012E90100100A0C001 /* MementoTheme.swift in Sources */,
 				8FFD5FF52E8422580035E446 /* CircleButton.swift in Sources */,
 				8FFD5FF62E8422580035E446 /* CustomButton.swift in Sources */,
 				E6FD3BCE2EB4D53A00E7FE5D /* NonStreamView.swift in Sources */,
 				0B8F600EB43845AA511C0688 /* CloudTranscriptModels.swift in Sources */,
 				11E4C290B8D94E589A430101 /* CloudFaceEmbeddingClient.swift in Sources */,
-				185F70042F9A000000000004 /* AssistanceModels.swift in Sources */,
-				1E0D5E12F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift in Sources */,
-				75F85B56FDAC6A8D904B01B7 /* StreamAudioRecorder.swift in Sources */,
+				13C4AED68C59474EA2D9AF13 /* CloudFaceEmbeddingLifecycleService.swift in Sources */,
+				13C4AEC68C59474EA2D9AF12 /* AWSCognitoLambdaClient.swift in Sources */,
+				13C4AEB68C59474EA2D9AF11 /* CloudSpeakerEmbeddingService.swift in Sources */,
+					185F70042F9A000000000004 /* AssistanceModels.swift in Sources */,
+					185F70142F9A000000000014 /* ConversationPartnerModels.swift in Sources */,
+					C0DE00010000000000000001 /* SceneContextModels.swift in Sources */,
+					1E0D5E12F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift in Sources */,
+					4AA90001BEEF000000000001 /* AlibabaLiveTranscriptionService.swift in Sources */,
+					C0DE00020000000000000002 /* SceneContextClient.swift in Sources */,
+					C0DE00030000000000000003 /* SceneLocationProvider.swift in Sources */,
+					C0DE00040000000000000004 /* SceneContextPipeline.swift in Sources */,
+					75F85B56FDAC6A8D904B01B7 /* StreamAudioRecorder.swift in Sources */,
 				C8CE2F1CBA736DEEDC40C13D /* CloudDiarizationService.swift in Sources */,
 				D4B412BB5A2085E74C737204 /* IdentityModels.swift in Sources */,
 				8E5AE7382E172FC908AD04BF /* SpeakerModels.swift in Sources */,
+				A10000012F9B000000000001 /* SupabaseClient.swift in Sources */,
+				A10000022F9B000000000002 /* SupabaseSession.swift in Sources */,
+				A10000032F9B000000000003 /* SupabaseRowEncoders.swift in Sources */,
+				A10000042F9B000000000004 /* SupabaseIdentityStore.swift in Sources */,
+				A10000052F9B000000000005 /* IdentitySyncQueue.swift in Sources */,
+				A10000062F9B000000000006 /* SyncingIdentityStore.swift in Sources */,
 					25025AFFA700912F76A7D988 /* FaceCropper.swift in Sources */,
 				7345B153C93627948A688CC4 /* FaceEmbeddingModels.swift in Sources */,
 				A462B38E5C8924717FCDD3A5 /* FaceMatcher.swift in Sources */,
 				74479E7F4B18FC04588E759D /* FaceQualityFilter.swift in Sources */,
 				45B41B236D6C01548084449B /* FaceVisionDebugPipeline.swift in Sources */,
 				C1DA506282C4A2AD8340B2D1 /* IdentityPipeline.swift in Sources */,
+				C1DA507282C4A2AD8340B2D2 /* ConversationPartnerResolver.swift in Sources */,
 				0E97130F936BD3CC7750DD03 /* LocalIdentityStore.swift in Sources */,
 				02749C4B4C19CC093F8C00DA /* LocalWorkerClient.swift in Sources */,
 				DE415D57253C5B680971ADE6 /* RollingIdentityConfirmor.swift in Sources */,
@@ -500,6 +571,7 @@
 				AEDB0F715E80C88D1BCD0C77 /* VoiceActivityDetector.swift in Sources */,
 				BAA1B8FCE3445656D62E9058 /* VoicePreviewPlayer.swift in Sources */,
 				E40AC0D8B91F1BFE57957AAC /* PeopleDictionaryView.swift in Sources */,
+				E40AC0E8B91F1BFE57957AAC /* StreamSummaryHistoryView.swift in Sources */,
 				94BE63803B4D4340B4847C29 /* PersonDayView.swift in Sources */,
 				E5FD150A5EA2ADAC88BD5813 /* PersonDetailView.swift in Sources */,
 			);
@@ -524,12 +596,12 @@
 /* Begin PBXTargetDependency section */
 		E66CC0142F3E05D900B07379 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 8A8A8A8A8A8A8A8A8A8A8A8A /* CameraAccess */;
+			target = 8A8A8A8A8A8A8A8A8A8A8A8A /* Memento */;
 			targetProxy = E66CC0132F3E05D900B07379 /* PBXContainerItemProxy */;
 		};
 		E699CC9A2E8150670052C240 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 8A8A8A8A8A8A8A8A8A8A8A8A /* CameraAccess */;
+			target = 8A8A8A8A8A8A8A8A8A8A8A8A /* Memento */;
 			targetProxy = E699CC992E8150670052C240 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -551,6 +623,9 @@
 				FRAMEWORK_SEARCH_PATHS = "";
 				INFOPLIST_FILE = CameraAccess/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB1ZW5rd2psamhtaGFubG51dWd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NTc5NDUsImV4cCI6MjA5NTUzMzk0NX0.2yc03egScMkUJqQjkK2t9oYkl1zMttCTfzRCR4YUo1Y";
+				SUPABASE_PROJECT_REF = puenkwjljhmhanlnuugy;
+				SUPABASE_URL = "https://puenkwjljhmhanlnuugy.supabase.co";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -587,6 +662,9 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.seanlee.smartglasses.cameraaccess;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
+				SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB1ZW5rd2psamhtaGFubG51dWd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5NTc5NDUsImV4cCI6MjA5NTUzMzk0NX0.2yc03egScMkUJqQjkK2t9oYkl1zMttCTfzRCR4YUo1Y";
+				SUPABASE_PROJECT_REF = puenkwjljhmhanlnuugy;
+				SUPABASE_URL = "https://puenkwjljhmhanlnuugy.supabase.co";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -616,7 +694,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = CameraAccess;
+				TEST_TARGET_NAME = Memento;
 			};
 			name = Debug;
 		};
@@ -643,7 +721,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = CameraAccess;
+				TEST_TARGET_NAME = Memento;
 			};
 			name = Release;
 		};
@@ -673,7 +751,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CameraAccess.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/CameraAccess";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Memento.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Memento";
 			};
 			name = Debug;
 		};
@@ -702,7 +780,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CameraAccess.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/CameraAccess";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Memento.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Memento";
 			};
 			name = Release;
 		};
@@ -825,7 +903,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		9A9A9A9A9A9A9A9A9A9A9A9A /* Build configuration list for PBXNativeTarget "CameraAccess" */ = {
+		9A9A9A9A9A9A9A9A9A9A9A9A /* Build configuration list for PBXNativeTarget "Memento" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				0B0B0B0B0B0B0B0B0B0B0B0B /* Debug */,
@@ -834,7 +912,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		DDDDDDDDDDDDDDDDDDDDDD /* Build configuration list for PBXProject "CameraAccess" */ = {
+		DDDDDDDDDDDDDDDDDDDDDD /* Build configuration list for PBXProject "Memento" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				EEEEEEEEEEEEEEEEEEEEEE /* Debug */,
@@ -843,7 +921,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		E66CC0172F3E05D900B07379 /* Build configuration list for PBXNativeTarget "CameraAccessUITests" */ = {
+		E66CC0172F3E05D900B07379 /* Build configuration list for PBXNativeTarget "MementoUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				E66CC0152F3E05D900B07379 /* Debug */,
@@ -852,7 +930,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		E699CC9D2E8150670052C240 /* Build configuration list for PBXNativeTarget "CameraAccessTests" */ = {
+		E699CC9D2E8150670052C240 /* Build configuration list for PBXNativeTarget "MementoTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				E699CC9B2E8150670052C240 /* Debug */,
@@ -874,6 +952,13 @@
 		};
 /* End XCRemoteSwiftPackageReference section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		F30000162F96000000000016 /* XCLocalSwiftPackageReference "DebugBridge" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = DebugBridge;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		F30000112F96000000000011 /* MWDATCore */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -889,6 +974,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = F30000102F96000000000010 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
 			productName = MWDATDisplay;
+		};
+		F30000152F96000000000015 /* DebugBridgeUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F30000162F96000000000016 /* XCLocalSwiftPackageReference "DebugBridge" */;
+			productName = DebugBridgeUI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -17,7 +17,8 @@ struct NonStreamView: View {
 
   var body: some View {
     ZStack {
-      Color.black.edgesIgnoringSafeArea(.all)
+      MementoTheme.homeBackground
+        .edgesIgnoringSafeArea(.all)
 
       if showSettingsMenu {
         Color.clear
@@ -33,7 +34,7 @@ struct NonStreamView: View {
       VStack {
         topBar
 
-        Spacer()
+        Spacer(minLength: 36)
 
         heroContent
 
@@ -49,7 +50,16 @@ struct NonStreamView: View {
   }
 
   private var topBar: some View {
-    HStack {
+    HStack(alignment: .center, spacing: 12) {
+      VStack(alignment: .leading, spacing: 2) {
+        Text("Memento")
+          .font(.system(size: 19, weight: .semibold))
+          .foregroundColor(.white)
+        Text(topStatusText)
+          .font(.system(size: 12, weight: .medium))
+          .foregroundColor(Color.white.opacity(0.62))
+      }
+
       Spacer()
 
       Button {
@@ -58,10 +68,15 @@ struct NonStreamView: View {
         }
       } label: {
         Image(systemName: "gearshape")
-          .resizable()
-          .aspectRatio(contentMode: .fit)
+          .font(.system(size: 17, weight: .semibold))
           .foregroundColor(.white)
-          .frame(width: 24, height: 24)
+          .frame(width: 42, height: 42)
+          .background(MementoTheme.panelRaised)
+          .overlay(
+            RoundedRectangle(cornerRadius: 12)
+              .stroke(MementoTheme.primary.opacity(0.22), lineWidth: 1)
+          )
+          .clipShape(RoundedRectangle(cornerRadius: 12))
       }
       .overlay(alignment: .topTrailing) {
         if showSettingsMenu {
@@ -75,6 +90,13 @@ struct NonStreamView: View {
     .zIndex(2)
   }
 
+  private var topStatusText: String {
+    if viewModel.datIsStreamRunning { return "Stream active" }
+    if viewModel.datRegistrationStateText == "registered" && viewModel.datHasActiveDevice { return "Glasses ready" }
+    if viewModel.datRegistrationStateText == "registered" { return "Registered" }
+    return "Disconnected"
+  }
+
   private var settingsMenu: some View {
     VStack(spacing: 8) {
       CustomButton(
@@ -83,17 +105,6 @@ struct NonStreamView: View {
         isDisabled: false
       ) {
         showAdvancedControls = true
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-          showSettingsMenu = false
-        }
-      }
-
-      CustomButton(
-        title: "People",
-        style: .primary,
-        isDisabled: false
-      ) {
-        viewModel.openPeopleDictionary()
         withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
           showSettingsMenu = false
         }
@@ -113,22 +124,36 @@ struct NonStreamView: View {
   }
 
   private var heroContent: some View {
-    VStack(spacing: 12) {
-      Image(.cameraAccessIcon)
+    VStack(spacing: 18) {
+      Image(.smartGlassesIcon)
         .resizable()
         .renderingMode(.template)
-        .foregroundColor(.white)
+        .foregroundStyle(
+          LinearGradient(
+            colors: [.white, MementoTheme.accent],
+            startPoint: .top,
+            endPoint: .bottom
+          )
+        )
         .aspectRatio(contentMode: .fit)
-        .frame(width: 120)
+        .frame(width: 116, height: 82)
 
-      Text("Stream Your Glasses Camera")
-        .font(.system(size: 20, weight: .semibold))
-        .foregroundColor(.white)
+      VStack(spacing: 8) {
+        Text("Memento")
+          .font(.system(size: 32, weight: .semibold))
+          .foregroundColor(.white)
 
-      Text("Tap the Start streaming button to stream video from your glasses.")
-        .font(.system(size: 15))
-        .multilineTextAlignment(.center)
-        .foregroundColor(.white)
+        Text("Live memory for Meta smart glasses.")
+          .font(.system(size: 15, weight: .medium))
+          .multilineTextAlignment(.center)
+          .foregroundColor(Color.white.opacity(0.68))
+      }
+
+      HStack(spacing: 8) {
+        MementoStatusChip(title: "Camera", isActive: viewModel.datHasActiveDevice)
+        MementoStatusChip(title: "People", isActive: !viewModel.peopleDictionaryEntries.isEmpty)
+        MementoStatusChip(title: "Display", isActive: viewModel.glassesDisplayConnected)
+      }
     }
     .padding(.horizontal, 12)
   }
@@ -136,11 +161,13 @@ struct NonStreamView: View {
   private var startControls: some View {
     VStack(spacing: 12) {
       activeDeviceStatus
+      LatestStreamSummaryPanel(viewModel: viewModel)
 
       if viewModel.datRegistrationStateText != "registered" {
-        CustomButton(
+        MementoControlButton(
           title: viewModel.connectGlassesButtonTitle,
-          style: .primary,
+          systemImage: "link",
+          style: .secondary,
           isDisabled: !viewModel.canConnectRealGlasses
         ) {
           Task { await viewModel.connectRealGlasses() }
@@ -148,14 +175,53 @@ struct NonStreamView: View {
         .accessibilityIdentifier("Connect my glasses")
       }
 
-      CustomButton(
-        title: "Start streaming",
-        style: .primary,
-        isDisabled: !viewModel.canStartRealStream
-      ) {
-        Task { await viewModel.startRealGlassesStream() }
+      HStack(spacing: 10) {
+        MementoControlButton(
+          title: "People",
+          systemImage: "person.2",
+          style: .secondary,
+          isDisabled: false
+        ) {
+          viewModel.openPeopleDictionary()
+        }
+
+        MementoControlButton(
+          title: "Summaries",
+          systemImage: "sparkles.rectangle.stack",
+          style: .secondary,
+          isDisabled: false
+        ) {
+          viewModel.openStreamSummaryHistory()
+        }
+
+        MementoControlButton(
+          title: "Start Stream",
+          systemImage: "play.fill",
+          style: .primary,
+          isDisabled: !viewModel.canStartRealStream
+        ) {
+          Task { await viewModel.startRealGlassesStream() }
+        }
+        .accessibilityIdentifier("Start streaming")
       }
-      .accessibilityIdentifier("Start streaming")
+
+      MementoControlButton(
+        title: "Activate Display",
+        systemImage: "rectangle.on.rectangle",
+        style: .secondary,
+        isDisabled: viewModel.datRegistrationStateText != "registered"
+      ) {
+        viewModel.activateGlassesDisplayControl()
+      }
+
+      if viewModel.glassesDisplayStatusText != "Display idle" {
+        Text(viewModel.glassesDisplayStatusText)
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundColor(viewModel.glassesDisplayConnected ? MementoTheme.success : Color.white.opacity(0.72))
+          .multilineTextAlignment(.center)
+          .lineLimit(2)
+          .minimumScaleFactor(0.85)
+      }
 
       if viewModel.datLastErrorText != "None" {
         Text(viewModel.datLastErrorText)
@@ -168,18 +234,7 @@ struct NonStreamView: View {
   }
 
   private var activeDeviceStatus: some View {
-    HStack(spacing: 8) {
-      Image(systemName: "hourglass")
-        .resizable()
-        .aspectRatio(contentMode: .fit)
-        .foregroundColor(Color.white.opacity(0.7))
-        .frame(width: 16, height: 16)
-
-      Text(waitingStatusText)
-        .font(.system(size: 14))
-        .foregroundColor(Color.white.opacity(0.7))
-    }
-    .opacity(viewModel.canStartRealStream ? 0 : 1)
+    MementoReadinessPill(text: waitingStatusText, isReady: viewModel.canStartRealStream)
   }
 
   private var waitingStatusText: String {
@@ -193,18 +248,118 @@ struct NonStreamView: View {
   }
 }
 
+private struct MementoStatusChip: View {
+  let title: String
+  let isActive: Bool
+
+  var body: some View {
+    Text(title)
+      .font(.system(size: 11, weight: .semibold))
+      .foregroundColor(isActive ? .black : Color.white.opacity(0.72))
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .background(isActive ? MementoTheme.accent : MementoTheme.panelRaised)
+      .overlay(
+        RoundedRectangle(cornerRadius: 8)
+          .stroke(isActive ? Color.clear : MementoTheme.primary.opacity(0.18), lineWidth: 1)
+      )
+      .clipShape(RoundedRectangle(cornerRadius: 8))
+  }
+}
+
+private struct MementoReadinessPill: View {
+  let text: String
+  let isReady: Bool
+
+  var body: some View {
+    HStack(spacing: 8) {
+      Image(systemName: isReady ? "checkmark.circle.fill" : "circle.dashed")
+        .font(.system(size: 14, weight: .semibold))
+      Text(isReady ? "Ready" : text)
+        .font(.system(size: 13, weight: .medium))
+        .lineLimit(1)
+        .minimumScaleFactor(0.8)
+    }
+    .foregroundColor(isReady ? .black : Color.white.opacity(0.72))
+    .frame(maxWidth: .infinity)
+    .padding(.vertical, 11)
+    .background(isReady ? MementoTheme.accent : MementoTheme.panelRaised)
+    .overlay(
+      RoundedRectangle(cornerRadius: 10)
+        .stroke(isReady ? Color.clear : MementoTheme.primary.opacity(0.18), lineWidth: 1)
+    )
+    .clipShape(RoundedRectangle(cornerRadius: 10))
+  }
+}
+
+private struct MementoControlButton: View {
+  enum Style {
+    case primary
+    case secondary
+  }
+
+  let title: String
+  let systemImage: String
+  let style: Style
+  let isDisabled: Bool
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      Label(title, systemImage: systemImage)
+        .font(.system(size: 15, weight: .semibold))
+        .lineLimit(1)
+        .minimumScaleFactor(0.82)
+        .foregroundColor(foregroundColor)
+        .frame(maxWidth: .infinity)
+        .frame(height: 54)
+        .background(backgroundColor)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+          RoundedRectangle(cornerRadius: 12)
+            .stroke(borderColor, lineWidth: style == .secondary ? 1 : 0)
+        )
+    }
+    .disabled(isDisabled)
+    .opacity(isDisabled ? 0.45 : 1)
+  }
+
+  private var backgroundColor: Color {
+    switch style {
+    case .primary:
+      return .appPrimary
+    case .secondary:
+      return MementoTheme.panelRaised
+    }
+  }
+
+  private var foregroundColor: Color {
+    switch style {
+    case .primary:
+      return .white
+    case .secondary:
+      return .white
+    }
+  }
+
+  private var borderColor: Color {
+    MementoTheme.primary.opacity(0.20)
+  }
+}
+
 private struct AdvancedControlsSheet: View {
   @ObservedObject var viewModel: StreamSessionViewModel
   @Environment(\.dismiss) private var dismiss
 
   var body: some View {
     ZStack {
-      Color.black.edgesIgnoringSafeArea(.all)
+      MementoTheme.homeBackground
+        .edgesIgnoringSafeArea(.all)
 
       ScrollView {
         VStack(spacing: 14) {
           HStack {
-            Text("App controls")
+            Text("Memento Controls")
               .font(.system(size: 18, weight: .semibold))
               .foregroundColor(.white)
             Spacer()
@@ -215,6 +370,7 @@ private struct AdvancedControlsSheet: View {
           }
 
           ConnectionStatusCard(viewModel: viewModel)
+          GlassesDisplayStatusCard(viewModel: viewModel)
           LastDetectedFacePanel(viewModel: viewModel)
           WearerVoiceProfilePanel(viewModel: viewModel)
           SettingsCard(viewModel: viewModel)
@@ -240,7 +396,7 @@ private struct ConnectionStatusCard: View {
           .foregroundColor(.white)
           .aspectRatio(contentMode: .fit)
           .frame(width: 24)
-        Text("Meta Glasses")
+        Text("Memento Glasses")
           .font(.system(size: 17, weight: .bold))
           .foregroundColor(.white)
         Spacer()
@@ -261,7 +417,7 @@ private struct ConnectionStatusCard: View {
           label("Readiness")
           Text(viewModel.datStartReadinessReasonText)
             .font(.system(size: 12))
-            .foregroundColor(viewModel.canStartRealStream ? .green : Color.orange.opacity(0.9))
+            .foregroundColor(viewModel.canStartRealStream ? MementoTheme.success : MementoTheme.warning)
             .multilineTextAlignment(.trailing)
             .fixedSize(horizontal: false, vertical: true)
         }
@@ -271,14 +427,13 @@ private struct ConnectionStatusCard: View {
         statusLine("Camera", viewModel.datCameraPermissionStatusText)
         statusLine("Device", deviceStatusText)
         if viewModel.datLastErrorText != "None" {
-          statusLine("DAT", viewModel.datLastErrorText, color: Color.orange.opacity(0.9))
+          statusLine("DAT", viewModel.datLastErrorText, color: MementoTheme.warning)
         }
       }
       .padding(.top, 2)
     }
     .padding(14)
-    .background(Color.white.opacity(0.08))
-    .clipShape(RoundedRectangle(cornerRadius: 12))
+    .mementoPanel(cornerRadius: 12)
   }
 
   private var modeBadge: some View {
@@ -287,7 +442,7 @@ private struct ConnectionStatusCard: View {
       .foregroundColor(.white)
       .padding(.horizontal, 8)
       .padding(.vertical, 3)
-      .background(Color.white.opacity(0.15))
+      .background(MementoTheme.primary.opacity(0.30))
       .clipShape(Capsule())
   }
 
@@ -313,6 +468,66 @@ private struct ConnectionStatusCard: View {
         .minimumScaleFactor(0.82)
         .fixedSize(horizontal: false, vertical: true)
     }
+  }
+}
+
+private struct GlassesDisplayStatusCard: View {
+  @ObservedObject var viewModel: StreamSessionViewModel
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      HStack(spacing: 10) {
+        Image(systemName: "eyeglasses")
+          .font(.system(size: 22, weight: .semibold))
+          .foregroundColor(viewModel.glassesDisplayConnected ? MementoTheme.success : .white.opacity(0.65))
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Glasses Display")
+            .font(.system(size: 15, weight: .bold))
+            .foregroundColor(.white)
+          Text(displaySubtitle)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundColor(viewModel.glassesDisplayConnected ? MementoTheme.success : MementoTheme.warning)
+        }
+        Spacer()
+        Button("Activate") {
+          viewModel.activateGlassesDisplayControl()
+        }
+        .buttonStyle(.borderedProminent)
+        .font(.system(size: 12, weight: .semibold))
+        .disabled(viewModel.datRegistrationStateText != "registered")
+      }
+
+      Text(viewModel.glassesDisplayStatusText)
+        .font(.system(size: 12))
+        .foregroundColor(.white.opacity(0.72))
+        .fixedSize(horizontal: false, vertical: true)
+
+      if viewModel.glassesDisplayRequiresDATAppUpdate {
+        Text("Update the DAT app on the glasses before testing display output.")
+          .font(.system(size: 11, weight: .semibold))
+          .foregroundColor(MementoTheme.warning)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+
+      if viewModel.glassesDisplayLastCardText != "none" {
+        Text(viewModel.glassesDisplayLastCardText)
+          .font(.system(size: 11))
+          .foregroundColor(.white.opacity(0.55))
+          .lineLimit(4)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+    .padding(12)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .mementoPanel(cornerRadius: 8)
+  }
+
+  private var displaySubtitle: String {
+    let count = viewModel.glassesDisplaySendCount
+    if viewModel.glassesDisplayConnected {
+      return "connected | sent \(count)"
+    }
+    return viewModel.glassesDisplayStateText
   }
 }
 
@@ -381,7 +596,7 @@ private struct LastDetectedFacePanel: View {
                 .font(.system(size: 11))
                 .foregroundColor(.white.opacity(0.70))
             } else {
-              Text("\(viewModel.streamEndedReviewText) | first group samples \(group.sampleCount), embeddings \(group.embeddingCount), \(group.qualitySummary)")
+              Text("\(viewModel.streamEndedReviewText) | current group samples \(group.sampleCount), embeddings \(group.embeddingCount), \(group.qualitySummary)")
                 .font(.system(size: 11))
                 .foregroundColor(.white.opacity(0.70))
             }
@@ -414,7 +629,7 @@ private struct LastDetectedFacePanel: View {
           if group.embeddingCount < 3 {
             Text("Need 3+ embedded face pictures before saving.")
               .font(.system(size: 11, weight: .semibold))
-              .foregroundColor(.orange.opacity(0.9))
+              .foregroundColor(MementoTheme.warning)
           }
         } else {
           Button("Dismiss") {
@@ -427,8 +642,7 @@ private struct LastDetectedFacePanel: View {
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .padding(12)
-    .background(Color.white.opacity(0.10))
-    .clipShape(RoundedRectangle(cornerRadius: 8))
+    .mementoPanel(cornerRadius: 8)
   }
 }
 
@@ -453,7 +667,7 @@ private struct WearerVoiceProfilePanel: View {
         Spacer()
         Image(systemName: profile.isEnrolled ? "person.crop.circle.badge.checkmark" : "person.crop.circle.badge.plus")
           .font(.system(size: 24))
-          .foregroundColor(profile.isEnrolled ? .green : .white.opacity(0.55))
+          .foregroundColor(profile.isEnrolled ? MementoTheme.success : .white.opacity(0.55))
       }
 
       if profile.isRecording {
@@ -472,11 +686,11 @@ private struct WearerVoiceProfilePanel: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.black.opacity(0.28))
+        .background(MementoTheme.panelRaised)
         .clipShape(RoundedRectangle(cornerRadius: 8))
 
         ProgressView(value: min(profile.recordingSeconds / SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds, 1.0))
-          .tint(profile.recordingSeconds >= SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds ? .green : .orange)
+          .tint(profile.recordingSeconds >= SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds ? MementoTheme.success : MementoTheme.warning)
         HStack(spacing: 8) {
           Button("Next Phrase") {
             viewModel.nextWearerVoicePrompt()
@@ -524,13 +738,12 @@ private struct WearerVoiceProfilePanel: View {
 
       Text(viewModel.wearerVoiceStatusText)
         .font(.system(size: 11, weight: .semibold))
-        .foregroundColor(viewModel.wearerVoiceStatusText.contains("Saved") || viewModel.wearerVoiceStatusText.contains("ready") ? .green : .white.opacity(0.55))
+        .foregroundColor(viewModel.wearerVoiceStatusText.contains("Saved") || viewModel.wearerVoiceStatusText.contains("ready") ? MementoTheme.success : .white.opacity(0.55))
         .fixedSize(horizontal: false, vertical: true)
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .padding(12)
-    .background(Color.white.opacity(0.08))
-    .clipShape(RoundedRectangle(cornerRadius: 10))
+    .mementoPanel(cornerRadius: 10)
   }
 }
 
@@ -541,7 +754,7 @@ private struct SettingsCard: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      toggleRow("Pause analysis", isOn: $viewModel.analysisPaused)
+      toggleRow("Pause all analysis", isOn: $viewModel.analysisPaused)
       Divider().background(Color.white.opacity(0.1))
       toggleRow("Identity recognition", isOn: $viewModel.identityRecognitionEnabled)
       Divider().background(Color.white.opacity(0.1))
@@ -549,7 +762,13 @@ private struct SettingsCard: View {
       Divider().background(Color.white.opacity(0.1))
       cloudFaceEmbeddingRow
       Divider().background(Color.white.opacity(0.1))
-      toggleRow("Live phone audio capture", isOn: $viewModel.livePhoneAudioCaptureEnabled)
+      cloudSpeakerEmbeddingRow
+      Divider().background(Color.white.opacity(0.1))
+      toggleRow("Live phone audio capture (required for DAT)", isOn: $viewModel.livePhoneAudioCaptureEnabled)
+      Divider().background(Color.white.opacity(0.1))
+      liveTranscriptionRow
+      Divider().background(Color.white.opacity(0.1))
+      sceneContextRow
       Divider().background(Color.white.opacity(0.1))
       audioSourceRow
       Divider().background(Color.white.opacity(0.1))
@@ -560,8 +779,7 @@ private struct SettingsCard: View {
       .padding(.vertical, 10)
       .padding(.horizontal, 14)
     }
-    .background(Color.white.opacity(0.06))
-    .clipShape(RoundedRectangle(cornerRadius: 10))
+    .mementoPanel(cornerRadius: 10)
   }
 
   private var cloudFaceEmbeddingRow: some View {
@@ -571,31 +789,27 @@ private struct SettingsCard: View {
           .font(.system(size: 13, weight: .medium))
           .foregroundColor(.white.opacity(0.82))
         Spacer()
-        Button("Save") {
-          viewModel.saveCloudFaceEmbeddingSettings()
-        }
-        .font(.system(size: 12, weight: .semibold))
       }
 
-      TextField("GPU worker endpoint", text: $viewModel.cloudFaceEmbeddingEndpointText)
-        .textInputAutocapitalization(.never)
-        .autocorrectionDisabled()
-        .font(.system(size: 12))
-        .padding(8)
-        .background(Color.white.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .foregroundColor(.white)
-
-      SecureField("Worker API key", text: $viewModel.cloudFaceEmbeddingAPIKeyText)
-        .textInputAutocapitalization(.never)
-        .autocorrectionDisabled()
-        .font(.system(size: 12))
-        .padding(8)
-        .background(Color.white.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .foregroundColor(.white)
-
       Text(viewModel.cloudFaceEmbeddingStatusText)
+        .font(.system(size: 11))
+        .foregroundColor(.white.opacity(0.55))
+        .lineLimit(2)
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+  }
+
+  private var cloudSpeakerEmbeddingRow: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        Toggle("AWS canonical speaker embeddings", isOn: $viewModel.cloudSpeakerEmbeddingEnabled)
+          .font(.system(size: 13, weight: .medium))
+          .foregroundColor(.white.opacity(0.82))
+        Spacer()
+      }
+
+      Text(viewModel.cloudSpeakerEmbeddingStatusText)
         .font(.system(size: 11))
         .foregroundColor(.white.opacity(0.55))
         .lineLimit(2)
@@ -627,6 +841,47 @@ private struct SettingsCard: View {
     .padding(.vertical, 10)
   }
 
+  private var liveTranscriptionRow: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        Toggle("Alibaba live transcript", isOn: $viewModel.liveTranscriptionEnabled)
+          .font(.system(size: 13, weight: .medium))
+          .foregroundColor(.white.opacity(0.82))
+        Spacer()
+      }
+
+      Text(viewModel.liveTranscriptionStatusText)
+        .font(.system(size: 11))
+        .foregroundColor(.white.opacity(0.55))
+        .lineLimit(2)
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+  }
+
+  private var sceneContextRow: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack {
+        Toggle("Alibaba scene context", isOn: $viewModel.sceneContextEnabled)
+          .font(.system(size: 13, weight: .medium))
+          .foregroundColor(.white.opacity(0.82))
+        Spacer()
+      }
+
+      Toggle("Use iPhone location context", isOn: $viewModel.sceneLocationContextEnabled)
+        .font(.system(size: 12, weight: .medium))
+        .foregroundColor(.white.opacity(0.68))
+        .disabled(!viewModel.sceneContextEnabled)
+
+      Text(viewModel.sceneContextStatusText)
+        .font(.system(size: 11))
+        .foregroundColor(.white.opacity(0.55))
+        .lineLimit(2)
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+  }
+
   private func toggleRow(_ title: String, isOn: Binding<Bool>) -> some View {
     Toggle(title, isOn: isOn)
       .font(.system(size: 13, weight: .medium))
@@ -641,7 +896,7 @@ private struct SettingsCard: View {
       .foregroundColor(.white.opacity(0.6))
       .frame(maxWidth: .infinity)
       .padding(.vertical, 6)
-      .background(Color.white.opacity(0.07))
+      .background(MementoTheme.panelRaised)
       .clipShape(RoundedRectangle(cornerRadius: 6))
   }
 }
@@ -658,7 +913,7 @@ private struct ActionPanel: View {
     .padding(.horizontal, 20)
     .padding(.bottom, 28)
     .padding(.top, 10)
-    .background(Color.black)
+    .background(MementoTheme.backgroundBottom)
   }
 
   private var realGlassesButtons: some View {

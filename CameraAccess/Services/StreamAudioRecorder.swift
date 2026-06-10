@@ -24,15 +24,23 @@ final class StreamAudioRecorder {
   )!
 
   // Call once per stream to prepare the output file.
-  func start() throws {
-    try writeQueue.sync {
+  func start() {
+    AppLogger.log(.audio, "[StreamAudioRecorder] Start requested")
+    writeQueue.async { [weak self] in
+      guard let self else { return }
       guard !isRecording else {
         AppLogger.log(.audio, "[StreamAudioRecorder] start() called while already recording -> ignored. Existing file=\(outputURL?.lastPathComponent ?? "none"). This means a previous stream's recorder was not stopped properly.")
         return
       }
       let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("stream_\(UUID().uuidString).wav")
-      let file = try AVAudioFile(forWriting: url, settings: Self.targetFormat.settings)
+      let file: AVAudioFile
+      do {
+        file = try AVAudioFile(forWriting: url, settings: Self.targetFormat.settings)
+      } catch {
+        AppLogger.log(.audio, "[StreamAudioRecorder] start() failed: \(error.localizedDescription)")
+        return
+      }
       audioFile = file
       outputURL = url
       converter = nil

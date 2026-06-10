@@ -57,6 +57,7 @@ enum AppLogCategory: String {
   case database = "DATABASE"
   case runSession = "RUN_SESSION"
   case pipelineStats = "PIPELINE_STATS"
+  case display = "DISPLAY"
   case facePipelineStats = "FACE_PIPELINE_STATS"
   case facePipelineStop = "FACE_PIPELINE_STOP"
   case faceCaptureCandidate = "FACE_CAPTURE_CANDIDATE"
@@ -69,19 +70,68 @@ enum AppLogCategory: String {
   case profileSave = "PROFILE_SAVE"
   case streamLifecycle = "STREAM_LIFECYCLE"
   case memory = "MEMORY"
+  case sceneContext = "SCENE_CONTEXT"
+  case activityMode = "ACTIVITY_MODE"
+  case cloudDiarization = "CLOUD_DIARIZATION"
   case audio = "AUDIO"
   case speakerVAD = "SPEAKER_VAD"
   case speakerEmbedding = "SPEAKER_EMBEDDING"
   case speakerEmbeddingModel = "SPEAKER_EMBEDDING_MODEL"
   case speakerMatch = "SPEAKER_MATCH"
   case speakerIdentity = "SPEAKER_IDENTITY"
+  case speakerEnrollment = "SPEAKER_ENROLLMENT"
   case localWorker = "LOCAL_WORKER"
   case mock = "MOCK"
   case tests = "TESTS"
 }
 
 enum AppLogger {
+  private static let suppressedCategories: Set<AppLogCategory> = [
+    .frames,
+    .frameSource,
+    .vision,
+    .visionInput,
+    .visionOrientation,
+    .faceBox,
+    .visionBox,
+    .visionBoxReject,
+    .faceCrop,
+    .faceQuality,
+    .embedding,
+    .faceEmbedding,
+    .faceEmbeddingVector,
+    .faceEmbeddingDebug,
+    .faceEmbeddingSkip,
+    .faceVectorStore,
+    .identityMatch,
+    .faceMatch,
+    .faceMatchSkip,
+    .rollingIdentity,
+    .identityRolling,
+    .pipelineStats,
+    .facePipelineStats,
+    .faceCaptureCandidate,
+    .faceCaptureSave,
+    .faceCaptureSkip,
+    .faceTrack,
+    .faceGroupUpdate,
+    .faceSampleDiversity,
+    .enrollmentCandidate,
+    .audio,
+    .speakerVAD,
+    .speakerEmbedding,
+    .speakerEmbeddingModel,
+    .speakerMatch,
+    .speakerIdentity,
+    .transcript,
+    .transcriptAttach,
+    .transcriptAttachSkip,
+    .vectorStore,
+    .sceneContext
+  ]
   private static let timestampLock = NSLock()
+  private static let printedOnceLock = NSLock()
+  private static var printedOnceKeys: Set<String> = []
   private static let timestampFormatter: ISO8601DateFormatter = {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime]
@@ -89,9 +139,69 @@ enum AppLogger {
   }()
 
   static func log(_ category: AppLogCategory, _ message: String) {
+    guard shouldPrint(category, message) else { return }
     timestampLock.lock()
     let timestamp = timestampFormatter.string(from: Date())
     timestampLock.unlock()
     print("[MetaFace][\(timestamp)][\(category.rawValue)] \(message)")
+  }
+
+  private static func shouldPrint(_ category: AppLogCategory, _ message: String) -> Bool {
+    if category == .sceneContext {
+      return shouldPrintSceneContext(message)
+    }
+    if category == .activityMode {
+      return ActivityModeDebugSettings.isLoggingEnabled()
+    }
+    guard !suppressedCategories.contains(category) else { return false }
+    if category == .database {
+      if message.contains("[SUPABASE_SYNC] enqueued")
+        || message.contains("[SUPABASE_SYNC] applied")
+        || message.contains("[SUPABASE_SYNC] restored pending") {
+        return false
+      }
+      if message.contains("presenceEpisode queued")
+        || message.contains("saved presenceEpisode=")
+        || message.contains("entity=IdentityMatchEvent saved")
+        || message.contains("entity=PersonProfile saved") {
+        return false
+      }
+      if message.contains("[SUPABASE_SYNC] schema-mismatch") {
+        return shouldPrintOnce("supabase-schema-mismatch:\(syncKind(in: message) ?? "unknown")")
+      }
+    }
+    if category == .memory {
+      if message.hasPrefix("Phone assistance display updated")
+        || message.hasPrefix("Phone assistance work invalidated")
+        || message.hasPrefix("Person summary requested")
+        || message.hasPrefix("Person summary stream refresh requested")
+        || message.hasPrefix("Person summary ready")
+        || message.hasPrefix("Live question classifier queued") {
+        return false
+      }
+    }
+    return true
+  }
+
+  private static func shouldPrintSceneContext(_ message: String) -> Bool {
+    message.hasPrefix("Stream summary")
+      || message.hasPrefix("Alibaba stream summary")
+      || message.hasPrefix("[AI_PROXY]")
+  }
+
+  private static func shouldPrintOnce(_ key: String) -> Bool {
+    printedOnceLock.lock()
+    defer { printedOnceLock.unlock() }
+    guard !printedOnceKeys.contains(key) else { return false }
+    printedOnceKeys.insert(key)
+    return true
+  }
+
+  private static func syncKind(in message: String) -> String? {
+    guard let range = message.range(of: "kind=") else { return nil }
+    return message[range.upperBound...]
+      .split(whereSeparator: { $0 == " " || $0 == "\t" })
+      .first
+      .map(String.init)
   }
 }

@@ -1,8 +1,15 @@
-# AWS g4dn.xlarge Face Embedding Worker
+# AWS Face Embedding Worker
 
-This worker is intended for an AWS `g4dn.xlarge` GPU instance running Ubuntu with NVIDIA drivers. It exposes the iOS app contract:
+This worker exposes AdaFace IR-101 (WebFace12M) embeddings for the iOS app. It
+shares EC2 instance `i-0c400af918e775f20` (`m7i-flex.large`, us-west-1) with the
+speaker worker — face runs on port `8080`, speaker on port `8090`. For GPU
+inference move the worker to a `g4dn.xlarge` instance unchanged; the iOS side
+discovers the public IP via the same `DiarizenStartEC2` Lambda regardless.
+
+The iOS app contract:
 
 ```text
+GET  /health
 POST /face/embed
 Authorization: Bearer <FACE_WORKER_API_KEY>
 Content-Type: application/json
@@ -70,13 +77,18 @@ pip install --index-url https://download.pytorch.org/whl/cpu \
 CPU inference is expected to be much slower than the `g4dn.xlarge` GPU path, but
 it is usable for occasional refinement or post-session processing.
 
-Then set the iOS app's `AWS AdaFace embeddings` endpoint to:
+The iOS app does not need an endpoint override when the AWS AdaFace toggle is
+on; the `DiarizenStartEC2` Lambda starts the EC2 instance via `startLiveFace`
+and the app probes the returned public IP at `:8080/health`. For manual testing
+without the Lambda, set the endpoint override to:
 
 ```text
 http://<ec2-public-dns-or-private-ip>:8080
 ```
 
-For production, put the worker behind TLS and restrict inbound security group access.
+The security group `sg-0578a4db814b95156` already permits inbound TCP `8080`
+from the development network. For production, put the worker behind TLS and
+restrict the source CIDR further.
 
 ## Model
 

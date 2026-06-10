@@ -1,16 +1,36 @@
 import SwiftUI
 
+#if DEBUG
+import DebugBridgeCore
+#if canImport(UIKit)
+import DebugBridgeUI
+#endif
+#endif
+
 @main
-struct CameraAccessApp: App {
+struct MementoApp: App {
   @Environment(\.scenePhase) private var scenePhase
 
   init() {
     DATGlassesManager.shared.configureAtStartup()
+
+    #if DEBUG
+    Task { @MainActor in
+      #if canImport(UIKit)
+      DebugBridgeUIWiring.installAll()
+      DebugOverlayWindow.shared.install(
+        recording: ProcessInfo.processInfo.arguments.contains("--gstack-recording")
+      )
+      #endif
+      StateServer.shared.start()
+    }
+    #endif
   }
 
   var body: some Scene {
     WindowGroup {
       StreamSessionView()
+        .tint(.appPrimary)
         .onOpenURL { url in
           Task {
             await DATGlassesManager.shared.handleOpenURL(url)

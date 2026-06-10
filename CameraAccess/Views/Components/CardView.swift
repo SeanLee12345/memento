@@ -25,7 +25,7 @@ struct CardView<Content: View>: View {
     VStack(spacing: 0) {
       content
     }
-    .background(Color(.secondarySystemGroupedBackground))
+    .background(Color.mementoListCard)
     .cornerRadius(12)
     .shadow(
       color: Color.black.opacity(0.15),

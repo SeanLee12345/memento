@@ -8,9 +8,11 @@
 
 import AVFoundation
 import Combine
+import CoreImage
 import CoreMedia
 import CoreVideo
 import SwiftUI
+import UIKit
 
 enum StreamingStatus {
   case streaming
@@ -19,11 +21,157 @@ enum StreamingStatus {
   case stopped
 }
 
+private struct SendablePixelBuffer: @unchecked Sendable {
+  let pixelBuffer: CVPixelBuffer
+}
+
+private enum GlassesIdentityConfirmation: Equatable {
+  case recognized(personId: UUID, displayName: String)
+  case unknown
+  case selectingPerson
+}
+
+private enum GlassesDisplayWindow: Equatable {
+  case live
+  case people
+  case context
+  case transcripts
+}
+
+private enum StreamSummaryHistoryStore {
+  private static let key = "streamSummaryHistory.v1"
+  private static let maxEntries = 50
+
+  static func load(defaults: UserDefaults = .standard) -> [StreamSummaryHistoryEntry] {
+    guard let data = defaults.data(forKey: key),
+          let entries = try? JSONDecoder().decode([StreamSummaryHistoryEntry].self, from: data) else {
+      return []
+    }
+    return entries.sorted { $0.endedAt > $1.endedAt }
+  }
+
+  static func save(_ entries: [StreamSummaryHistoryEntry], defaults: UserDefaults = .standard) {
+    let trimmed = Array(entries.sorted { $0.endedAt > $1.endedAt }.prefix(maxEntries))
+    guard let data = try? JSONEncoder().encode(trimmed) else { return }
+    defaults.set(data, forKey: key)
+  }
+}
+
+struct IdentityPromptThumbnailSelection {
+  let image: UIImage?
+  let source: String
+}
+
+enum GlassesDisplaySendTiming: Equatable {
+  case immediate
+  case coalesced(nanoseconds: UInt64)
+
+  static let transientStatusDelayNanoseconds: UInt64 = 250_000_000
+
+  static func streamStatus(reason: String) -> GlassesDisplaySendTiming {
+    reason == "dat-stream-preparing"
+      ? .coalesced(nanoseconds: transientStatusDelayNanoseconds)
+      : .immediate
+  }
+}
+
+private enum CloudDiarizationTuning {
+  static let minimumAudioSeconds = 5.0
+  static let minSpeakerEnrollmentPreviewSeconds = 1.0
+  static let maxSpeakerEvidenceAge: TimeInterval = 10.0
+  static let maxTimelineEvidenceAge: TimeInterval = 4.0
+  static let maxFaceEvidenceAge: TimeInterval = 6.0
+}
+
 @MainActor
 final class StreamSessionViewModel: ObservableObject {
+  nonisolated static let liveDATPhonePreviewEnabled = false
+  nonisolated private static let displayImageBucketID = "face-crops"
+  nonisolated private static let displayImageSignedURLExpirationSeconds = 10 * 60
+
+  nonisolated static func streamingDashboardText(
+    datFramesReceived: UInt64,
+    lastFrameTimestampText: String,
+    datLastErrorText: String,
+    hasReceivedFirstFrame: Bool
+  ) -> (frameText: String, statusText: String, currentLineOverride: String?) {
+    if datFramesReceived > 0 {
+      return (
+        frameText: "\(datFramesReceived) received, last \(lastFrameTimestampText)",
+        statusText: "Display active",
+        currentLineOverride: nil
+      )
+    }
+
+    if datLastErrorText.localizedCaseInsensitiveContains("no video frames") {
+      return (
+        frameText: "0 received; camera frames missing",
+        statusText: "Camera stream has no frames",
+        currentLineOverride: "Camera: no video frames"
+      )
+    }
+
+    return (
+      frameText: "waiting for first frame",
+      statusText: hasReceivedFirstFrame ? "Display active" : "Starting stream",
+      currentLineOverride: nil
+    )
+  }
+
+  nonisolated static func streamRunningModeText(
+    hasActiveRecognizedPeople: Bool,
+    detectedFaceCount: Int,
+    activeConversationPartnerStateText: String,
+    activeSpeakerStateText: String,
+    liveTranscriptPreviewText: String,
+    hasReceivedFirstFrame: Bool,
+    activityMode: ActivityModeClassification? = nil
+  ) -> String {
+    guard hasReceivedFirstFrame else { return "Starting stream" }
+    if let activityMode {
+      return activityMode.displayText
+    }
+
+    let partnerState = activeConversationPartnerStateText.lowercased()
+    let speakerState = activeSpeakerStateText.lowercased()
+    let recognizedPeople = hasActiveRecognizedPeople
+      || ["confirmed", "possible", "multiplepeople"].contains(partnerState)
+      || ["confirmed", "possible", "speaking"].contains(speakerState)
+      ? ["recognized person"]
+      : []
+    let request = ActivityModeClassificationRequest(
+      transcriptText: liveTranscriptPreviewText,
+      sceneContexts: [],
+      recognizedPeople: recognizedPeople,
+      detectedFaceCount: detectedFaceCount,
+      identityEvidence: nil,
+      locationLabel: nil,
+      streamState: "streaming",
+      reason: "stream-running-fallback"
+    )
+    return ActivityModeClassifier.fallbackClassification(for: request).displayText
+  }
+
+  nonisolated static func streamRunningRecognizedPeopleText(_ names: [String]) -> String {
+    let uniqueNames = uniqueDisplayStrings(names)
+    return uniqueNames.isEmpty ? "None" : uniqueNames.joined(separator: ", ")
+  }
+
+  nonisolated private static func hasMeaningfulLiveTranscript(_ value: String) -> Bool {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !normalized.isEmpty else { return false }
+    return ![
+      "no live transcript yet",
+      "listening...",
+      "analysis paused"
+    ].contains(normalized)
+  }
+
   // MARK: - Published State
 
   @Published var currentVideoFrame: UIImage?
+  @Published var lastStreamPhotoSnapshot: UIImage?
+  @Published var streamPhotoStatusText: String = "No stream photo yet"
   @Published var currentImageSize: CGSize = .zero
   @Published var detectedFaces: [DetectedFace] = []
   @Published var hasReceivedFirstFrame: Bool = false
@@ -43,7 +191,12 @@ final class StreamSessionViewModel: ObservableObject {
   @Published var lastFrameIntervalText: String = "0.0 ms"
   @Published var liveFrameStatsText: String = "received=0 preview=0 vision=0/0 dropped=0 fps=0.0 avgVision=0.0 ms"
   @Published var people: [Person] = []
-  @Published var analysisPaused = false
+  @Published var analysisPaused = false {
+    didSet {
+      guard oldValue != analysisPaused else { return }
+      handleAnalysisPausedChanged()
+    }
+  }
   @Published var identityRecognitionEnabled = true
   @Published var conversationSavingEnabled = true
   @Published var livePhoneAudioCaptureEnabled = true {
@@ -61,6 +214,10 @@ final class StreamSessionViewModel: ObservableObject {
   @Published var activeIdentityName = "None"
   @Published var activeIdentityConfidenceText = "0.00"
   @Published var activeIdentityStateText = "none"
+  @Published var activeConversationPartnerName = "None"
+  @Published var activeConversationPartnerStateText = "none"
+  @Published var activeConversationPartnerConfidenceText = "0.00"
+  @Published var activeConversationPartnerEvidenceText = "No partner evidence yet"
   @Published var detectedFaceCount: Int = 0
   @Published var isUnknownPersonVisible = false
   @Published var pendingEnrollmentFacePreview: UIImage?
@@ -71,10 +228,20 @@ final class StreamSessionViewModel: ObservableObject {
   @Published var lastEnrollmentCandidateName = ""
   @Published var identitySummaryText = "Identity idle"
   @Published var recentConversationAttributionText = "No transcript attribution yet"
-  @Published var phoneAssistanceTitleText = "Phone assistance"
-  @Published var phoneAssistanceDetailText = "Identify a person to show conversation memory."
-  @Published var phoneAssistanceStatusText = "Phone display fallback"
+  @Published var presencePipelineVerificationText = "Presence: waiting for name or identity evidence"
+  @Published var sceneContextPipelineVerificationText = "5W/1H: waiting for scene context"
+  @Published var activityModeVerificationText = "Activity mode: waiting for stream context"
+  @Published var memoryTriggerVerificationText = "Memory trigger: waiting for a past-reference question"
+  @Published var phoneAssistanceTitleText = "Memento"
+  @Published var phoneAssistanceDetailText = "Live memory will appear when the stream recognizes someone."
+  @Published var phoneAssistanceStatusText = "Ready"
+  @Published var phoneAssistanceThumbnail: UIImage?
   @Published var phoneAssistanceDismissed = false
+  @Published var latestStreamSummaryTimeText = "No stream yet"
+  @Published var latestStreamSummaryText = "Stop a stream to generate the latest summary."
+  @Published var latestStreamSummaryStatusText = "Stream summary idle"
+  @Published var showStreamSummaryHistory = false
+  @Published var streamSummaryHistory: [StreamSummaryHistoryEntry] = StreamSummaryHistoryStore.load()
   @Published var currentAppRunIDText = "none"
   @Published var currentConversationSessionIDText = "none"
   @Published var sessionDetectedFacesText = "0"
@@ -92,6 +259,8 @@ final class StreamSessionViewModel: ObservableObject {
   @Published var calibrationSampleCountText = "same 0 / different 0"
   @Published var calibrationSummaryText = "same 0, different 0 | strong 0.70, weak 0.60, margin 0.05"
   @Published var canRecordCalibrationLabel = false
+  @Published var videoFaceEmbeddingMetricsText = "Video face: waiting for accepted face"
+  @Published var videoFaceRecognitionMetricsText = "Recognition source: waiting"
   @Published var faceEmbeddingModelStatusText = "Checking face model"
   @Published var faceEmbeddingModelDiagnosticsText = "Model diagnostics unavailable"
   @Published var faceAlignmentWarning: String = ""
@@ -111,12 +280,17 @@ final class StreamSessionViewModel: ObservableObject {
   @Published var lastIPhoneVoiceSimilarity: Float = 0
   @Published var lastWorkerVoiceSimilarity: Float = 0
   @Published var lastWearerVoiceSimilarity: Float = 0
-  @Published var iPhoneVoiceSimilarityStatusText = "iPhone: pending"
-  @Published var workerVoiceSimilarityStatusText = "Worker PC: disabled"
+  @Published var iPhoneVoiceSimilarityStatusText = "iPhone local estimate: pending"
+  @Published var workerVoiceSimilarityStatusText = "AWS canonical: disabled"
   @Published var wearerVoiceSimilarityStatusText = "Wearer: not checked"
+  @Published var audioSpeakerEmbeddingMetricsText = "Audio speaker: waiting for speech"
   @Published var voiceMatchStatusText = ""
   @Published var voiceSpeechBufferSeconds: Double = 0
   @Published var enrolledVoicePersonIds: Set<UUID> = []
+  // People whose diarized voice enrollment is saved as a preview but still
+  // awaiting a usable AWS voice embedding. They are NOT in enrolledVoicePersonIds
+  // until the pending embedding lands (retried when the worker is reachable).
+  @Published var pendingVoiceEnrollmentPersonIds: Set<UUID> = []
   @Published var cloudDiarizationState: CloudDiarizationState = .idle
   @Published var unknownDiarizationSpeakers: [UnknownDiarizationSpeaker] = []
   @Published var capturedVoiceClips: [CapturedVoiceClipSnapshot] = []
@@ -128,10 +302,48 @@ final class StreamSessionViewModel: ObservableObject {
   @Published var deepSeekAPIKeyText = ""
   @Published var deepSeekModelText = DeepSeekSettings.defaultModel
   @Published var deepSeekStatusText = "DeepSeek not configured"
-  @Published var cloudFaceEmbeddingEnabled = false
+  @Published var liveTranscriptionEnabled = AlibabaTranscriptionSettings.load().enabled {
+    didSet {
+      guard oldValue != liveTranscriptionEnabled else { return }
+      AlibabaTranscriptionSettings.saveEnabled(liveTranscriptionEnabled)
+      liveTranscriptionStatusText = liveTranscriptionEnabled
+        ? "Alibaba ASR enabled for next stream"
+        : "Alibaba ASR disabled"
+    }
+  }
+  @Published var liveTranscriptionStatusText = "Alibaba ASR not configured"
+  @Published var liveTranscriptPreviewText = "No live transcript yet"
+  @Published var sceneContextEnabled = SceneContextSettings.load().enabled {
+    didSet {
+      guard !isLoadingSceneContextSettings, oldValue != sceneContextEnabled else { return }
+      saveSceneContextSettings()
+    }
+  }
+  @Published var sceneLocationContextEnabled = SceneContextSettings.load().locationEnabled {
+    didSet {
+      guard !isLoadingSceneContextSettings, oldValue != sceneLocationContextEnabled else { return }
+      saveSceneContextSettings()
+    }
+  }
+  @Published var sceneContextStatusText = "Scene context off"
+  @Published var cloudFaceEmbeddingEnabled = false {
+    didSet {
+      guard !isLoadingCloudEmbeddingSettings, oldValue != cloudFaceEmbeddingEnabled else { return }
+      saveCloudFaceEmbeddingSettings()
+    }
+  }
   @Published var cloudFaceEmbeddingEndpointText = CloudFaceEmbeddingSettings.defaultEndpoint
   @Published var cloudFaceEmbeddingAPIKeyText = ""
   @Published var cloudFaceEmbeddingStatusText = "Cloud face embedding off"
+  @Published var cloudSpeakerEmbeddingEnabled = false {
+    didSet {
+      guard !isLoadingCloudEmbeddingSettings, oldValue != cloudSpeakerEmbeddingEnabled else { return }
+      saveCloudSpeakerEmbeddingSettings()
+    }
+  }
+  @Published var cloudSpeakerEmbeddingEndpointText = CloudSpeakerEmbeddingSettings.defaultEndpoint
+  @Published var cloudSpeakerEmbeddingAPIKeyText = ""
+  @Published var cloudSpeakerEmbeddingStatusText = "AWS canonical speaker embeddings off"
   @Published var microphoneStatusText: String = "Stopped"
   @Published var visionLatencyText: String = "0.0 ms"
   @Published var datSDKStatusText: String = "Not configured"
@@ -172,22 +384,56 @@ final class StreamSessionViewModel: ObservableObject {
   @Published var datRequestCameraPermissionCalledText: String = "no"
   @Published var datRegistrationHandoffDiagnosticText: String = "No handoff attempted"
   @Published var datFramesReceived: UInt64 = 0
-  @Published var datFramesConvertedToUIImage: UInt64 = 0
+  @Published var datFramesWithPixelBuffer: UInt64 = 0
   @Published var datFrameConversionFailures: UInt64 = 0
   @Published var datLastFrameWidthText: String = "none"
   @Published var datLastFrameHeightText: String = "none"
   @Published var datLastFrameTimestampText: String = "none"
   @Published var datLastFrameErrorText: String = "none"
+  @Published var glassesDisplayStateText: String = "Not connected"
+  @Published var glassesDisplayStatusText: String = "Display idle"
+  @Published var glassesDisplayLastCardText: String = "none"
+  @Published var glassesDisplayConnected: Bool = false
+  @Published var glassesDisplayRequiresDATAppUpdate: Bool = false
+  @Published var glassesDisplaySendCount: UInt64 = 0
   @Published var lastFrameTimestampText: String = "none"
 
   var isStreaming: Bool { lifecycleState.isStreamingSurfaceVisible }
+  var shouldHidePhoneVideoFootage: Bool {
+    PhoneVideoFootagePolicy.hidesFootage(inputMode: inputMode, lifecycleState: lifecycleState)
+  }
+  var streamRunningHeaderText: String { "Stream running successfully" }
+  var streamRunningModeText: String {
+    let activityMode = currentActivityModeClassification.confidence > 0
+      ? currentActivityModeClassification
+      : nil
+    return Self.streamRunningModeText(
+      hasActiveRecognizedPeople: !activeStreamRecognizedPeopleNames().isEmpty,
+      detectedFaceCount: detectedFaceCount,
+      activeConversationPartnerStateText: activeConversationPartnerStateText,
+      activeSpeakerStateText: activeSpeakerStateText,
+      liveTranscriptPreviewText: liveTranscriptPreviewText,
+      hasReceivedFirstFrame: hasReceivedFirstFrame,
+      activityMode: activityMode
+    )
+  }
+  var streamRunningModeLineText: String {
+    "Mode: \(streamRunningModeText)"
+  }
+  var streamRunningRecognizedPeopleText: String {
+    Self.streamRunningRecognizedPeopleText(activeStreamRecognizedPeopleNames())
+  }
+  var streamRunningRecognizedPeopleLineText: String {
+    "Recognized people: \(streamRunningRecognizedPeopleText)"
+  }
+
   var canConnectRealGlasses: Bool {
     !datIsConnecting
       && !datWaitingForMetaAIReturn
       && datRegistrationStateText != "registering"
   }
   var connectGlassesButtonTitle: String {
-    canConnectRealGlasses ? "Connect my glasses" : "Connecting..."
+    canConnectRealGlasses ? "Connect" : "Connecting..."
   }
   var canStartRealStream: Bool {
     inputMode == .realGlasses
@@ -209,9 +455,14 @@ final class StreamSessionViewModel: ObservableObject {
   private let speechManager = SpeechTranscriptionManager()
   private let identityPipeline = IdentityPipeline()
   private let speakerPipeline = SpeakerIdentityPipeline()
-  private let liveVoiceEmbeddingEnabled = false
+  private let conversationPartnerResolver = ConversationPartnerResolver()
+  private let liveDATPreviewRenderQueue = DispatchQueue(label: "com.metaface.liveDAT.previewRender", qos: .userInitiated)
+  private let liveDATStreamHealthIsolationMode = true
+  private let aggregateFrameStatsLogIntervalSeconds: TimeInterval = 5
+  private let liveVoiceEmbeddingEnabled = true
   private let voicePreviewPlayer = VoicePreviewPlayer()
   private let assistanceCardFormatter = AssistanceCardFormatter()
+  private let glassesAssistanceCardFormatter = AssistanceCardFormatter(maximumLineCount: 8, maximumLineLength: 2_000)
   private var conversationSummaryCache: [UUID: PersonConversationSummary] = [:]
   private var conversationSummaryInFlight: Set<UUID> = []
   private var conversationSummaryRefreshPendingPersonIds: Set<UUID> = []
@@ -259,7 +510,7 @@ final class StreamSessionViewModel: ObservableObject {
     }
   }
 
-  private struct TimedSpeakerEvidence {
+  private struct TimedSpeakerEvidence: Sendable {
     let timestamp: Date
     let personId: UUID
     let displayName: String?
@@ -267,13 +518,29 @@ final class StreamSessionViewModel: ObservableObject {
     let state: String
   }
 
-  private struct TimedFaceEvidence {
+  private struct TimedFaceEvidence: Sendable {
     let timestamp: Date
     let personId: UUID
     let displayName: String?
     let confidence: Float
     let state: String
     let mouthMovementScore: Float
+  }
+
+  private struct TimedConversationPartnerState {
+    let timestamp: Date
+    let state: ConversationPartnerState
+  }
+
+  private struct CloudDiarizationProcessingOutput: Sendable {
+    let savedChunkCount: Int
+    let unknownSpeakers: [UnknownDiarizationSpeaker]
+    let attributedPersonIds: Set<UUID>
+  }
+
+  private struct LiveTranscriptQuestionWork {
+    let observation: LiveTranscriptQuestionObservation
+    let attribution: TranscriptAttribution
   }
 
   private var isProcessingFrame = false
@@ -296,6 +563,7 @@ final class StreamSessionViewModel: ObservableObject {
   private var lastFrameArrival: Date?
   private var lastPreviewUpdateAt: Date?
   private var lastVisionSubmissionAt: Date?
+  private var liveAudioCaptureReadyForVision = false
   private var statsWindowStartedAt = Date()
   private var statsWindowReceivedFrames: UInt64 = 0
   private var statsWindowPreviewFrames: UInt64 = 0
@@ -312,10 +580,16 @@ final class StreamSessionViewModel: ObservableObject {
   private var statsWindowEmbeddingDurationMS: Double = 0
   private var statsWindowVisionDurationMS: Double = 0
   private var statsWindowVisionDurationCount: UInt64 = 0
+  private var debugMetricSessionStartedAt = Date()
+  private var videoAWSFaceMetrics = EmbeddingMetricAggregate()
+  private var videoLocalFaceMetrics = EmbeddingMetricAggregate()
+  private var audioIPhoneSpeakerMetrics = EmbeddingMetricAggregate()
+  private var audioWorkerSpeakerMetrics = EmbeddingMetricAggregate()
   private var visionGeneration: UInt64 = 0
   private var liveDATStreamingStartedAt: Date?
   private var liveDATFirstFrameAt: Date?
   private var liveDATLastFrameAt: Date?
+  private var liveDATTerminalVisionInvalidated = false
   private var pipelineContext: PipelineContext?
   private var faceDetectionEventsPersisted = 0
   private var lastFaceDetectionEventPersistedAt: Date?
@@ -325,19 +599,87 @@ final class StreamSessionViewModel: ObservableObject {
   private var activeFaceName: String?
   private var activeFaceConfidence: Float = 0
   private var activeFaceState = "none"
+  private var retainedRecognizedPersonId: UUID?
+  private var retainedRecognizedName: String?
+  private var retainedRecognizedConfidence: Float = 0
+  private var retainedRecognizedAt: Date?
   private var lastIdentityUIUpdateAt: Date?
   private var lastIdentityUIKey: String?
   private var latestMouthMovementScore: Float = 0
   private var speakerEvidenceTimeline: [TimedSpeakerEvidence] = []
   private var faceEvidenceTimeline: [TimedFaceEvidence] = []
+  private var conversationPartnerEvidence: [ConversationPartnerEvidence] = []
+  private var conversationPartnerTimeline: [TimedConversationPartnerState] = []
+  private var activeConversationPartnerState = ConversationPartnerState.empty
+  private let presenceTracker = PresenceEpisodeTracker()
+  private var lastSavedPresenceEpisodeSignatures: [UUID: String] = [:]
+  private var lastPresenceEpisodeSavedAt: [UUID: Date] = [:]
+  private var lastNameAddressLLMAt: Date?
   private var lastSpeakerUIUpdateAt: Date?
   // Cloud diarization
   private let audioRecorder = StreamAudioRecorder()
+  private let liveTranscriber = AlibabaLiveAudioChunkTranscriber()
+  private let sceneContextPipeline = SceneContextPipeline()
+  private let sceneLocationProvider = SceneLocationProvider()
   private let cloudDiarizationService = CloudDiarizationService()
+  private static let liveCaptionDisplayLineLimit = 8
+  private static let sceneContextDisplaySectionLimit = 8
+  private static let liveRecallDisplaySectionLimit = 6
+  private static let activityModeSceneContextLimit = 6
+  private static let activityModeMinimumClassificationInterval: TimeInterval = 18
+  private let cloudSpeakerLifecycleService = CloudSpeakerEmbeddingLifecycleService()
+  private let cloudFaceLifecycleService = CloudFaceEmbeddingLifecycleService()
   private var speakerTimeline: [SpeakerTimelineEntry] = []
   private var streamAudioStart: Date?
   private var lastConversationSessionIdForSpeakerReview: UUID?
   private var liveStreamActivationTask: Task<Void, Never>?
+  private var latestStreamSummaryTask: Task<Void, Never>?
+  private var cloudSpeakerLifecycleTask: Task<Void, Never>?
+  private var cloudSpeakerHeartbeatTask: Task<Void, Never>?
+  private var cloudFaceLifecycleTask: Task<Void, Never>?
+  private var cloudFaceHeartbeatTask: Task<Void, Never>?
+  private var deferredCloudWorkerStartTask: Task<Void, Never>?
+  private var isLoadingCloudEmbeddingSettings = false
+  private var isLoadingSceneContextSettings = false
+  private var currentGlassesAssistanceCard: AssistanceDisplayCard?
+  private var currentGlassesSceneContextSections: [AssistanceDisplaySection] = []
+  private var currentGlassesLiveRecallSections: [AssistanceDisplaySection] = []
+  private var currentActivityModeClassification = ActivityModeClassification.unknown
+  private var currentActivityModeEpisode: ActivityModeEpisodeRecord?
+  private var recentActivityModeSceneContexts: [SceneContextRecord] = []
+  private var activityModeClassificationTask: Task<Void, Never>?
+  private var lastActivityModeClassificationAt: Date?
+  private var currentGlassesIdentityPromptSection: AssistanceDisplaySection?
+  private var currentIdentityConfirmationThumbnail: UIImage?
+  private var currentIdentityConfirmationImageURI: String?
+  private var identityDisplayImageUploadTask: Task<Void, Never>?
+  private var identityDisplayImageUploadToken: UUID?
+  private var currentGlassesFaceVisibilitySection: AssistanceDisplaySection?
+  private var activeGlassesDisplayWindow: GlassesDisplayWindow = .live
+  private var currentGlassesDisplayPersonId: UUID?
+  private var currentGlassesDisplayName: String?
+  private var lastGlassesDisplayCardForActions: AssistanceDisplayCard?
+  private var pendingIdentityConfirmation: GlassesIdentityConfirmation?
+  private var promptedIdentityPersonIds: Set<UUID> = []
+  private var promptedUnknownIdentityThisStream = false
+  private var consecutiveUnknownIdentityAttempts = 0
+  private var warnedUnavailableFaceEmbeddingPromptThisStream = false
+  private var glassesIdentitySelectionEntries: [PersonDictionaryEntry] = []
+  private var glassesIdentitySelectionIndex = 0
+  private var glassesConfirmedConversationPersonId: UUID?
+  private var glassesConfirmedConversationPersonIds: Set<UUID> = []
+  private var glassesConfirmedConversationPersonName: String?
+  private var glassesPeopleListPage = 0
+  private var lastRecordedGlassesDisplayCardKey = ""
+  private var liveCaptionDisplayLines: [String] = []
+  private var lastLiveCaptionDisplayText = ""
+  private var liveQuestionAssembler = LiveTranscriptQuestionAssembler()
+  private var liveMemoryTriggerInFlight = false
+  private var pendingLiveQuestionWorks: [LiveTranscriptQuestionWork] = []
+  private var lastLiveMemoryTriggerText = ""
+  private var lastLiveMemoryTriggerAt: Date?
+  private var glassesDisplaySendTask: Task<Void, Never>?
+  private var cloudDiarizationTask: Task<Void, Never>?
   // Set during stopSession() to suppress the DAT-state-publisher-driven deactivate.
   // Without this, a stale "datStreamStopped" deactivate Task can fire AFTER the user
   // starts a new stream and tear down the new stream's mic mid-flight — producing a
@@ -356,11 +698,30 @@ final class StreamSessionViewModel: ObservableObject {
     localWorkerEndpointText = workerSettings.endpoint
     localWorkerAPIKeyText = workerSettings.apiKey
     let deepSeekSettings = DeepSeekSettings.load()
+    let aiProxyConfigured = SupabaseEdgeFunctionClient.isConfigured()
     deepSeekAPIKeyText = deepSeekSettings.apiKey
     deepSeekModelText = deepSeekSettings.model
-    deepSeekStatusText = deepSeekSettings.apiKey.isEmpty
-      ? "DeepSeek key missing"
-      : "DeepSeek configured: \(deepSeekSettings.model)"
+    deepSeekStatusText = aiProxyConfigured
+      ? "DeepSeek via Supabase Edge: \(deepSeekSettings.model)"
+      : deepSeekSettings.apiKey.isEmpty
+        ? "DeepSeek key missing"
+        : "DeepSeek configured: \(deepSeekSettings.model)"
+    let alibabaSettings = AlibabaTranscriptionSettings.load()
+    liveTranscriptionEnabled = alibabaSettings.enabled
+    liveTranscriptionStatusText = aiProxyConfigured
+      ? "Alibaba ASR via Supabase Edge: \(alibabaSettings.model)"
+      : alibabaSettings.apiKey.isEmpty
+        ? "Alibaba ASR key missing"
+        : "Alibaba ASR ready: \(alibabaSettings.model)"
+    isLoadingSceneContextSettings = true
+    let sceneSettings = SceneContextSettings.load()
+    sceneContextEnabled = sceneSettings.enabled
+    sceneLocationContextEnabled = sceneSettings.locationEnabled
+    sceneContextStatusText = sceneSettings.enabled
+      ? (aiProxyConfigured ? "Scene context via Supabase Edge: \(sceneSettings.model)" : sceneSettings.apiKey.isEmpty ? "Scene context key missing" : "Scene context ready: \(sceneSettings.model)")
+      : "Scene context off"
+    isLoadingSceneContextSettings = false
+    isLoadingCloudEmbeddingSettings = true
     let cloudFaceSettings = CloudFaceEmbeddingSettings.load()
     cloudFaceEmbeddingEnabled = cloudFaceSettings.enabled
     cloudFaceEmbeddingEndpointText = cloudFaceSettings.endpoint
@@ -368,6 +729,14 @@ final class StreamSessionViewModel: ObservableObject {
     cloudFaceEmbeddingStatusText = cloudFaceSettings.enabled
       ? "Cloud AdaFace configured; restart stream/app to apply"
       : "Cloud face embedding off"
+    let cloudSpeakerSettings = CloudSpeakerEmbeddingSettings.load()
+    cloudSpeakerEmbeddingEnabled = cloudSpeakerSettings.enabled
+    cloudSpeakerEmbeddingEndpointText = cloudSpeakerSettings.endpoint
+    cloudSpeakerEmbeddingAPIKeyText = cloudSpeakerSettings.apiKey
+    cloudSpeakerEmbeddingStatusText = cloudSpeakerSettings.enabled
+      ? "AWS canonical speaker configured; starts with next stream"
+      : "AWS canonical speaker embeddings off"
+    isLoadingCloudEmbeddingSettings = false
     Task { [weak self] in
       guard let self else { return }
       let status = await identityPipeline.embeddingModelStatusText()
@@ -380,12 +749,17 @@ final class StreamSessionViewModel: ObservableObject {
     datManager.onFrameImage = { [weak self] image in
       self?.handleRealGlassesImage(image)
     }
-    datManager.onFrameSampleBuffer = { [weak self] sampleBuffer, previewImage in
-      self?.handleRealGlassesSampleBuffer(sampleBuffer, previewImage: previewImage)
+    datManager.onFramePixelBuffer = { [weak self] pixelBuffer, previewImage in
+      self?.handleRealGlassesPixelBuffer(pixelBuffer, previewImage: previewImage)
     }
     datManager.onError = { [weak self] message in
       Task { @MainActor in
         self?.showError(message)
+      }
+    }
+    datManager.assistanceDisplayActionHandler = { [weak self] action in
+      Task { @MainActor in
+        await self?.handleGlassesDisplayAction(action)
       }
     }
     speechManager.$microphoneStatusText
@@ -465,7 +839,15 @@ final class StreamSessionViewModel: ObservableObject {
       .assign(to: &$datFirstFrameTimestampText)
     datManager.$lastDATErrorText
       .receive(on: DispatchQueue.main)
-      .assign(to: &$datLastErrorText)
+      .sink { [weak self] message in
+        guard let self else { return }
+        self.datLastErrorText = message
+        if message.localizedCaseInsensitiveContains("no video frames"),
+           self.datIsStreamRunning || self.datStreamSessionStateText.lowercased().contains("streaming") {
+          self.showGlassesStreamingDashboard(reason: "dat-stream-no-video-frames")
+        }
+      }
+      .store(in: &cancellables)
     datManager.$runtimeBundleConfigurationText
       .receive(on: DispatchQueue.main)
       .assign(to: &$datRuntimeBundleConfigurationText)
@@ -502,19 +884,18 @@ final class StreamSessionViewModel: ObservableObject {
     datManager.$framesReceived
       .receive(on: DispatchQueue.main)
       .assign(to: &$datFramesReceived)
-    datManager.$framesConvertedToUIImage
+    datManager.$framesWithPixelBuffer
       .receive(on: DispatchQueue.main)
       .sink { [weak self] count in
         guard let self else { return }
-        self.datFramesConvertedToUIImage = count
+        self.datFramesWithPixelBuffer = count
+        var shouldActivateLiveStream = true
         if count > 0 {
-          let now = Date()
-          if self.liveDATFirstFrameAt == nil {
-            self.liveDATFirstFrameAt = now
-          }
-          self.liveDATLastFrameAt = now
+          shouldActivateLiveStream = self.markLiveDATFrameArrived(at: Date())
         }
-        self.activateLiveStreamSessionAfterFirstFrameIfReady()
+        if shouldActivateLiveStream {
+          self.activateLiveStreamSessionAfterFirstFrameIfReady()
+        }
       }
       .store(in: &cancellables)
     datManager.$frameConversionFailures
@@ -532,6 +913,24 @@ final class StreamSessionViewModel: ObservableObject {
     datManager.$lastFrameErrorText
       .receive(on: DispatchQueue.main)
       .assign(to: &$datLastFrameErrorText)
+    datManager.$assistanceDisplayStateText
+      .receive(on: DispatchQueue.main)
+      .assign(to: &$glassesDisplayStateText)
+    datManager.$assistanceDisplayStatusText
+      .receive(on: DispatchQueue.main)
+      .assign(to: &$glassesDisplayStatusText)
+    datManager.$assistanceDisplayLastCardText
+      .receive(on: DispatchQueue.main)
+      .assign(to: &$glassesDisplayLastCardText)
+    datManager.$isAssistanceDisplayConnected
+      .receive(on: DispatchQueue.main)
+      .assign(to: &$glassesDisplayConnected)
+    datManager.$assistanceDisplayRequiresDATAppUpdate
+      .receive(on: DispatchQueue.main)
+      .assign(to: &$glassesDisplayRequiresDATAppUpdate)
+    datManager.$assistanceDisplaySendCount
+      .receive(on: DispatchQueue.main)
+      .assign(to: &$glassesDisplaySendCount)
     datManager.$streamSessionStateText
       .receive(on: DispatchQueue.main)
       .sink { [weak self] stateText in
@@ -539,9 +938,24 @@ final class StreamSessionViewModel: ObservableObject {
         self.datStreamSessionStateText = stateText
         self.streamStateText = stateText
         self.syncLifecycleFromDATState(stateText)
-        if stateText.lowercased().contains("streaming") {
+        let normalizedState = stateText.lowercased()
+        if normalizedState.contains("streaming") {
+          self.showGlassesStreamingDashboard(reason: "dat-streaming")
           self.activateLiveStreamSessionAfterFirstFrameIfReady()
-        } else if stateText.lowercased().contains("stopped") {
+        } else if normalizedState.contains("starting") || normalizedState.contains("waiting") {
+          self.showGlassesStreamStatus(
+            title: "Starting stream",
+            message: normalizedState.contains("waiting") ? "Waiting for glasses camera stream." : "Preparing glasses camera stream.",
+            reason: "dat-stream-preparing",
+            sendTiming: .streamStatus(reason: "dat-stream-preparing")
+          )
+        } else if normalizedState.contains("paused") {
+          self.showGlassesStreamStatus(
+            title: "Stream paused",
+            message: "Waiting for the DAT stream to resume.",
+            reason: "dat-stream-paused"
+          )
+        } else if normalizedState.contains("stopped") {
           self.liveStreamActivationTask?.cancel()
           self.liveStreamActivationTask = nil
           // If stopSession() is the one driving DAT to "stopped", it already tore
@@ -549,7 +963,10 @@ final class StreamSessionViewModel: ObservableObject {
           // would run after the user's next start, killing the new stream's mic.
           guard !self.explicitTeardownInFlight else { return }
           Task { @MainActor [weak self] in
-            await self?.deactivateLiveStreamSessionIfNeeded(reason: "datStreamStopped")
+            await self?.deactivateLiveStreamSessionIfNeeded(
+              reason: "datStreamStopped",
+              cancelDisplayWork: false
+            )
           }
         }
       }
@@ -607,33 +1024,49 @@ final class StreamSessionViewModel: ObservableObject {
     lifecycleState = .stopping
     streamingStatus = .waiting
     streamStateText = StreamLifecycleState.stopping.rawValue
+    prepareDisplayForStreamStop(reason: reason)
     let hadLivePhoneAudioSession = livePhoneAudioSessionActive
     liveStreamSessionActivated = false
     livePhoneAudioSessionActive = false
     liveStreamActivationTask?.cancel()
     liveStreamActivationTask = nil
-    invalidateAssistanceWork(reason: "stopSession-\(reason)", stopAudio: true)
-    await datManager.stopStream(reason: reason)
-    speechManager.stop()
-    speechManager.onAudioBuffer = nil
-    if hadLivePhoneAudioSession {
+    invalidateLiveDATVisionWork(reason: "stopSession-\(reason)")
+    invalidateAssistanceWork(reason: "stopSession-\(reason)", cancelDisplayWork: false)
+	    await datManager.stopStream(reason: reason)
+	    speechManager.stop()
+	    speechManager.onAudioBuffer = nil
+	    stopLiveTranscriptionForStream()
+	    await stopCloudSpeakerWorkerForStream(reason: reason, stopEC2: !hadLivePhoneAudioSession)
+    await stopCloudFaceWorkerForStream(reason: reason, stopEC2: !hadLivePhoneAudioSession)
+    if hadLivePhoneAudioSession, !isDATAnalysisPaused {
       await finalizeConversationTranscriptAfterStream(reason: reason)
+      await scheduleLatestStreamSummary(reason: reason)
       // Finalize audio recording and submit cloud diarization job.
       let audioFileURL = audioRecorder.stop()
       let capturedStart = streamAudioStart
       let capturedTimeline = speakerTimeline
+      let capturedSpeakerEvidence = speakerEvidenceTimeline
       let capturedFaceEvidence = faceEvidenceTimeline
       let capturedContext = pipelineContext
       if let audioURL = audioFileURL, let start = capturedStart {
-        Task {
-          await self.submitCloudDiarizationJob(audioURL: audioURL, streamStart: start,
-                                               speakerTimeline: capturedTimeline,
-                                               faceEvidenceTimeline: capturedFaceEvidence,
-                                               pipelineContext: capturedContext)
-        }
+        scheduleCloudDiarizationJob(
+          audioURL: audioURL,
+          streamStart: start,
+          speakerTimeline: capturedTimeline,
+          speakerEvidenceTimeline: capturedSpeakerEvidence,
+          faceEvidenceTimeline: capturedFaceEvidence,
+          pipelineContext: capturedContext
+        )
       } else {
         cloudDiarizationState = .idle
       }
+    } else if hadLivePhoneAudioSession {
+      let discardedURL = audioRecorder.stop()
+      if let discardedURL {
+        try? FileManager.default.removeItem(at: discardedURL)
+      }
+      cloudDiarizationState = .idle
+      AppLogger.log(.stream, "Skipped post-stream transcript attribution and cloud diarization because analysis is paused reason=\(reason)")
     } else {
       cloudDiarizationState = .idle
       AppLogger.log(.stream, "Skipping phone audio/conversation teardown because live phone audio was not active reason=\(reason)")
@@ -643,6 +1076,8 @@ final class StreamSessionViewModel: ObservableObject {
     await speakerPipeline.resetRuntimeState(reason: "stopSession-\(reason)")
     capturedVoiceClips = await speakerPipeline.capturedVoiceClipSnapshots()
     wearerVoiceProfile = await speakerPipeline.wearerVoiceProfileSnapshot()
+    persistFinalPresenceEpisodes(reason: "stopSession-\(reason)")
+    closeCurrentActivityModeEpisode(reason: "stopSession-\(reason)")
     await identityPipeline.endConversation()
     pipelineContext = await identityPipeline.currentContext()
     applyRunSessionSnapshot(await identityPipeline.currentRunSessionSnapshot())
@@ -656,8 +1091,8 @@ final class StreamSessionViewModel: ObservableObject {
     lastIPhoneVoiceSimilarity = 0
     lastWorkerVoiceSimilarity = 0
     lastWearerVoiceSimilarity = 0
-    iPhoneVoiceSimilarityStatusText = "iPhone: pending"
-    workerVoiceSimilarityStatusText = "Worker PC: disabled"
+    iPhoneVoiceSimilarityStatusText = "iPhone local estimate: pending"
+    workerVoiceSimilarityStatusText = "AWS canonical: disabled"
     wearerVoiceSimilarityStatusText = "Wearer: not checked"
     voiceMatchStatusText = ""
     resetVideoState(reason: "streamStopped")
@@ -690,6 +1125,12 @@ final class StreamSessionViewModel: ObservableObject {
       return
     }
     guard datManager.canStartStream else {
+      showGlassesStreamStatus(
+        title: "Stream not ready",
+        message: datStartReadinessReasonText,
+        reason: "start-real-glasses-stream-not-ready",
+        allowStop: false
+      )
       showError("Start streaming blocked: \(datStartReadinessReasonText)")
       AppLogger.log(.stream, "Start streaming tapped before ready: \(datStartReadinessReasonText)")
       return
@@ -720,75 +1161,695 @@ final class StreamSessionViewModel: ObservableObject {
     streamingStatus = .waiting
     streamStateText = "STARTING"
     sourceStateText = "REAL GLASSES"
+    showGlassesStreamStatus(
+      title: "Starting stream",
+      message: "Preparing iPhone mic and glasses camera.",
+      reason: "start-real-glasses-stream"
+    )
+
+    guard livePhoneAudioCaptureEnabled else {
+      lifecycleState = .error
+      streamingStatus = .stopped
+      microphoneStatusText = "iPhone mic required for DAT stream"
+      showGlassesStreamStatus(
+        title: "Stream blocked",
+        message: "Enable iPhone microphone recording before starting.",
+        reason: "start-real-glasses-stream-mic-disabled",
+        allowStop: false
+      )
+      showError("Start streaming blocked: iPhone microphone recording is required while DAT streaming is active.")
+      AppLogger.log(.stream, "Start streaming blocked because live iPhone audio capture is disabled")
+      return
+    }
+    let datDeviceId = datSelectedDeviceIDText == "None" ? nil : datSelectedDeviceIDText
+    let phoneAudioStarted = await startLivePhoneAudioCapture(
+      reason: "beforeDATStreamStart",
+      datDeviceId: datDeviceId,
+      validateDATAfterStart: false
+    )
+    guard phoneAudioStarted else {
+      lifecycleState = .error
+      streamingStatus = .stopped
+      showGlassesStreamStatus(
+        title: "Stream blocked",
+        message: "iPhone microphone failed to start.",
+        reason: "start-real-glasses-stream-mic-failed",
+        allowStop: false
+      )
+      showError("Start streaming blocked: iPhone microphone failed to start.")
+      AppLogger.log(.stream, "Start streaming blocked because live iPhone audio failed to start before DAT stream")
+      return
+    }
 
     let started = await datManager.startStream()
     if started {
       lifecycleState = .waiting
       streamingStatus = .waiting
-      AppLogger.log(.stream, "Real glasses stream start requested; waiting for DAT Stream state=streaming before starting app-side session work")
+      AppLogger.log(.stream, "Real glasses stream start requested after iPhone microphone startup; waiting for DAT Stream state=streaming")
     } else {
+      await deactivateLiveStreamSessionIfNeeded(reason: "datStartFailedAfterPhoneAudioStart")
       lifecycleState = .error
       streamingStatus = .stopped
       let detail = datLastErrorText == "None" ? datStartReadinessReasonText : datLastErrorText
+      showGlassesStreamStatus(
+        title: "Stream failed",
+        message: detail,
+        reason: "start-real-glasses-stream-failed",
+        allowStop: false
+      )
       showError("Start streaming failed: \(detail)")
     }
   }
 
-  private func activateLiveStreamSessionIfNeeded() async {
-    guard !liveStreamSessionActivated else { return }
-    guard canActivateLiveAudioSession else {
-      AppLogger.log(.stream, "Skipping live audio activation because DAT stream is no longer usable. stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+  private func startLiveTranscriptionForStream(reason: String) {
+    let settings = AlibabaTranscriptionSettings.load()
+    guard !isDATAnalysisPaused else {
+      liveTranscriptPreviewText = "Analysis paused"
+      liveTranscriptionStatusText = "Alibaba ASR paused"
+      liveTranscriber.stop()
+      stopSceneContextForStream()
+      sceneContextStatusText = "Scene context paused"
       return
     }
-    guard livePhoneAudioCaptureEnabled else {
-      liveStreamSessionActivated = true
-      livePhoneAudioSessionActive = false
-      activeSpeakerStateText = "disabled"
+    guard liveTranscriptionEnabled else {
+      liveTranscriptPreviewText = "No live transcript yet"
+      liveTranscriptionStatusText = "Alibaba ASR disabled"
+      liveTranscriber.stop()
+      startSceneContextForStream(reason: reason)
+      return
+    }
+    liveTranscriptPreviewText = "Listening..."
+    let aiProxyConfigured = SupabaseEdgeFunctionClient.isConfigured()
+    liveTranscriptionStatusText = aiProxyConfigured
+      ? "Alibaba ASR proxy starting"
+      : settings.apiKey.isEmpty
+        ? "Alibaba ASR key missing"
+        : "Alibaba ASR starting"
+    let transcriptPath = aiProxyConfigured
+      ? "supabase_edge_proxy"
+      : settings.apiKey.isEmpty ? "unavailable_no_key_no_proxy" : "direct_dashscope_key"
+    if transcriptPath == "unavailable_no_key_no_proxy" {
+      liveTranscriptPreviewText = "Live transcript unavailable"
+      liveTranscriptionStatusText = "Live transcript unavailable: no DashScope key and Supabase ASR proxy not configured"
+      AppLogger.log(.transcript, "warning...---- [LIVE_TRANSCRIPT] stage=start reason=\(reason) path=unavailable enabled=true model=\(settings.model) hasKey=false proxy=false detail=Set SUPABASE_URL/SUPABASE_ANON_KEY (edge proxy) or DASHSCOPE_API_KEY (direct) to enable ASR; transcript will stay empty until then")
+    } else {
+      AppLogger.log(.transcript, "[LIVE_TRANSCRIPT] stage=start reason=\(reason) path=\(transcriptPath) enabled=\(settings.enabled) model=\(settings.model) hasKey=\(!settings.apiKey.isEmpty) proxy=\(aiProxyConfigured)")
+    }
+    liveTranscriber.start(settings: settings) { [weak self] update in
+      Task { @MainActor [weak self] in
+        self?.handleLiveTranscriptionUpdate(update)
+      }
+    }
+    startSceneContextForStream(reason: reason)
+  }
+
+  private func stopLiveTranscriptionForStream() {
+    liveTranscriber.stop()
+    stopSceneContextForStream()
+  }
+
+  private func startSceneContextForStream(reason: String) {
+    let settings = SceneContextSettings.load()
+    guard !isDATAnalysisPaused else {
+      sceneContextPipeline.stop()
+      sceneLocationProvider.stop()
+      sceneContextStatusText = "Scene context paused"
+      return
+    }
+    guard sceneContextEnabled else {
+      sceneContextPipeline.stop()
+      sceneLocationProvider.stop()
+      sceneContextStatusText = "Scene context off"
+      return
+    }
+    let aiProxyConfigured = SupabaseEdgeFunctionClient.isConfigured()
+    sceneContextStatusText = aiProxyConfigured
+      ? "Scene context proxy listening: \(settings.model)"
+      : settings.apiKey.isEmpty
+        ? "Scene context key missing"
+        : "Scene context listening: \(settings.model)"
+    sceneLocationProvider.start(enabled: sceneLocationContextEnabled)
+    sceneContextPipeline.start(
+      onStatus: { [weak self] message in
+        self?.sceneContextStatusText = message
+      },
+      onRecord: { [weak self] record in
+        guard let self else { return }
+        await self.identityPipeline.saveSceneContext(record)
+        self.publishSceneContextDisplay(record, reason: "scene-context")
+        self.peopleDictionaryEntries = await self.identityPipeline.loadPeopleForDictionary()
+      }
+    )
+    AppLogger.log(.sceneContext, "Scene context requested reason=\(reason) enabled=\(settings.enabled) model=\(settings.model) hasKey=\(!settings.apiKey.isEmpty) proxy=\(aiProxyConfigured) location=\(sceneLocationContextEnabled)")
+  }
+
+  private func stopSceneContextForStream() {
+    sceneContextPipeline.stop()
+    sceneLocationProvider.stop()
+  }
+
+  private func handleLiveTranscriptionUpdate(_ update: AlibabaLiveTranscriptionUpdate) {
+    switch update {
+    case .status(let message):
+      liveTranscriptionStatusText = message
+      AppLogger.log(.transcript, "[LIVE_TRANSCRIPT] stage=status message=\"\(Self.truncated(message, maxLength: 120))\"")
+    case .failure(let message):
+      liveTranscriptionStatusText = "Alibaba ASR failed: \(Self.truncated(message, maxLength: 140))"
+      AppLogger.log(.transcript, "warning...---- [LIVE_TRANSCRIPT] stage=failure detail=\"\(Self.truncated(message, maxLength: 200))\"; live transcript chunk did not produce text — see preceding [ASR_PROXY]/[AI_PROXY] line for endpoint+status")
+    case .transcript(let segment):
+      guard !isDATAnalysisPaused else {
+        liveTranscriptionStatusText = "Alibaba ASR paused"
+        return
+      }
+      let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !text.isEmpty else { return }
+      liveTranscriptPreviewText = text
+      liveTranscriptionStatusText = "Alibaba ASR saved \(String(format: "%.1f", Double(segment.durationSeconds)))s"
+      recentConversationAttributionText = "Live transcript: \(Self.truncated(text, maxLength: 180))"
+      let attribution = currentTranscriptAttribution()
+      let identityEvidence = currentSceneContextIdentityEvidence(attribution: attribution)
+      sceneContextPipelineVerificationText = Self.sceneContextIdentityVerificationText(
+        evidence: identityEvidence,
+        attribution: attribution
+      )
+      publishLiveCaptionDisplay(text: text, attribution: attribution)
+      processTranscriptNamePresence(text: text, timestamp: segment.endedAt)
+      scheduleActivityModeClassification(reason: "live-transcript")
+      processLiveTranscriptMemoryTrigger(
+        text: text,
+        attribution: attribution,
+        startedAt: segment.startedAt,
+        endedAt: segment.endedAt
+      )
+      let entry = TranscriptEntry(
+        id: segment.id,
+        text: text,
+        timestamp: segment.startedAt.timeIntervalSince1970,
+        isFinal: true,
+        startedAt: segment.startedAt,
+        endedAt: segment.endedAt,
+        source: "AlibabaLiveASR"
+      )
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        let pipelineContext = await self.identityPipeline.currentContext()
+        self.sceneContextPipeline.captureTranscript(
+          id: entry.id,
+          text: text,
+          startedAt: entry.startedAt,
+          endedAt: entry.endedAt,
+          personId: attribution.personId,
+          displayName: attribution.displayName,
+          context: pipelineContext,
+          identityEvidence: identityEvidence,
+          location: self.sceneLocationProvider.currentSnapshot()
+        )
+      }
+      AppLogger.log(.transcript, "Alibaba live transcript received seconds=\(String(format: "%.1f", Double(segment.durationSeconds))) textLen=\(text.count) preview=\"\(Self.truncated(text, maxLength: 120))\"")
+    }
+  }
+
+  nonisolated private static func truncated(_ text: String, maxLength: Int) -> String {
+    guard text.count > maxLength else { return text }
+    return String(text.prefix(maxLength)) + "..."
+  }
+
+  private static func sceneContextIdentityVerificationText(
+    evidence: SceneContextIdentityEvidence?,
+    attribution: TranscriptAttribution
+  ) -> String {
+    guard let evidence else {
+      return "5W/1H: no app identity evidence yet; transcript attribution=\(attribution.state)"
+    }
+    let partner = evidence.conversationPartnerName ?? evidence.conversationPartnerPersonId?.uuidString ?? "unknown"
+    let active = evidence.activePeople.map(\.displayName).joined(separator: ", ")
+    let departed = evidence.departedPeople.map(\.displayName).joined(separator: ", ")
+    var parts = [
+      "5W/1H identity: \(partner) \(evidence.conversationPartnerState) \(Int((evidence.confidence * 100).rounded()))%"
+    ]
+    if !active.isEmpty {
+      parts.append("active: \(active)")
+    }
+    if !departed.isEmpty {
+      parts.append("departed: \(departed)")
+    }
+    return truncated(parts.joined(separator: " | "), maxLength: 220)
+  }
+
+  private func processLiveTranscriptMemoryTrigger(
+    text: String,
+    attribution: TranscriptAttribution,
+    startedAt: Date?,
+    endedAt: Date?
+  ) {
+    let people = peopleDictionaryEntries.map {
+      PersonNameCandidate(personId: $0.id, displayName: $0.displayName)
+    }
+    guard let observation = liveQuestionAssembler.appendObservation(
+      text: text,
+      startedAt: startedAt,
+      endedAt: endedAt,
+      people: people
+    ) else { return }
+    if observation.localTrigger == nil,
+       LiveTranscriptQuestionRouter.shouldWaitForMoreTranscript(observation.candidateText) {
+      memoryTriggerVerificationText = "Live question: waiting for complete question"
+      AppLogger.log(.memory, "Live question trigger held locally reason=incompleteQuestion text=\"\(Self.truncated(observation.candidateText, maxLength: 160))\"")
+      return
+    }
+    let qwenSettings = AlibabaQuestionAnswerSettings.load()
+    let hasQwenClassifier = SupabaseEdgeFunctionClient.isConfigured()
+      || !qwenSettings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    guard hasQwenClassifier || observation.localTrigger != nil else { return }
+    guard !liveMemoryTriggerInFlight else {
+      pendingLiveQuestionWorks.append(LiveTranscriptQuestionWork(observation: observation, attribution: attribution))
+      pendingLiveQuestionWorks = Array(pendingLiveQuestionWorks.suffix(4))
+      AppLogger.log(.memory, "Live question trigger queued reason=inFlight pending=\(pendingLiveQuestionWorks.count) mode=\(observation.candidateMode.rawValue)")
+      return
+    }
+
+    runLiveTranscriptQuestionWork(
+      LiveTranscriptQuestionWork(observation: observation, attribution: attribution),
+      qwenSettings: qwenSettings
+    )
+  }
+
+  private func runLiveTranscriptQuestionWork(
+    _ work: LiveTranscriptQuestionWork,
+    qwenSettings: AlibabaQuestionAnswerSettings
+  ) {
+    let observation = work.observation
+    liveMemoryTriggerInFlight = true
+    let trigger = observation.localTrigger ?? LiveTranscriptResolvedTrigger(
+      fullText: observation.candidateText,
+      answerMode: .ignore,
+      memoryTrigger: nil,
+      confidence: 0,
+      reason: "pendingLLM",
+      mentionedNames: [],
+      startedAt: observation.startedAt,
+      endedAt: observation.endedAt
+    )
+    if let localTrigger = observation.localTrigger {
+      memoryTriggerVerificationText = "Live question: \(localTrigger.answerMode.rawValue) detected via \(localTrigger.reason)"
+      AppLogger.log(.memory, "Live question trigger detected mode=\(localTrigger.answerMode.rawValue) reason=\(localTrigger.reason) confidence=\(String(format: "%.2f", Double(localTrigger.confidence))) text=\"\(Self.truncated(localTrigger.fullText, maxLength: 160))\"")
+    } else {
+      memoryTriggerVerificationText = "Live question: checking transcript with LLM"
+      AppLogger.log(.memory, "Live question classifier queued text=\"\(Self.truncated(observation.rollingTranscript, maxLength: 160))\"")
+    }
+
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      defer {
+        self.liveMemoryTriggerInFlight = false
+        self.runNextPendingLiveTranscriptQuestionWorkIfNeeded()
+      }
+      let entries = await self.identityPipeline.loadPeopleForDictionary()
+      self.peopleDictionaryEntries = entries
+      guard let resolvedTrigger = await self.resolveLiveTranscriptTrigger(
+        trigger,
+        rollingTranscript: observation.rollingTranscript,
+        currentTranscript: observation.currentTranscript,
+        settings: qwenSettings,
+        entries: entries
+      ) else { return }
+      let triggerTime = resolvedTrigger.endedAt
+      let normalizedText = LiveTranscriptQuestionRouter.normalizedSearchText(resolvedTrigger.fullText)
+      if let lastAt = self.lastLiveMemoryTriggerAt,
+         triggerTime.timeIntervalSince(lastAt) < 12 {
+        AppLogger.log(.memory, "Live question trigger skipped reason=throttled mode=\(resolvedTrigger.answerMode.rawValue)")
+        return
+      }
+      if normalizedText == self.lastLiveMemoryTriggerText,
+         let lastAt = self.lastLiveMemoryTriggerAt,
+         triggerTime.timeIntervalSince(lastAt) < 60 {
+        return
+      }
+      self.lastLiveMemoryTriggerText = normalizedText
+      self.lastLiveMemoryTriggerAt = triggerTime
+
+      switch resolvedTrigger.answerMode {
+      case .memory, .mixed:
+        let candidates = self.liveMemoryCandidates(
+          for: resolvedTrigger,
+          attribution: work.attribution,
+          entries: entries
+        )
+        let section = await self.liveMemoryTriggerDisplaySection(
+          trigger: resolvedTrigger,
+          candidates: candidates,
+          settings: qwenSettings
+        )
+        self.publishLiveMemoryTriggerSection(section, personId: candidates.first?.personId, trigger: resolvedTrigger)
+      case .general, .current:
+        let section = await self.liveQuestionAnswerDisplaySection(
+          trigger: resolvedTrigger,
+          settings: qwenSettings
+        )
+        self.publishLiveMemoryTriggerSection(section, personId: nil, trigger: resolvedTrigger)
+      case .ignore:
+        break
+      }
+    }
+  }
+
+  private func runNextPendingLiveTranscriptQuestionWorkIfNeeded() {
+    guard !liveMemoryTriggerInFlight, !pendingLiveQuestionWorks.isEmpty else { return }
+    let work = pendingLiveQuestionWorks.removeFirst()
+    let qwenSettings = AlibabaQuestionAnswerSettings.load()
+    let hasQwenClassifier = SupabaseEdgeFunctionClient.isConfigured()
+      || !qwenSettings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    guard hasQwenClassifier || work.observation.localTrigger != nil else {
+      runNextPendingLiveTranscriptQuestionWorkIfNeeded()
+      return
+    }
+    runLiveTranscriptQuestionWork(
+      work,
+      qwenSettings: qwenSettings
+    )
+  }
+
+  private func resolveLiveTranscriptTrigger(
+    _ trigger: LiveTranscriptResolvedTrigger,
+    rollingTranscript: String,
+    currentTranscript: String,
+    settings: AlibabaQuestionAnswerSettings,
+    entries: [PersonDictionaryEntry]
+  ) async -> LiveTranscriptResolvedTrigger? {
+    let apiKey = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard SupabaseEdgeFunctionClient.isConfigured() || !apiKey.isEmpty else {
+      return trigger.answerMode == .ignore ? nil : trigger
+    }
+    do {
+      let client = try AlibabaQuestionAnswerClient(settings: settings)
+      let decision = try await client.classifyLiveTranscriptTrigger(LiveTranscriptTriggerLLMRequest(
+        rollingTranscript: rollingTranscript,
+        currentTranscript: currentTranscript,
+        localCandidateQuestion: trigger.fullText,
+        localAnswerMode: trigger.answerMode,
+        peopleNames: entries.map(\.displayName)
+      ))
+      guard decision.isTrigger, !decision.needsMoreTranscript else {
+        AppLogger.log(
+          .memory,
+          "Live question trigger held by LLM reason=\(decision.reason) needsMore=\(decision.needsMoreTranscript)"
+        )
+        memoryTriggerVerificationText = "Live question: waiting for complete question"
+        return nil
+      }
+      let llmQuestion = decision.fullQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+      let question = llmQuestion.isEmpty ? trigger.fullText : llmQuestion
+      if LiveTranscriptQuestionRouter.shouldWaitForMoreTranscript(question) {
+        AppLogger.log(.memory, "Live question trigger held after LLM reason=incompleteQuestion text=\"\(Self.truncated(question, maxLength: 160))\"")
+        memoryTriggerVerificationText = "Live question: waiting for complete question"
+        return nil
+      }
+      let routed = LiveTranscriptQuestionRouter.route(
+        text: question,
+        startedAt: trigger.startedAt,
+        endedAt: trigger.endedAt,
+        people: entries.map { PersonNameCandidate(personId: $0.id, displayName: $0.displayName) }
+      )
+      let base = routed ?? trigger.replacing(fullText: question)
+      let resolved = base.replacing(
+        answerMode: decision.answerMode == .ignore ? base.answerMode : decision.answerMode,
+        reason: "llm:\(decision.reason)",
+        confidence: Float(decision.confidence)
+      )
+      AppLogger.log(
+        .memory,
+        "Live question trigger confirmed by LLM mode=\(resolved.answerMode.rawValue) confidence=\(String(format: "%.2f", decision.confidence)) text=\"\(Self.truncated(resolved.fullText, maxLength: 160))\""
+      )
+      return resolved
+    } catch {
+      AppLogger.log(.memory, "Live question LLM trigger classifier failed; using local trigger: \(error.localizedDescription)")
+      return trigger
+    }
+  }
+
+  private func liveMemoryCandidates(
+    for trigger: LiveTranscriptResolvedTrigger,
+    attribution: TranscriptAttribution,
+    entries: [PersonDictionaryEntry]
+  ) -> [LiveMemoryCandidate] {
+    let activeIds = Set([
+      attribution.personId,
+      activeConversationPartnerState.primary?.personId,
+      glassesConfirmedConversationPersonId,
+      livePhoneAssistancePinnedPersonId,
+      activeFacePersonId
+    ].compactMap { $0 })
+      .union(presenceTracker.snapshot().active.compactMap(\.personId))
+    return LiveMemoryCandidateRanker.rankedCandidates(
+      for: trigger,
+      entries: entries,
+      attribution: attribution,
+      activePersonIds: activeIds
+    )
+  }
+
+  private func liveMemoryTriggerDisplaySection(
+    trigger: LiveTranscriptResolvedTrigger,
+    candidates: [LiveMemoryCandidate],
+    settings: AlibabaQuestionAnswerSettings
+  ) async -> AssistanceDisplaySection {
+    guard !candidates.isEmpty else {
+      return AssistanceDisplaySection(
+        title: "Relevant memory",
+        lines: Self.liveAnswerLines(
+          questionText: trigger.fullText,
+          answerText: LiveMemoryAnswerPolicy.noRelevantSavedMemoryLine
+        )
+      )
+    }
+    let memoryContext = candidates
+      .map(\.context)
+      .joined(separator: "\n\n")
+    let fallbackLines = Self.localLiveMemoryTriggerLines(
+      trigger: trigger,
+      candidates: candidates
+    )
+
+    let apiKey = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard (SupabaseEdgeFunctionClient.isConfigured() || !apiKey.isEmpty), !memoryContext.isEmpty else {
+      return AssistanceDisplaySection(title: "Relevant memory", lines: fallbackLines)
+    }
+
+    do {
+      let client = try AlibabaQuestionAnswerClient(settings: settings)
+      let answer = try await client.answerMemoryQuestion(AlibabaMemoryAnswerRequest(
+        fullQuestion: trigger.fullText,
+        triggerReason: "\(trigger.answerMode.rawValue):\(trigger.reason)",
+        memoryEvidence: memoryContext
+      ))
+      let trimmed = answer.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.localizedCaseInsensitiveContains("No relevant saved memory") {
+        return AssistanceDisplaySection(
+          title: "Relevant memory",
+          lines: Self.liveAnswerLines(
+            questionText: trigger.fullText,
+            answerText: LiveMemoryAnswerPolicy.noRelevantSavedMemoryLine
+          )
+        )
+      }
+      return AssistanceDisplaySection(
+        title: "Relevant memory",
+        lines: Self.liveAnswerLines(questionText: trigger.fullText, answerText: trimmed)
+      )
+    } catch {
+      AppLogger.log(.memory, "Qwen live memory trigger failed: \(error.localizedDescription)")
+      return AssistanceDisplaySection(title: "Relevant memory", lines: fallbackLines)
+    }
+  }
+
+  private func liveQuestionAnswerDisplaySection(
+    trigger: LiveTranscriptResolvedTrigger,
+    settings: AlibabaQuestionAnswerSettings
+  ) async -> AssistanceDisplaySection {
+    let title = trigger.answerMode == .current ? "Current answer" : "Answer"
+    do {
+      let client = try AlibabaQuestionAnswerClient(settings: settings)
+      let answer = trigger.answerMode == .current
+        ? try await client.answerCurrentQuestion(trigger.fullText)
+        : try await client.answerStableQuestion(trigger.fullText)
+      var lines = Self.liveAnswerLines(questionText: trigger.fullText, answerText: answer.text)
+      if let source = answer.sources.first {
+        lines.append(Self.truncated("Source: \(source.title)", maxLength: 80))
+      } else if answer.usedWebSearch {
+        lines.append("Source: Alibaba web search")
+      }
+      return AssistanceDisplaySection(title: title, lines: lines)
+    } catch {
+      AppLogger.log(.memory, "Alibaba Qwen live question failed: \(error.localizedDescription)")
+      return AssistanceDisplaySection(
+        title: title,
+        lines: Self.liveAnswerLines(
+          questionText: trigger.fullText,
+          answerText: "Alibaba Qwen answer unavailable: \(Self.truncated(error.localizedDescription, maxLength: 110))"
+        )
+      )
+    }
+  }
+
+  private func publishLiveMemoryTriggerSection(
+    _ section: AssistanceDisplaySection,
+    personId: UUID?,
+    trigger: LiveTranscriptResolvedTrigger
+  ) {
+    let shouldSwitchToLive = LiveTranscriptAnswerPresentationPolicy.target(for: trigger) == .liveHome
+      && (datIsStreamRunning || datStreamSessionStateText.lowercased().contains("streaming"))
+    publishLiveRecallSection(
+      section,
+      personId: personId,
+      status: "Triggered by live transcript",
+      verification: "Live question: displayed \(Self.truncated(section.lines.first ?? section.title, maxLength: 140))",
+      reason: "live-memory-trigger",
+      shouldSwitchToLive: shouldSwitchToLive
+    )
+    AppLogger.log(.memory, "Live memory trigger displayed person=\(personId?.uuidString ?? "none") lines=\(section.lines.count) stack=\(currentGlassesLiveRecallSections.count)")
+  }
+
+  private func publishLiveRecallSection(
+    _ section: AssistanceDisplaySection,
+    personId: UUID?,
+    status: String,
+    verification: String,
+    reason: String,
+    shouldSwitchToLive: Bool
+  ) {
+    let sectionKey = liveRecallSectionKey(section)
+    currentGlassesLiveRecallSections.removeAll {
+      liveRecallSectionKey($0) == sectionKey
+    }
+    currentGlassesLiveRecallSections.insert(section, at: 0)
+    if currentGlassesLiveRecallSections.count > Self.liveRecallDisplaySectionLimit {
+      currentGlassesLiveRecallSections.removeLast(currentGlassesLiveRecallSections.count - Self.liveRecallDisplaySectionLimit)
+    }
+    refreshLiveRecallPresenceLines()
+    phoneAssistanceDismissed = false
+    phoneAssistanceTitleText = section.title
+    phoneAssistanceDetailText = Self.liveRecallPhoneDetailText(from: currentGlassesLiveRecallSections)
+    phoneAssistanceStatusText = status
+    phoneAssistanceThumbnail = thumbnailForPerson(personId)
+    memoryTriggerVerificationText = verification
+    if shouldSwitchToLive {
+      activeGlassesDisplayWindow = .live
+    }
+    sendCombinedGlassesDisplayCard(reason: reason)
+  }
+
+  private func liveRecallSectionKey(_ section: AssistanceDisplaySection) -> String {
+    ([section.title] + section.lines.filter { !Self.isPresentWithYouLine($0) })
+      .joined(separator: "\n")
+  }
+
+  private func refreshLiveRecallPresenceLines() {
+    guard !currentGlassesLiveRecallSections.isEmpty else { return }
+    let presentLine = activePresenceDisplayNames().isEmpty
+      ? nil
+      : "Present with you: \(activePresenceDisplayNames().joined(separator: ", "))"
+    currentGlassesLiveRecallSections = currentGlassesLiveRecallSections.enumerated().map { index, section in
+      var updated = section
+      var lines = section.lines.filter { !Self.isPresentWithYouLine($0) }
+      if index == 0, let presentLine {
+        lines.insert(presentLine, at: 0)
+      }
+      updated = AssistanceDisplaySection(
+        title: section.title,
+        lines: lines,
+        thumbnailImageURI: section.thumbnailImageURI,
+        thumbnailImageSize: section.thumbnailImageSize
+      )
+      return updated
+    }
+  }
+
+  private func activePresenceDisplayNames() -> [String] {
+    Self.uniqueDisplayStrings(presenceTracker.snapshot().active.map(\.displayName))
+  }
+
+  private func activeStreamRecognizedPeopleNames() -> [String] {
+    var names = activePresenceDisplayNames()
+    if activeIdentityStateText == ActiveIdentityState.State.confirmed.rawValue {
+      names.append(activeIdentityName)
+    }
+    if let retainedRecognizedName {
+      names.append(retainedRecognizedName)
+    }
+    if activeConversationPartnerStateText == ConversationPartnerState.Phase.confirmed.rawValue {
+      names.append(activeConversationPartnerName)
+    }
+    if activeSpeakerStateText == "confirmed" {
+      names.append(activeSpeakerName)
+    }
+    return Self.uniqueDisplayStrings(names)
+  }
+
+  private static func isPresentWithYouLine(_ line: String) -> Bool {
+    line.trimmingCharacters(in: .whitespacesAndNewlines)
+      .localizedCaseInsensitiveContains("Present with you:")
+  }
+
+  private static func liveRecallPhoneDetailText(from sections: [AssistanceDisplaySection]) -> String {
+    sections.enumerated().flatMap { index, section -> [String] in
+      let lines = section.lines
+        .map { truncated($0, maxLength: 140) }
+        .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+      guard !lines.isEmpty else { return [] }
+      if index == 0 { return lines }
+      return ["", "\(section.title):"] + lines
+    }
+    .joined(separator: "\n")
+  }
+
+  private static func localLiveMemoryTriggerLines(
+    trigger: LiveTranscriptResolvedTrigger,
+    candidates: [LiveMemoryCandidate]
+  ) -> [String] {
+    guard let best = candidates.first else {
+      return liveAnswerLines(
+        questionText: trigger.fullText,
+        answerText: LiveMemoryAnswerPolicy.noRelevantSavedMemoryLine
+      )
+    }
+    return liveAnswerLines(questionText: trigger.fullText, answerText: best.summaryLine)
+  }
+
+  nonisolated static func liveAnswerLines(questionText: String, answerText: String) -> [String] {
+    [
+      truncated("Q: \(questionText)", maxLength: 90),
+      truncated("A: \(answerText)", maxLength: 120)
+    ]
+    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+  }
+
+  nonisolated static func liveMemoryAnswerLines(triggerText: String, answerText: String) -> [String] {
+    liveAnswerLines(questionText: triggerText, answerText: answerText)
+  }
+
+  private func configureLiveAudioBufferHandling(reason: String) {
+    let recorderRef = audioRecorder
+    let transcriptionRef = liveTranscriber
+    guard !isDATAnalysisPaused else {
+      speechManager.onAudioBuffer = { _ in }
+      activeSpeakerStateText = "analysis paused"
       activeSpeakerName = ""
       activeSpeakerPersonId = nil
       activeSpeakerSimilarity = 0
       voiceSpeechBufferSeconds = 0
-      voiceMatchStatusText = "Live phone audio disabled"
-      iPhoneVoiceSimilarityStatusText = "iPhone: live audio disabled"
-      workerVoiceSimilarityStatusText = "Worker PC: disabled"
-      wearerVoiceSimilarityStatusText = "Wearer: live audio disabled"
-      cloudDiarizationState = .idle
-      microphoneStatusText = "Live phone audio disabled"
-      UIApplication.shared.isIdleTimerDisabled = true
-      AppLogger.log(.stream, "DAT stream is streaming; phone audio/conversation activation skipped to keep DAT camera stream isolated")
-      return
-    }
-    resetPostSessionAttributionState()
-    lastWearerVoiceSimilarity = 0
-    wearerVoiceSimilarityStatusText = "Wearer: not checked"
-    workerVoiceSimilarityStatusText = "Worker PC: disabled"
-
-    let snapshot = await identityPipeline.startConversationSession(
-      deviceId: UIDevice.current.identifierForVendor?.uuidString,
-      datDeviceId: datSelectedDeviceIDText == "None" ? nil : datSelectedDeviceIDText
-    )
-    pipelineContext = await identityPipeline.currentContext()
-    applyRunSessionSnapshot(snapshot)
-    guard !Task.isCancelled, canActivateLiveAudioSession else {
-      AppLogger.log(.stream, "Canceling live audio activation after conversation setup because DAT stopped. stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
-      await identityPipeline.endConversation()
-      pipelineContext = await identityPipeline.currentContext()
-      applyRunSessionSnapshot(await identityPipeline.currentRunSessionSnapshot())
-      return
-    }
-    guard datFramesConvertedToUIImage > 0 else {
-      AppLogger.log(.stream, "Canceling live audio activation because DAT has not delivered a video frame yet. stream=\(datStreamSessionStateText), datFramesConverted=\(datFramesConvertedToUIImage)")
-      await identityPipeline.endConversation()
-      pipelineContext = await identityPipeline.currentContext()
-      applyRunSessionSnapshot(await identityPipeline.currentRunSessionSnapshot())
+      voiceMatchStatusText = "Analysis paused"
+      iPhoneVoiceSimilarityStatusText = "iPhone local estimate: analysis paused"
+      workerVoiceSimilarityStatusText = "AWS canonical: analysis paused"
+      wearerVoiceSimilarityStatusText = "Wearer: analysis paused"
+      AppLogger.log(.speakerIdentity, "Live audio analysis paused reason=\(reason); iPhone audio session remains available for DAT")
       return
     }
 
-    let recorderRef = audioRecorder
     if liveVoiceEmbeddingEnabled {
       let pipeline = speakerPipeline
       speechManager.onAudioBuffer = { [weak self] buffer in
         recorderRef.append(buffer)
+        transcriptionRef.append(buffer)
         Task { [weak self] in
           let result = await pipeline.process(buffer: buffer)
           let bufferSec = await pipeline.currentSpeechBufferSeconds
@@ -844,7 +1905,7 @@ final class StreamSessionViewModel: ObservableObject {
             self.recordSpeakerEvidenceIfNeeded(result)
             if let diagnostic = result.iPhoneSimilarity {
               self.iPhoneVoiceSimilarityStatusText = result.vadDecision == "wearerSpeech"
-                ? "iPhone: Me \(String(format: "%.3f", result.matchResult?.bestSimilarity ?? 0)) · same voice"
+                ? "iPhone local estimate: Me \(String(format: "%.3f", Double(result.matchResult?.bestSimilarity ?? 0))) · same voice"
                 : diagnostic.statusText
               if let sim = diagnostic.bestSimilarity {
                 self.lastIPhoneVoiceSimilarity = sim
@@ -859,6 +1920,7 @@ final class StreamSessionViewModel: ObservableObject {
                 self.lastWorkerVoiceSimilarity = sim
               }
             }
+            self.updateAudioSpeakerDebugMetrics(with: result)
             self.voiceSpeechBufferSeconds = bufferSec
             self.capturedVoiceClips = voiceClips
             self.wearerVoiceProfile = wearerSnapshot
@@ -868,29 +1930,135 @@ final class StreamSessionViewModel: ObservableObject {
     } else {
       speechManager.onAudioBuffer = { buffer in
         recorderRef.append(buffer)
+        transcriptionRef.append(buffer)
       }
-      activeSpeakerStateText = "disabled"
+      activeSpeakerStateText = inputMode == .realGlasses ? "recording" : "disabled"
       activeSpeakerName = ""
       activeSpeakerPersonId = nil
       activeSpeakerSimilarity = 0
       voiceSpeechBufferSeconds = 0
       voiceMatchStatusText = "Live voice embedding disabled"
-      iPhoneVoiceSimilarityStatusText = "iPhone: live embedding disabled"
-      workerVoiceSimilarityStatusText = "Worker PC: disabled"
+      iPhoneVoiceSimilarityStatusText = "iPhone local estimate: live embedding disabled"
+      workerVoiceSimilarityStatusText = "AWS canonical: disabled"
       wearerVoiceSimilarityStatusText = "Wearer: live embedding disabled"
-      AppLogger.log(.speakerIdentity, "Live voice embedding disabled; audio buffers are recorded for post-session diarization only")
+      AppLogger.log(.speakerIdentity, "Live speaker identity disabled for reason=\(reason); iPhone audio buffers are recorded for post-session diarization")
     }
+  }
+
+  private func startLivePhoneAudioCapture(reason: String, datDeviceId: String?, validateDATAfterStart: Bool) async -> Bool {
+    if livePhoneAudioSessionActive {
+      liveAudioCaptureReadyForVision = true
+      AppLogger.log(.audio, "Live iPhone audio already active; reusing capture reason=\(reason)")
+      return true
+    }
+
+    resetPostSessionAttributionState()
+    lastWearerVoiceSimilarity = 0
+    wearerVoiceSimilarityStatusText = "Wearer: not checked"
+    workerVoiceSimilarityStatusText = "AWS canonical: disabled"
+    let conversationDeviceId = UIDevice.current.identifierForVendor?.uuidString
+    let conversationDATDeviceId = datDeviceId
+
+    configureLiveAudioBufferHandling(reason: reason)
+
+    startLiveTranscriptionForStream(reason: reason)
+    liveStreamSessionActivated = true
+    livePhoneAudioSessionActive = true
+    let audioStart = Date()
+    streamAudioStart = isDATAnalysisPaused ? nil : audioStart
+    speakerTimeline = []
+    cloudDiarizationState = isDATAnalysisPaused ? .idle : .recording
+    AppLogger.log(.stream, "Starting live iPhone audio capture reason=\(reason)")
+    if !isDATAnalysisPaused {
+      audioRecorder.start()
+    }
+    let audioStarted = await speechManager.start(audioSource: .iPhone)
+    guard audioStarted else {
+      let droppedURL = audioRecorder.stop()
+      if let droppedURL {
+        try? FileManager.default.removeItem(at: droppedURL)
+      }
+      await stopCloudSpeakerWorkerForStream(reason: "audioStartFailed-\(reason)")
+      await stopCloudFaceWorkerForStream(reason: "audioStartFailed-\(reason)")
+      cloudDiarizationState = .failed("Could not start iPhone audio capture")
+      liveStreamSessionActivated = false
+	      livePhoneAudioSessionActive = false
+	      liveAudioCaptureReadyForVision = false
+	      speechManager.onAudioBuffer = nil
+	      stopLiveTranscriptionForStream()
+	      streamAudioStart = nil
+      return false
+    }
+
+    if validateDATAfterStart, let blocker = datActivationReadinessBlocker(at: Date()) {
+      AppLogger.log(.stream, "Stopping live audio immediately because DAT is not activation-ready during audio start. reason=\(reason), blocker=\(blocker), stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+      await deactivateLiveStreamSessionIfNeeded(reason: "datStoppedDuringAudioStart-\(reason)")
+      return false
+    }
+
+    liveAudioCaptureReadyForVision = true
+    startCloudWorkersForStream(reason: reason, includeSpeaker: liveVoiceEmbeddingEnabled)
+    UIApplication.shared.isIdleTimerDisabled = true
+    AppLogger.log(.stream, "Live iPhone audio capture started; creating conversation metadata reason=\(reason)")
+
+    let snapshot = await identityPipeline.startConversationSession(
+      deviceId: conversationDeviceId,
+      datDeviceId: conversationDATDeviceId
+    )
+    pipelineContext = await identityPipeline.currentContext()
+    applyRunSessionSnapshot(snapshot)
+    if validateDATAfterStart, let blocker = datActivationReadinessBlocker(at: Date()) {
+      AppLogger.log(.stream, "Canceling live session after conversation setup because DAT is not activation-ready. reason=\(reason), blocker=\(blocker), stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+      await deactivateLiveStreamSessionIfNeeded(reason: "datStoppedAfterConversationSetup-\(reason)")
+      return false
+    }
+    return true
+  }
+
+  private func activateLiveStreamSessionIfNeeded() async {
+    guard !liveStreamSessionActivated else { return }
+    if let activationBlocker = datActivationReadinessBlocker(at: Date()) {
+      AppLogger.log(.stream, "Skipping live audio activation because DAT is not activation-ready. blocker=\(activationBlocker), stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+      return
+    }
+    guard livePhoneAudioCaptureEnabled else {
+      liveStreamSessionActivated = true
+      livePhoneAudioSessionActive = false
+      activeSpeakerStateText = "disabled"
+      activeSpeakerName = ""
+      activeSpeakerPersonId = nil
+      activeSpeakerSimilarity = 0
+      voiceSpeechBufferSeconds = 0
+      voiceMatchStatusText = "Live phone audio disabled"
+      iPhoneVoiceSimilarityStatusText = "iPhone local estimate: live phone audio disabled"
+      workerVoiceSimilarityStatusText = "AWS canonical: disabled"
+      wearerVoiceSimilarityStatusText = "Wearer: live phone audio disabled"
+      cloudDiarizationState = .idle
+      microphoneStatusText = "Live phone audio disabled"
+      liveAudioCaptureReadyForVision = true
+      UIApplication.shared.isIdleTimerDisabled = true
+      AppLogger.log(.stream, "Phone audio/conversation activation skipped because live phone audio is disabled")
+      return
+    }
+    resetPostSessionAttributionState()
+    lastWearerVoiceSimilarity = 0
+    wearerVoiceSimilarityStatusText = "Wearer: not checked"
+    workerVoiceSimilarityStatusText = "AWS canonical: disabled"
+    let conversationDeviceId = UIDevice.current.identifierForVendor?.uuidString
+    let conversationDATDeviceId = datSelectedDeviceIDText == "None" ? nil : datSelectedDeviceIDText
+
+    configureLiveAudioBufferHandling(reason: "afterDATStreamStart")
+    startLiveTranscriptionForStream(reason: "afterDATStreamStart")
     liveStreamSessionActivated = true
     livePhoneAudioSessionActive = true
     // Start cloud diarization audio recorder
     let audioStart = Date()
-    streamAudioStart = audioStart
+    streamAudioStart = isDATAnalysisPaused ? nil : audioStart
     speakerTimeline = []
-    cloudDiarizationState = .recording
-    do {
-      try audioRecorder.start()
-    } catch {
-      AppLogger.log(.audio, "[StreamAudioRecorder] start() threw: \(error.localizedDescription)")
+    cloudDiarizationState = isDATAnalysisPaused ? .idle : .recording
+    AppLogger.log(.stream, "Starting live iPhone audio before conversation metadata to avoid blocking DAT startup")
+    if !isDATAnalysisPaused {
+      audioRecorder.start()
     }
     let audioStarted = await speechManager.start(audioSource: audioSource)
     guard audioStarted else {
@@ -898,37 +2066,106 @@ final class StreamSessionViewModel: ObservableObject {
       if let droppedURL {
         try? FileManager.default.removeItem(at: droppedURL)
       }
+      await stopCloudSpeakerWorkerForStream(reason: "audioStartFailed")
+      await stopCloudFaceWorkerForStream(reason: "audioStartFailed")
       cloudDiarizationState = .failed("Could not start \(audioSource.displayName) audio capture")
       liveStreamSessionActivated = false
-      livePhoneAudioSessionActive = false
-      await identityPipeline.endConversation()
-      pipelineContext = await identityPipeline.currentContext()
-      applyRunSessionSnapshot(await identityPipeline.currentRunSessionSnapshot())
+	      livePhoneAudioSessionActive = false
+	      liveAudioCaptureReadyForVision = false
+	      speechManager.onAudioBuffer = nil
+	      stopLiveTranscriptionForStream()
+	      streamAudioStart = nil
       return
     }
-    guard !Task.isCancelled, canActivateLiveAudioSession else {
-      AppLogger.log(.stream, "Stopping live audio immediately because DAT stopped during audio start. stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+    if Task.isCancelled {
+      AppLogger.log(.stream, "Stopping live audio immediately because activation task was canceled. stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
       await deactivateLiveStreamSessionIfNeeded(reason: "datStoppedDuringAudioStart")
       return
     }
+    if let activationBlocker = datActivationReadinessBlocker(at: Date()) {
+      AppLogger.log(.stream, "Stopping live audio immediately because DAT is not activation-ready during audio start. blocker=\(activationBlocker), stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+      await deactivateLiveStreamSessionIfNeeded(reason: "datStoppedDuringAudioStart")
+      return
+    }
+    liveAudioCaptureReadyForVision = true
+    startCloudWorkersForStream(reason: "afterDATStreamStart", includeSpeaker: liveVoiceEmbeddingEnabled)
     UIApplication.shared.isIdleTimerDisabled = true
+    AppLogger.log(.stream, "Live audio started; creating conversation metadata")
+
+    let snapshot = await identityPipeline.startConversationSession(
+      deviceId: conversationDeviceId,
+      datDeviceId: conversationDATDeviceId
+    )
+    pipelineContext = await identityPipeline.currentContext()
+    applyRunSessionSnapshot(snapshot)
+    if Task.isCancelled {
+      AppLogger.log(.stream, "Canceling live session after conversation setup because activation task was canceled. stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+      await identityPipeline.endConversation()
+      pipelineContext = await identityPipeline.currentContext()
+      applyRunSessionSnapshot(await identityPipeline.currentRunSessionSnapshot())
+      await deactivateLiveStreamSessionIfNeeded(reason: "datStoppedAfterConversationSetup")
+      return
+    }
+    if let conversationBlocker = datActivationReadinessBlocker(at: Date()) {
+      AppLogger.log(.stream, "Canceling live session after conversation setup because DAT is not activation-ready. blocker=\(conversationBlocker), stream=\(datStreamSessionStateText), deviceSession=\(datDeviceSessionStateText), device=\(datSelectedDeviceIDText), isStreamRunning=\(datIsStreamRunning)")
+      await identityPipeline.endConversation()
+      pipelineContext = await identityPipeline.currentContext()
+      applyRunSessionSnapshot(await identityPipeline.currentRunSessionSnapshot())
+      await deactivateLiveStreamSessionIfNeeded(reason: "datStoppedAfterConversationSetup")
+      return
+    }
     AppLogger.log(.stream, "DAT stream is streaming; live audio and conversation session activated")
   }
 
   private var canActivateLiveAudioSession: Bool {
-    isDATStreamUsableForHeavyWork && liveDATHeavyWorkDelayRemaining(at: Date()) <= 0
+    datActivationReadinessBlocker(at: Date()) == nil
   }
 
-  private var isDATStreamUsableForHeavyWork: Bool {
-    guard datStreamSessionStateText.lowercased().contains("streaming"),
-          datIsStreamRunning,
-          datFramesConvertedToUIImage > 0,
-          datSelectedDeviceIDText != "None",
-          datDeviceSessionStateText.lowercased().contains("started"),
-          let liveDATLastFrameAt else {
-      return false
+  private func datStreamLivenessBlocker() -> String? {
+    guard datStreamSessionStateText.lowercased().contains("streaming") else {
+      return "DAT StreamSession state=\(datStreamSessionStateText)"
     }
-    return Date().timeIntervalSince(liveDATLastFrameAt) <= liveDATRecentFrameGraceSeconds
+    guard datIsStreamRunning else {
+      return "DAT isStreamRunning=false"
+    }
+    guard datSelectedDeviceIDText != "None" else {
+      return "waiting for active DAT device"
+    }
+    guard datDeviceSessionStateText.lowercased().contains("started") else {
+      return "DAT DeviceSession state=\(datDeviceSessionStateText)"
+    }
+    return nil
+  }
+
+  private func datActivationReadinessBlocker(at now: Date) -> String? {
+    if let blocker = datStreamLivenessBlocker() {
+      return blocker
+    }
+    guard datFramesWithPixelBuffer > 0, liveDATFirstFrameAt != nil else {
+      return "waiting for first DAT video frame"
+    }
+    let delayRemaining = liveDATHeavyWorkDelayRemaining(at: now)
+    if delayRemaining > 0 {
+      return String(format: "app-side startup delay %.1fs", Double(delayRemaining))
+    }
+    return nil
+  }
+
+  private func datVisionReadinessBlocker(at now: Date) -> String? {
+    if let blocker = datStreamLivenessBlocker() {
+      return blocker
+    }
+    guard datFramesWithPixelBuffer > 0, liveDATLastFrameAt != nil else {
+      return "waiting for first DAT video frame"
+    }
+    let delayRemaining = liveDATVisionDelayRemaining(at: now)
+    if delayRemaining > 0 {
+      return String(format: "vision startup delay %.1fs", Double(delayRemaining))
+    }
+    if !liveAudioCaptureReadyForVision {
+      return "waiting for live audio startup"
+    }
+    return nil
   }
 
   private func liveDATHeavyWorkDelayRemaining(at now: Date) -> TimeInterval {
@@ -941,19 +2178,200 @@ final class StreamSessionViewModel: ObservableObject {
     return max(0, liveDATVisionStartupDelaySeconds - now.timeIntervalSince(liveDATFirstFrameAt))
   }
 
+  nonisolated static func shouldSubmitSceneContextForLiveDATFrame(
+    previewImageAvailable: Bool,
+    isDATAnalysisPaused: Bool,
+    frameAccepted: Bool
+  ) -> Bool {
+    previewImageAvailable && !isDATAnalysisPaused && frameAccepted
+  }
+
+  nonisolated static func shouldAcceptLiveDATFrameForAnalysis(
+    streamStateText: String,
+    datIsStreamRunning: Bool,
+    terminalVisionInvalidated: Bool
+  ) -> Bool {
+    guard !terminalVisionInvalidated else { return false }
+    let normalizedState = streamStateText.lowercased()
+    guard normalizedState.contains("streaming"), datIsStreamRunning else { return false }
+    return !normalizedState.contains("stopping") && !normalizedState.contains("stopped")
+  }
+
+  nonisolated static func shouldInvalidateLiveDATVisionWorkOnTerminalState(
+    liveStreamSessionActivated: Bool,
+    livePhoneAudioSessionActive: Bool,
+    liveDATStreamingStarted: Bool,
+    hasReceivedFrame: Bool,
+    datFramesReceived: UInt64,
+    datFramesWithPixelBuffer: UInt64,
+    pendingVisionImageAvailable: Bool,
+    liveAudioCaptureReadyForVision: Bool
+  ) -> Bool {
+    liveStreamSessionActivated
+      || livePhoneAudioSessionActive
+      || liveDATStreamingStarted
+      || hasReceivedFrame
+      || datFramesReceived > 0
+      || datFramesWithPixelBuffer > 0
+      || pendingVisionImageAvailable
+      || liveAudioCaptureReadyForVision
+  }
+
+  nonisolated static func shouldContinueCloudFaceWarmupAfterInitialHealthMiss(
+    useEC2Lifecycle: Bool,
+    inputMode: InputMode
+  ) -> Bool {
+    useEC2Lifecycle && inputMode == .realGlasses
+  }
+
+  nonisolated static func shouldPublishLiveDisplayAfterNoConfirmedPerson(
+    datIsStreamRunning: Bool,
+    streamStateText: String
+  ) -> Bool {
+    datIsStreamRunning && streamStateText.lowercased().contains("streaming")
+  }
+
+  nonisolated static func shouldSendRemainingDisplayAfterClear(
+    datIsStreamRunning: Bool,
+    streamStateText: String,
+    activeWindowIsLive: Bool
+  ) -> Bool {
+    if !activeWindowIsLive { return true }
+    return shouldPublishLiveDisplayAfterNoConfirmedPerson(
+      datIsStreamRunning: datIsStreamRunning,
+      streamStateText: streamStateText
+    )
+  }
+
+  nonisolated static func isDATTerminalState(_ stateText: String) -> Bool {
+    let normalizedState = stateText.lowercased()
+    return normalizedState.contains("stopping") || normalizedState.contains("stopped")
+  }
+
+  nonisolated static func shouldRenderPhonePreviewForLiveDAT(
+    phonePreviewEnabled: Bool,
+    forceTestFaceOverlay: Bool
+  ) -> Bool {
+    forceTestFaceOverlay || phonePreviewEnabled
+  }
+
+  nonisolated static func isUnavailableFaceEmbeddingDecision(_ matchDecisionText: String) -> Bool {
+    switch matchDecisionText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "modelmissing", "embeddingmodelmissing", "embeddingfailed", "embeddingdisabled":
+      return true
+    default:
+      return false
+    }
+  }
+
+  nonisolated static func shouldShowFaceRecognitionUnavailableStatus(
+    faceCandidateCount: Int,
+    qualityPassCount: Int,
+    embeddingGenerated: Bool,
+    matchDecisionText: String
+  ) -> Bool {
+    faceCandidateCount > 0
+      && qualityPassCount > 0
+      && !embeddingGenerated
+      && isUnavailableFaceEmbeddingDecision(matchDecisionText)
+  }
+
+  nonisolated static func isCloudFaceRecognitionWarmingStatus(_ modelStatusText: String) -> Bool {
+    let normalizedStatus = modelStatusText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return normalizedStatus.contains("adaface")
+      && (
+        normalizedStatus.contains("starting")
+          || normalizedStatus.contains("warming")
+          || normalizedStatus.contains("worker is ready")
+      )
+  }
+
+  nonisolated static func shouldAskToConfirmUnknownIdentity(
+    activeIdentityState: ActiveIdentityState.State,
+    isUnknownPersonVisible: Bool,
+    embeddingGenerated: Bool,
+    matchDecisionText: String
+  ) -> Bool {
+    guard embeddingGenerated else { return false }
+    guard !isUnavailableFaceEmbeddingDecision(matchDecisionText) else { return false }
+    return activeIdentityState == .unknown || isUnknownPersonVisible
+  }
+
+  nonisolated static func shouldAskToConfirmRecognizedIdentity(
+    activeIdentityState: ActiveIdentityState.State,
+    personId: UUID?,
+    embeddingGenerated: Bool,
+    matchDecisionText: String
+  ) -> Bool {
+    guard personId != nil else { return false }
+    guard embeddingGenerated else { return activeIdentityState == .confirmed }
+    guard !isUnavailableFaceEmbeddingDecision(matchDecisionText) else { return false }
+    return activeIdentityState == .possible || activeIdentityState == .confirmed
+  }
+
+  @discardableResult
+  private func markLiveDATFrameArrived(at now: Date) -> Bool {
+    guard inputMode == .realGlasses else { return true }
+    if liveDATFirstFrameAt == nil {
+      liveDATFirstFrameAt = now
+    }
+    liveDATLastFrameAt = now
+    return true
+  }
+
+  private func shouldAcceptLiveDATFrameForAnalysis() -> Bool {
+    Self.shouldAcceptLiveDATFrameForAnalysis(
+      streamStateText: datStreamSessionStateText,
+      datIsStreamRunning: datIsStreamRunning,
+      terminalVisionInvalidated: liveDATTerminalVisionInvalidated
+    )
+  }
+
+  private func shouldInvalidateLiveDATVisionWorkOnTerminalState() -> Bool {
+    Self.shouldInvalidateLiveDATVisionWorkOnTerminalState(
+      liveStreamSessionActivated: liveStreamSessionActivated,
+      livePhoneAudioSessionActive: livePhoneAudioSessionActive,
+      liveDATStreamingStarted: liveDATStreamingStartedAt != nil,
+      hasReceivedFrame: hasReceivedFirstFrame || liveDATFirstFrameAt != nil || liveDATLastFrameAt != nil,
+      datFramesReceived: datFramesReceived,
+      datFramesWithPixelBuffer: datFramesWithPixelBuffer,
+      pendingVisionImageAvailable: pendingVisionImage != nil,
+      liveAudioCaptureReadyForVision: liveAudioCaptureReadyForVision
+    )
+  }
+
+  private func invalidateLiveDATVisionWork(reason: String) {
+    guard inputMode == .realGlasses else { return }
+    guard !liveDATTerminalVisionInvalidated else { return }
+    liveDATTerminalVisionInvalidated = true
+    visionGeneration &+= 1
+    pendingVisionImage = nil
+    liveAudioCaptureReadyForVision = false
+    AppLogger.log(
+      .facePipelineStop,
+      "warning...---- reason=\(reason) invalidated live DAT vision work generation=\(visionGeneration) stream=\(datStreamSessionStateText) deviceSession=\(datDeviceSessionStateText)"
+    )
+  }
+
+  private func markFirstRealGlassesFrameIfNeeded(reason: String) {
+    guard !hasReceivedFirstFrame else { return }
+    hasReceivedFirstFrame = true
+    showGlassesStreamingDashboard(reason: reason)
+  }
+
   private func activateLiveStreamSessionAfterFirstFrameIfReady() {
     guard liveStreamActivationTask == nil else { return }
     guard !liveStreamSessionActivated else { return }
     guard datStreamSessionStateText.lowercased().contains("streaming") else { return }
-    guard datFramesConvertedToUIImage > 0 else {
-      AppLogger.log(.stream, "Waiting for first DAT video frame before starting audio/conversation session")
+    guard datFramesWithPixelBuffer > 0 else {
+      AppLogger.log(.stream, "Waiting for first DAT video frame before app-side stream activation")
       return
     }
     let delay = liveDATHeavyWorkDelayRemaining(at: Date())
     liveStreamActivationTask = Task { @MainActor [weak self] in
       guard let self else { return }
       if delay.isFinite, delay > 0 {
-        AppLogger.log(.stream, "Delaying live audio/conversation activation for \(String(format: "%.1f", delay))s after first DAT video frame")
+        AppLogger.log(.stream, "Delaying app-side stream activation for \(String(format: "%.1f", Double(delay)))s after first DAT video frame")
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
       }
       guard !Task.isCancelled else {
@@ -965,35 +2383,439 @@ final class StreamSessionViewModel: ObservableObject {
     }
   }
 
-  private func deactivateLiveStreamSessionIfNeeded(reason: String) async {
+  private func startCloudWorkersForStream(reason: String, includeSpeaker: Bool) {
+    guard !isDATAnalysisPaused else {
+      deferredCloudWorkerStartTask?.cancel()
+      deferredCloudWorkerStartTask = nil
+      cloudFaceEmbeddingStatusText = "AWS AdaFace paused"
+      cloudSpeakerEmbeddingStatusText = "AWS canonical speaker paused"
+      workerVoiceSimilarityStatusText = "AWS canonical: analysis paused"
+      Task {
+        await identityPipeline.disableCloudFaceEmbedding(reason: "analysisPaused-\(reason)")
+        await speakerPipeline.disableWorkerEmbedding(reason: "analysisPaused-\(reason)")
+      }
+      AppLogger.log(.stream, "Skipped cloud analysis workers because Pause analysis is enabled reason=\(reason)")
+      return
+    }
+    let shouldDeferForDATWarmup = inputMode == .realGlasses || reason.contains("DAT")
+    guard shouldDeferForDATWarmup else {
+      if includeSpeaker {
+        startCloudSpeakerWorkerForStream()
+      }
+      startCloudFaceWorkerForStream()
+      return
+    }
+
+    let speakerSettings = CloudSpeakerEmbeddingSettings.load()
+    let faceSettings = CloudFaceEmbeddingLifecycleSettings.load()
+    let deferSpeaker = includeSpeaker && speakerSettings.enabled
+    let startFaceInBackground = faceSettings.enabled
+
+    if includeSpeaker, !speakerSettings.enabled {
+      startCloudSpeakerWorkerForStream()
+    }
+    if !faceSettings.enabled {
+      startCloudFaceWorkerForStream()
+    }
+    if startFaceInBackground {
+      startCloudFaceWorkerForStream()
+    }
+    guard deferSpeaker else { return }
+
+    deferredCloudWorkerStartTask?.cancel()
+    if deferSpeaker {
+      cloudSpeakerEmbeddingEnabled = true
+      cloudSpeakerEmbeddingEndpointText = speakerSettings.endpoint
+      cloudSpeakerEmbeddingAPIKeyText = speakerSettings.apiKey
+      cloudSpeakerEmbeddingStatusText = "AWS canonical speaker deferred until DAT is stable"
+      workerVoiceSimilarityStatusText = "AWS canonical: deferred"
+    }
+    AppLogger.log(.stream, "Deferred AWS live speaker worker for DAT warmup reason=\(reason) delaySeconds=45; face lease starts in background=\(startFaceInBackground)")
+
+    deferredCloudWorkerStartTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: 45_000_000_000)
+      guard !Task.isCancelled, let self else { return }
+      guard !self.isDATAnalysisPaused else {
+        AppLogger.log(.stream, "Skipped deferred AWS live embedding workers because Pause analysis is enabled")
+        return
+      }
+      guard self.datStreamSessionStateText.lowercased().contains("streaming") else {
+        AppLogger.log(.stream, "Skipped deferred AWS live embedding workers because DAT stream is \(self.datStreamSessionStateText)")
+        return
+      }
+      if deferSpeaker {
+        self.startCloudSpeakerWorkerForStream()
+      }
+    }
+  }
+
+  private func startCloudSpeakerWorkerForStream() {
+    let settings = CloudSpeakerEmbeddingSettings.load()
+    isLoadingCloudEmbeddingSettings = true
+    cloudSpeakerEmbeddingEnabled = settings.enabled
+    cloudSpeakerEmbeddingEndpointText = settings.endpoint
+    cloudSpeakerEmbeddingAPIKeyText = settings.apiKey
+    isLoadingCloudEmbeddingSettings = false
+
+    guard settings.enabled else {
+      cloudSpeakerEmbeddingStatusText = "AWS canonical speaker embeddings off"
+      workerVoiceSimilarityStatusText = "AWS canonical: disabled"
+      Task { await speakerPipeline.disableWorkerEmbedding(reason: "settingsDisabled") }
+      return
+    }
+
+    cloudSpeakerLifecycleTask?.cancel()
+    cloudSpeakerHeartbeatTask?.cancel()
+    cloudSpeakerHeartbeatTask = nil
+    cloudSpeakerEmbeddingStatusText = settings.useEC2Lifecycle
+      ? "AWS canonical speaker starting EC2..."
+      : "AWS canonical speaker warming worker..."
+    workerVoiceSimilarityStatusText = "AWS canonical: starting"
+    let lifecycle = cloudSpeakerLifecycleService
+    let pipeline = speakerPipeline
+    cloudSpeakerLifecycleTask = Task { [weak self] in
+      await pipeline.markWorkerEmbeddingStarting()
+      do {
+        let result = try await lifecycle.startAndWarm(settings: settings)
+        guard !Task.isCancelled else { return }
+        await pipeline.configureWorkerEmbedding(endpoint: result.endpoint, apiKey: result.apiKey)
+        // The worker is now reachable — finish any diarized enrollments that
+        // were left pending because the embedding service was unavailable.
+        if await pipeline.pendingDiarizedEnrollmentCount() > 0 {
+          let completed = await pipeline.retryPendingDiarizedEnrollments()
+          if !completed.isEmpty {
+            await MainActor.run { [weak self] in
+              guard let self else { return }
+              for id in completed {
+                self.pendingVoiceEnrollmentPersonIds.remove(id)
+                self.enrolledVoicePersonIds.insert(id)
+              }
+              AppLogger.log(.speakerEnrollment, "[CloudDiarization] pending voice enrollments completed on worker ready count=\(completed.count)")
+            }
+          }
+        }
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.cloudSpeakerEmbeddingEndpointText = result.endpoint
+          self.cloudSpeakerEmbeddingStatusText = "AWS canonical speaker ready \(result.publicIp ?? result.endpoint)"
+          self.workerVoiceSimilarityStatusText = "AWS canonical: ready"
+          self.startCloudSpeakerHeartbeatForStream()
+          AppLogger.log(
+            .speakerEmbeddingModel,
+            "AWS canonical speaker ready endpoint=\(result.endpoint) publicIp=\(result.publicIp ?? "none") privateIp=\(result.privateIp ?? "none") health=\(result.healthStatus) session=\(result.liveSessionId ?? "none") expiresAt=\(result.liveExpiresAt ?? "unknown")"
+          )
+        }
+      } catch {
+        await pipeline.disableWorkerEmbedding(reason: "startFailed")
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.cloudSpeakerEmbeddingStatusText = "AWS canonical speaker failed: \(error.localizedDescription)"
+          self.workerVoiceSimilarityStatusText = "AWS canonical: unavailable"
+          AppLogger.log(.speakerEmbeddingModel, "AWS live speaker start failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func stopCloudSpeakerWorkerForStream(reason: String, stopEC2: Bool = true) async {
+    cloudSpeakerLifecycleTask?.cancel()
+    cloudSpeakerLifecycleTask = nil
+    cloudSpeakerHeartbeatTask?.cancel()
+    cloudSpeakerHeartbeatTask = nil
+    await speakerPipeline.disableWorkerEmbedding(reason: "streamStop-\(reason)")
+    let settings = CloudSpeakerEmbeddingSettings.load()
+    if stopEC2 {
+      await cloudSpeakerLifecycleService.stopIfNeeded(settings: settings)
+    } else {
+      await cloudSpeakerLifecycleService.releaseLiveSessionWithoutStopping(reason: reason)
+    }
+    if settings.enabled {
+      cloudSpeakerEmbeddingStatusText = "AWS canonical speaker stopped"
+    }
+    workerVoiceSimilarityStatusText = settings.enabled ? "AWS canonical: stopped" : "AWS canonical: disabled"
+  }
+
+  private func startCloudSpeakerHeartbeatForStream() {
+    cloudSpeakerHeartbeatTask?.cancel()
+    let lifecycle = cloudSpeakerLifecycleService
+    cloudSpeakerHeartbeatTask = Task {
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 300_000_000_000)
+        guard !Task.isCancelled else { return }
+        await lifecycle.refreshLiveLeaseIfNeeded()
+      }
+    }
+  }
+
+  private func startCloudFaceWorkerForStream() {
+    let settings = CloudFaceEmbeddingLifecycleSettings.load()
+    isLoadingCloudEmbeddingSettings = true
+    cloudFaceEmbeddingEnabled = settings.enabled
+    isLoadingCloudEmbeddingSettings = false
+
+    guard settings.enabled else {
+      cloudFaceEmbeddingStatusText = "Cloud face embedding off"
+      Task { await identityPipeline.disableCloudFaceEmbedding(reason: "settingsDisabled") }
+      return
+    }
+
+    if shouldStartCloudFaceLeaseOnly(settings: settings) {
+      startCloudFaceWorkerLeaseOnlyForStream(settings: settings)
+      return
+    }
+
+    cloudFaceLifecycleTask?.cancel()
+    cloudFaceHeartbeatTask?.cancel()
+    cloudFaceHeartbeatTask = nil
+    cloudFaceEmbeddingStatusText = settings.useEC2Lifecycle
+      ? "AWS AdaFace starting EC2..."
+      : "AWS AdaFace warming worker..."
+    let lifecycle = cloudFaceLifecycleService
+    let pipeline = identityPipeline
+    cloudFaceLifecycleTask = Task { [weak self] in
+      await pipeline.markCloudFaceEmbeddingStarting()
+      do {
+        let result = try await lifecycle.startAndWarm(settings: settings)
+        guard !Task.isCancelled else { return }
+        await pipeline.configureCloudFaceEmbedding(endpoint: result.endpoint, apiKey: result.apiKey)
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.cloudFaceEmbeddingEndpointText = result.endpoint
+          self.cloudFaceEmbeddingStatusText = "AWS AdaFace ready \(result.publicIp ?? result.endpoint)"
+          self.startCloudFaceHeartbeatForStream()
+          AppLogger.log(
+            .faceEmbeddingModel,
+            "AWS live face ready endpoint=\(result.endpoint) publicIp=\(result.publicIp ?? "none") privateIp=\(result.privateIp ?? "none") health=\(result.healthStatus) session=\(result.liveSessionId ?? "none") expiresAt=\(result.liveExpiresAt ?? "unknown")"
+          )
+          Task { @MainActor in
+            self.faceEmbeddingModelStatusText = await self.identityPipeline.embeddingModelStatusText()
+          }
+        }
+      } catch {
+        await pipeline.disableCloudFaceEmbedding(reason: "startFailed")
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.cloudFaceEmbeddingStatusText = "AWS AdaFace failed: \(error.localizedDescription)"
+          AppLogger.log(.faceEmbeddingModel, "AWS live face start failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func shouldStartCloudFaceLeaseOnly(settings: CloudFaceEmbeddingLifecycleSettings) -> Bool {
+    settings.useEC2Lifecycle && inputMode == .realGlasses
+  }
+
+  private func startCloudFaceWorkerLeaseOnlyForStream(settings: CloudFaceEmbeddingLifecycleSettings) {
+    cloudFaceLifecycleTask?.cancel()
+    cloudFaceHeartbeatTask?.cancel()
+    cloudFaceHeartbeatTask = nil
+    cloudFaceEmbeddingStatusText = "AWS AdaFace starting EC2 in background; face recognition paused"
+    let lifecycle = cloudFaceLifecycleService
+    let pipeline = identityPipeline
+    let inputModeAtStart = inputMode
+    cloudFaceLifecycleTask = Task { [weak self] in
+      await pipeline.markCloudFaceEmbeddingStarting()
+      do {
+        let result = try await lifecycle.startLeaseOnly(settings: settings)
+        guard !Task.isCancelled else { return }
+        guard let endpoint = result.endpoint else {
+          await MainActor.run { [weak self] in
+            guard let self else { return }
+            self.cloudFaceEmbeddingStatusText = "AWS AdaFace EC2 starting; face recognition paused"
+            AppLogger.log(
+              .faceEmbeddingModel,
+              "AWS live face lease started without public endpoint yet session=\(result.liveSessionId ?? "none") expiresAt=\(result.liveExpiresAt ?? "unknown")"
+            )
+          }
+          return
+        }
+
+        await MainActor.run { [weak self] in
+          self?.cloudFaceEmbeddingEndpointText = endpoint
+        }
+
+        do {
+          let health: String
+          do {
+            health = try await lifecycle.checkWorkerHealthOnce(endpoint: endpoint, apiKey: result.apiKey, timeout: 2)
+          } catch {
+            guard Self.shouldContinueCloudFaceWarmupAfterInitialHealthMiss(
+              useEC2Lifecycle: settings.useEC2Lifecycle,
+              inputMode: inputModeAtStart
+            ) else {
+              throw error
+            }
+            await MainActor.run { [weak self] in
+              guard let self else { return }
+              self.cloudFaceEmbeddingStatusText = "AWS AdaFace warming; waiting for worker"
+              AppLogger.log(
+                .faceEmbeddingModel,
+                "AWS live face worker missed initial health probe; continuing background warmup endpoint=\(endpoint) error=\(error.localizedDescription)"
+              )
+            }
+            health = try await lifecycle.waitForWorkerHealth(endpoint: endpoint, apiKey: result.apiKey)
+          }
+          guard !Task.isCancelled else { return }
+          await pipeline.configureCloudFaceEmbedding(endpoint: endpoint, apiKey: result.apiKey)
+          await MainActor.run { [weak self] in
+            guard let self else { return }
+            self.cloudFaceEmbeddingStatusText = "AWS AdaFace ready \(result.publicIp ?? endpoint)"
+            self.startCloudFaceHeartbeatForStream()
+            AppLogger.log(
+              .faceEmbeddingModel,
+              "AWS live face ready after nonblocking lease endpoint=\(endpoint) publicIp=\(result.publicIp ?? "none") privateIp=\(result.privateIp ?? "none") health=\(health) session=\(result.liveSessionId ?? "none") expiresAt=\(result.liveExpiresAt ?? "unknown")"
+            )
+            Task { @MainActor in
+              self.faceEmbeddingModelStatusText = await self.identityPipeline.embeddingModelStatusText()
+            }
+          }
+        } catch {
+          await pipeline.disableCloudFaceEmbedding(reason: "workerWarming")
+          await MainActor.run { [weak self] in
+            guard let self else { return }
+            self.cloudFaceEmbeddingStatusText = "AWS AdaFace warming; face recognition paused"
+            AppLogger.log(
+              .faceEmbeddingModel,
+              "AWS live face lease started but worker is not ready; skipping wait during DAT stream endpoint=\(endpoint) error=\(error.localizedDescription)"
+            )
+          }
+        }
+      } catch {
+        await pipeline.disableCloudFaceEmbedding(reason: "startFailed")
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          self.cloudFaceEmbeddingStatusText = "AWS AdaFace failed: \(error.localizedDescription)"
+          AppLogger.log(.faceEmbeddingModel, "AWS live face lease start failed: \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func stopCloudFaceWorkerForStream(reason: String, stopEC2: Bool = true) async {
+    cloudFaceLifecycleTask?.cancel()
+    cloudFaceLifecycleTask = nil
+    cloudFaceHeartbeatTask?.cancel()
+    cloudFaceHeartbeatTask = nil
+    let settings = CloudFaceEmbeddingLifecycleSettings.load()
+    if stopEC2 {
+      await identityPipeline.disableCloudFaceEmbedding(reason: "streamStop-\(reason)")
+      await cloudFaceLifecycleService.stopIfNeeded(settings: settings)
+      if settings.enabled {
+        cloudFaceEmbeddingStatusText = "AWS AdaFace stopped; restart stream to relaunch"
+      }
+    } else {
+      await cloudFaceLifecycleService.releaseLiveSessionWithoutStopping(reason: reason)
+      if settings.enabled {
+        cloudFaceEmbeddingStatusText = await identityPipeline.isCloudFaceEmbeddingActive()
+          ? "AWS AdaFace ready for post-stream enrollment"
+          : "AWS AdaFace released; will warm again before enrollment"
+      }
+    }
+    faceEmbeddingModelStatusText = await identityPipeline.embeddingModelStatusText()
+  }
+
+  private func ensureCloudFaceEmbeddingReadyForEnrollmentIfNeeded() async {
+    let settings = CloudFaceEmbeddingLifecycleSettings.load()
+    guard settings.enabled else { return }
+
+    if let task = cloudFaceLifecycleTask {
+      cloudFaceEmbeddingStatusText = "AWS AdaFace finishing startup for enrollment..."
+      await task.value
+    }
+
+    if await identityPipeline.isCloudFaceEmbeddingActive(),
+       cloudFaceEmbeddingStatusText.localizedCaseInsensitiveContains("ready") {
+      return
+    }
+
+    cloudFaceEmbeddingStatusText = settings.useEC2Lifecycle
+      ? "AWS AdaFace warming for enrollment..."
+      : "AWS AdaFace checking enrollment worker..."
+
+    do {
+      let result = try await cloudFaceLifecycleService.startAndWarm(settings: settings)
+      await identityPipeline.configureCloudFaceEmbedding(endpoint: result.endpoint, apiKey: result.apiKey)
+      cloudFaceEmbeddingEndpointText = result.endpoint
+      cloudFaceEmbeddingStatusText = "AWS AdaFace ready for enrollment \(result.publicIp ?? result.endpoint)"
+      faceEmbeddingModelStatusText = await identityPipeline.embeddingModelStatusText()
+      AppLogger.log(
+        .faceEmbeddingModel,
+        "AWS AdaFace enrollment worker ready endpoint=\(result.endpoint) publicIp=\(result.publicIp ?? "none") health=\(result.healthStatus) session=\(result.liveSessionId ?? "none") expiresAt=\(result.liveExpiresAt ?? "unknown")"
+      )
+    } catch {
+      cloudFaceEmbeddingStatusText = "AWS AdaFace enrollment unavailable; saving local vectors"
+      faceEmbeddingModelStatusText = await identityPipeline.embeddingModelStatusText()
+      AppLogger.log(
+        .faceEmbeddingModel,
+        "warning...---- AWS AdaFace enrollment warmup failed; enrollment will continue with available local vectors. error=\(error.localizedDescription)"
+      )
+    }
+  }
+
+  private func startCloudFaceHeartbeatForStream() {
+    cloudFaceHeartbeatTask?.cancel()
+    let lifecycle = cloudFaceLifecycleService
+    cloudFaceHeartbeatTask = Task {
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 300_000_000_000)
+        guard !Task.isCancelled else { return }
+        await lifecycle.refreshLiveLeaseIfNeeded()
+      }
+    }
+  }
+
+  private func deactivateLiveStreamSessionIfNeeded(
+    reason: String,
+    cancelDisplayWork: Bool = true
+  ) async {
     guard liveStreamSessionActivated else { return }
     let hadLivePhoneAudioSession = livePhoneAudioSessionActive
     liveStreamSessionActivated = false
     livePhoneAudioSessionActive = false
+    liveAudioCaptureReadyForVision = false
+    deferredCloudWorkerStartTask?.cancel()
+    deferredCloudWorkerStartTask = nil
     lastSpeakerUIUpdateAt = nil
-    invalidateAssistanceWork(reason: "deactivate-\(reason)", stopAudio: true)
-    speechManager.stop()
-    speechManager.onAudioBuffer = nil
-    if hadLivePhoneAudioSession {
+    prepareDisplayForStreamStop(reason: reason)
+    invalidateLiveDATVisionWork(reason: "deactivate-\(reason)")
+	    invalidateAssistanceWork(reason: "deactivate-\(reason)", cancelDisplayWork: cancelDisplayWork)
+	    speechManager.stop()
+	    speechManager.onAudioBuffer = nil
+	    stopLiveTranscriptionForStream()
+	    await stopCloudSpeakerWorkerForStream(reason: reason, stopEC2: !hadLivePhoneAudioSession)
+    await stopCloudFaceWorkerForStream(reason: reason, stopEC2: !hadLivePhoneAudioSession)
+    if hadLivePhoneAudioSession, !isDATAnalysisPaused {
       await finalizeConversationTranscriptAfterStream(reason: reason)
+      await scheduleLatestStreamSummary(reason: reason)
       // Without this, the open WAV from the disconnected stream stays attached to the
       // recorder; the next stream's audioRecorder.start() hits its !isRecording guard,
       // bails, and the new stream writes into the stale file (or no file at all).
       let audioFileURL = audioRecorder.stop()
       let capturedStart = streamAudioStart
       let capturedTimeline = speakerTimeline
+      let capturedSpeakerEvidence = speakerEvidenceTimeline
       let capturedFaceEvidence = faceEvidenceTimeline
       let capturedContext = pipelineContext
       if let audioURL = audioFileURL, let start = capturedStart {
-        Task {
-          await self.submitCloudDiarizationJob(audioURL: audioURL, streamStart: start,
-                                                speakerTimeline: capturedTimeline,
-                                                faceEvidenceTimeline: capturedFaceEvidence,
-                                                pipelineContext: capturedContext)
-        }
+        scheduleCloudDiarizationJob(
+          audioURL: audioURL,
+          streamStart: start,
+          speakerTimeline: capturedTimeline,
+          speakerEvidenceTimeline: capturedSpeakerEvidence,
+          faceEvidenceTimeline: capturedFaceEvidence,
+          pipelineContext: capturedContext
+        )
       } else if audioFileURL == nil {
         cloudDiarizationState = .idle
       }
+    } else if hadLivePhoneAudioSession {
+      let discardedURL = audioRecorder.stop()
+      if let discardedURL {
+        try? FileManager.default.removeItem(at: discardedURL)
+      }
+      cloudDiarizationState = .idle
+      AppLogger.log(.stream, "Skipped post-stream transcript attribution and cloud diarization because analysis is paused reason=\(reason)")
     } else {
       cloudDiarizationState = .idle
       AppLogger.log(.stream, "DAT stream marker deactivated without phone audio teardown reason=\(reason)")
@@ -1003,6 +2825,8 @@ final class StreamSessionViewModel: ObservableObject {
     await speakerPipeline.resetRuntimeState(reason: reason)
     capturedVoiceClips = await speakerPipeline.capturedVoiceClipSnapshots()
     wearerVoiceProfile = await speakerPipeline.wearerVoiceProfileSnapshot()
+    persistFinalPresenceEpisodes(reason: reason)
+    closeCurrentActivityModeEpisode(reason: reason)
     await identityPipeline.endConversation()
     pipelineContext = await identityPipeline.currentContext()
     applyRunSessionSnapshot(await identityPipeline.currentRunSessionSnapshot())
@@ -1081,7 +2905,7 @@ final class StreamSessionViewModel: ObservableObject {
           if !self.isLiveDATStreamActive {
             self.people = result.people
           }
-          self.visionLatencyText = String(format: "%.1f ms", durationMS)
+          self.visionLatencyText = String(format: "%.1f ms", Double(durationMS))
           self.recordFaceDetectionEventIfNeeded(result)
           self.processIdentityIfNeeded(result)
           self.logVisionProcessed(sequence: sequence, source: "sampleBuffer", durationMS: durationMS, faces: result.faces.count)
@@ -1121,6 +2945,79 @@ final class StreamSessionViewModel: ObservableObject {
       return .dropped(reason: "processor busy")
     }
     submitVisionFrame(image: image, sequence: sequence, submittedAt: now)
+    return .accepted
+  }
+
+  private func enqueue(
+    pixelBuffer: CVPixelBuffer,
+    sequence: UInt64
+  ) -> VisionEnqueueResult {
+    guard !analysisPaused else {
+      return .dropped(reason: "analysis paused")
+    }
+    let now = Date()
+    guard forceTestFaceOverlay || shouldSubmitVisionFrame(at: now) else {
+      return .dropped(reason: visionSkipReason(at: now))
+    }
+    logVisionBusyGate(sequence: sequence, source: "CVPixelBuffer", stage: "beforeBusyGate")
+    guard !isProcessingFrame else {
+      logVisionBusyDrop(sequence: sequence, source: "CVPixelBuffer")
+      return .dropped(reason: "processor busy")
+    }
+    isProcessingFrame = true
+    lastVisionSubmissionAt = now
+    statsWindowVisionPending += 1
+    logVisionBusySetTrue(sequence: sequence, source: "CVPixelBuffer")
+    logVisionEnqueued(sequence: sequence, source: "CVPixelBuffer")
+    let generation = visionGeneration
+    let context = pipelineContext
+    let sendablePixelBuffer = SendablePixelBuffer(pixelBuffer: pixelBuffer)
+    Task { [weak self, sendablePixelBuffer] in
+      guard let self else { return }
+      await MainActor.run {
+        self.markVisionStarted(sequence: sequence, source: "CVPixelBuffer")
+      }
+      let startedAt = Date()
+      let result = await frameProcessor.process(
+        pixelBuffer: sendablePixelBuffer.pixelBuffer,
+        sequence: sequence,
+        forceTestFaceOverlay: forceTestFaceOverlay,
+        context: context
+      )
+      let durationMS = Date().timeIntervalSince(startedAt) * 1_000
+      await MainActor.run {
+        defer {
+          self.clearVisionBusy(sequence: sequence, source: "CVPixelBuffer")
+          self.emitAggregateFrameStatsIfNeeded(force: false)
+        }
+        guard self.visionGeneration == generation else {
+          AppLogger.log(.facePipelineStop, "reason=staleVisionResultIgnored frame=\(sequence) generation=\(generation) currentGeneration=\(self.visionGeneration)")
+          return
+        }
+        if let result {
+          self.visionProcessedFrames += 1
+          self.statsWindowVisionProcessedFrames += 1
+          self.statsWindowVisionDurationMS += durationMS
+          self.statsWindowVisionDurationCount += 1
+          self.currentImageSize = result.imageSize
+          self.detectedFaces = result.faces
+          self.latestMouthMovementScore = result.faces.map(\.mouthMovementScore).max() ?? 0
+          if !self.isLiveDATStreamActive {
+            self.people = result.people
+          }
+          self.visionLatencyText = String(format: "%.1f ms", Double(durationMS))
+          self.recordFaceDetectionEventIfNeeded(result)
+          self.processIdentityIfNeeded(result)
+          self.logVisionProcessed(sequence: sequence, source: "CVPixelBuffer", durationMS: durationMS, faces: result.faces.count)
+          if !self.hasReceivedFirstFrame {
+            self.hasReceivedFirstFrame = true
+          }
+        } else {
+          AppLogger.log(.pipelineStats, "visionSkippedReason=Vision returned no result frame=\(sequence) source=CVPixelBuffer")
+          self.noteDroppedFrame(sequence: sequence, reason: "Vision returned no result", shouldLog: self.verboseFrameLogging)
+        }
+      }
+    }
     return .accepted
   }
 
@@ -1169,7 +3066,7 @@ final class StreamSessionViewModel: ObservableObject {
           if !self.isLiveDATStreamActive {
             self.people = result.people
           }
-          self.visionLatencyText = String(format: "%.1f ms", durationMS)
+          self.visionLatencyText = String(format: "%.1f ms", Double(durationMS))
           self.recordFaceDetectionEventIfNeeded(result)
           self.processIdentityIfNeeded(result)
           self.logVisionProcessed(sequence: sequence, source: "UIImage", durationMS: durationMS, faces: result.faces.count)
@@ -1193,10 +3090,31 @@ final class StreamSessionViewModel: ObservableObject {
     let sequence = totalReceivedFrames
     let now = Date()
     if let lastFrameArrival {
-      lastFrameIntervalText = String(format: "%.1f ms", now.timeIntervalSince(lastFrameArrival) * 1_000)
+      lastFrameIntervalText = String(format: "%.1f ms", Double(now.timeIntervalSince(lastFrameArrival) * 1_000))
     }
     lastFrameArrival = now
-    lastFrameTimestampText = String(format: "%.3f", now.timeIntervalSince1970)
+    lastFrameTimestampText = String(format: "%.3f", Double(now.timeIntervalSince1970))
+    guard shouldAcceptLiveDATFrameForAnalysis() else {
+      AppLogger.log(.frames, "warning...---- Dropped DAT UIImage frame #\(sequence) because stream is terminal or not streaming. stream=\(datStreamSessionStateText), datRunning=\(datIsStreamRunning), terminalInvalidated=\(liveDATTerminalVisionInvalidated)")
+      noteDroppedFrame(sequence: sequence, reason: "DAT stream terminal")
+      emitAggregateFrameStatsIfNeeded(force: false)
+      return
+    }
+    let frameAccepted = markLiveDATFrameArrived(at: now)
+    if Self.shouldSubmitSceneContextForLiveDATFrame(
+      previewImageAvailable: true,
+      isDATAnalysisPaused: isDATAnalysisPaused,
+      frameAccepted: frameAccepted
+    ) {
+      submitSceneContextFrameIfSampled(image: image, timestamp: now)
+    }
+    guard frameAccepted else {
+      emitAggregateFrameStatsIfNeeded(force: false)
+      return
+    }
+    markFirstRealGlassesFrameIfNeeded(reason: "first-video-stream-frame")
+
+    guard !dropFrameIfAnalysisPaused(sequence: sequence, source: "UIImage") else { return }
 
     let size = image.size
     if verboseFrameLogging {
@@ -1211,9 +3129,6 @@ final class StreamSessionViewModel: ObservableObject {
       currentVideoFrame = image
       currentImageSize = size
       previewUpdated = true
-      if !hasReceivedFirstFrame {
-        hasReceivedFirstFrame = true
-      }
     }
 
     let enqueueResult = enqueue(image: image, sequence: sequence)
@@ -1230,50 +3145,172 @@ final class StreamSessionViewModel: ObservableObject {
     emitAggregateFrameStatsIfNeeded(force: false)
   }
 
-  private func handleRealGlassesSampleBuffer(_ sampleBuffer: CMSampleBuffer, previewImage: UIImage?) {
+  private func submitSceneContextFrameIfSampled(image: UIImage, timestamp: Date) {
+    guard sceneContextPipeline.captureFrame(image: image, timestamp: timestamp) else { return }
+    let attribution = currentTranscriptAttribution()
+    sceneContextPipeline.submitLatestIfReady(
+      context: pipelineContext,
+      identityEvidence: currentSceneContextIdentityEvidence(attribution: attribution),
+      location: sceneLocationProvider.currentSnapshot()
+    )
+  }
+
+  private func handleRealGlassesPixelBuffer(_ pixelBuffer: CVPixelBuffer, previewImage: UIImage?) {
     totalReceivedFrames += 1
     statsWindowReceivedFrames += 1
     let sequence = totalReceivedFrames
     let now = Date()
     if let lastFrameArrival {
-      lastFrameIntervalText = String(format: "%.1f ms", now.timeIntervalSince(lastFrameArrival) * 1_000)
+      lastFrameIntervalText = String(format: "%.1f ms", Double(now.timeIntervalSince(lastFrameArrival) * 1_000))
     }
     lastFrameArrival = now
-    lastFrameTimestampText = String(format: "%.3f", now.timeIntervalSince1970)
+    lastFrameTimestampText = String(format: "%.3f", Double(now.timeIntervalSince1970))
+    guard shouldAcceptLiveDATFrameForAnalysis() else {
+      AppLogger.log(.frames, "warning...---- Dropped DAT CVPixelBuffer frame #\(sequence) because stream is terminal or not streaming. stream=\(datStreamSessionStateText), datRunning=\(datIsStreamRunning), terminalInvalidated=\(liveDATTerminalVisionInvalidated)")
+      noteDroppedFrame(sequence: sequence, reason: "DAT stream terminal")
+      emitAggregateFrameStatsIfNeeded(force: false)
+      return
+    }
+    let frameAccepted = markLiveDATFrameArrived(at: now)
+    if Self.shouldSubmitSceneContextForLiveDATFrame(
+      previewImageAvailable: previewImage != nil,
+      isDATAnalysisPaused: isDATAnalysisPaused,
+      frameAccepted: frameAccepted
+    ), let previewImage {
+      submitSceneContextFrameIfSampled(image: previewImage, timestamp: now)
+    }
+    guard frameAccepted else {
+      emitAggregateFrameStatsIfNeeded(force: false)
+      return
+    }
+    markFirstRealGlassesFrameIfNeeded(reason: "first-video-stream-frame")
 
-    if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-      let width = CVPixelBufferGetWidth(pixelBuffer)
-      let height = CVPixelBufferGetHeight(pixelBuffer)
-      currentImageSize = CGSize(width: width, height: height)
-      AppLogger.log(.visionInput, "frame=\(sequence) input=CVPixelBuffer width=\(width) height=\(height) orientation=up mirrored=false")
-    } else {
-      AppLogger.log(.visionInput, "frame=\(sequence) input=UIImage fallback=true reason=pixelBufferUnavailable")
+    guard !dropFrameIfAnalysisPaused(sequence: sequence, source: "CVPixelBuffer") else { return }
+
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    datFramesWithPixelBuffer = max(datFramesWithPixelBuffer, sequence)
+
+    if verboseFrameLogging {
+      AppLogger.log(.frames, "Real DAT frame #\(sequence) arrived pixelBufferSize=\(width)x\(height), previewImage=\(previewImage != nil), timestamp=\(lastFrameTimestampText)")
     }
 
     var previewUpdated = false
-    if let previewImage, shouldUpdatePreview(at: now) {
-      totalPreviewFrames += 1
-      statsWindowPreviewFrames += 1
+    if shouldUpdatePreview(at: now) {
       lastPreviewUpdateAt = now
-      currentVideoFrame = previewImage
-      previewUpdated = true
-      if !hasReceivedFirstFrame {
-        hasReceivedFirstFrame = true
+      if let previewImage {
+        totalPreviewFrames += 1
+        statsWindowPreviewFrames += 1
+        currentVideoFrame = previewImage
+        currentImageSize = previewImage.size
+        previewUpdated = true
+      } else {
+        currentImageSize = CGSize(width: width, height: height)
+        renderLiveDATPreview(pixelBuffer: pixelBuffer, sequence: sequence, generation: visionGeneration)
+        previewUpdated = true
       }
     }
 
-    let enqueueResult = enqueue(sampleBuffer: sampleBuffer, sequence: sequence)
-    logVisionSelection(sequence: sequence, source: "sampleBuffer", result: enqueueResult)
+    let enqueueResult = enqueue(pixelBuffer: pixelBuffer, sequence: sequence)
+    logVisionSelection(sequence: sequence, source: "CVPixelBuffer", result: enqueueResult)
     if verboseFrameLogging {
       AppLogger.log(
         .frames,
-        "Real DAT sampleBuffer #\(sequence) previewUpdated=\(previewUpdated), selectedForVision=\(enqueueResult.selectedForVision), visionEnqueued=\(enqueueResult.visionEnqueued), visionSkippedReason=\(enqueueResult.visionSkippedReason)"
+        "Real DAT frame #\(sequence) previewUpdated=\(previewUpdated), selectedForVision=\(enqueueResult.selectedForVision), visionEnqueued=\(enqueueResult.visionEnqueued), visionSkippedReason=\(enqueueResult.visionSkippedReason)"
       )
     }
     if let reason = enqueueResult.dropReason {
-      noteDroppedFrame(sequence: sequence, reason: reason)
+      noteDroppedFrame(sequence: sequence, reason: reason, shouldLog: false)
     }
     emitAggregateFrameStatsIfNeeded(force: false)
+  }
+
+  private func handleRealGlassesSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+    totalReceivedFrames += 1
+    statsWindowReceivedFrames += 1
+    let sequence = totalReceivedFrames
+    let now = Date()
+    let frameIntervalMS = lastFrameArrival.map { now.timeIntervalSince($0) * 1_000 }
+    lastFrameArrival = now
+    guard shouldAcceptLiveDATFrameForAnalysis() else {
+      AppLogger.log(.frames, "warning...---- Dropped DAT CMSampleBuffer frame #\(sequence) because stream is terminal or not streaming. stream=\(datStreamSessionStateText), datRunning=\(datIsStreamRunning), terminalInvalidated=\(liveDATTerminalVisionInvalidated)")
+      noteDroppedFrame(sequence: sequence, reason: "DAT stream terminal")
+      emitAggregateFrameStatsIfNeeded(force: false)
+      return
+    }
+    guard markLiveDATFrameArrived(at: now) else {
+      emitAggregateFrameStatsIfNeeded(force: false)
+      return
+    }
+    markFirstRealGlassesFrameIfNeeded(reason: "first-video-stream-frame")
+
+    let shouldRenderPreview = shouldUpdatePreview(at: now)
+    if shouldRenderPreview {
+      lastPreviewUpdateAt = now
+      if let frameIntervalMS {
+        lastFrameIntervalText = String(format: "%.1f ms", Double(frameIntervalMS))
+      }
+      lastFrameTimestampText = String(format: "%.3f", Double(now.timeIntervalSince1970))
+      if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+        datFramesWithPixelBuffer = max(datFramesWithPixelBuffer, sequence)
+        currentImageSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
+        renderLiveDATPreview(pixelBuffer: pixelBuffer, sequence: sequence, generation: visionGeneration)
+      } else if verboseFrameLogging {
+        AppLogger.log(
+          .visionInput,
+          "WARNING frame=\(sequence) input=sampleBuffer pixelBufferUnavailable mode=liveDAT action=previewSkipped"
+        )
+      }
+    }
+
+    if !liveDATStreamHealthIsolationMode {
+      scheduleLiveDATAnalysis(sampleBuffer: sampleBuffer, sequence: sequence)
+    }
+    emitAggregateFrameStatsIfNeeded(force: false)
+  }
+
+  private func scheduleLiveDATAnalysis(sampleBuffer: CMSampleBuffer, sequence: UInt64) {
+    guard !analysisPaused else { return }
+    let now = Date()
+    guard forceTestFaceOverlay || shouldSubmitVisionFrame(at: now) else { return }
+    let enqueueResult = enqueue(sampleBuffer: sampleBuffer, sequence: sequence)
+    logVisionSelection(sequence: sequence, source: "sampleBuffer", result: enqueueResult)
+    if let reason = enqueueResult.dropReason {
+      noteDroppedFrame(sequence: sequence, reason: reason)
+    }
+  }
+
+  private func renderLiveDATPreview(pixelBuffer: CVPixelBuffer, sequence: UInt64, generation: UInt64) {
+    let sendablePixelBuffer = SendablePixelBuffer(pixelBuffer: pixelBuffer)
+    liveDATPreviewRenderQueue.async { [sendablePixelBuffer] in
+      guard let image = Self.makePreviewImage(from: sendablePixelBuffer.pixelBuffer) else {
+        Task { @MainActor [weak self] in
+          guard let self else { return }
+          self.noteDroppedFrame(sequence: sequence, reason: "preview render failed", shouldLog: self.verboseFrameLogging)
+        }
+        return
+      }
+      Task { @MainActor [weak self] in
+        guard let self, self.visionGeneration == generation else { return }
+        self.totalPreviewFrames += 1
+        self.statsWindowPreviewFrames += 1
+        self.currentVideoFrame = image
+        self.currentImageSize = image.size
+        if !self.isDATAnalysisPaused {
+          self.submitSceneContextFrameIfSampled(image: image, timestamp: Date())
+        }
+        if !self.hasReceivedFirstFrame {
+          self.hasReceivedFirstFrame = true
+        }
+      }
+    }
+  }
+
+  nonisolated private static func makePreviewImage(from pixelBuffer: CVPixelBuffer) -> UIImage? {
+    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+    let context = CIContext(options: nil)
+    guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
+    return UIImage(cgImage: cgImage)
   }
 
   private func handleSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
@@ -1282,13 +3319,15 @@ final class StreamSessionViewModel: ObservableObject {
     let sequence = totalReceivedFrames
     let now = Date()
     if let lastFrameArrival {
-      lastFrameIntervalText = String(format: "%.1f ms", now.timeIntervalSince(lastFrameArrival) * 1_000)
+      lastFrameIntervalText = String(format: "%.1f ms", Double(now.timeIntervalSince(lastFrameArrival) * 1_000))
     }
     lastFrameArrival = now
 
     let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    let timestampText = timestamp.isValid ? String(format: "%.3f", CMTimeGetSeconds(timestamp)) : "invalid"
+    let timestampText = timestamp.isValid ? String(format: "%.3f", Double(CMTimeGetSeconds(timestamp))) : "invalid"
     lastFrameTimestampText = timestampText
+
+    guard !dropFrameIfAnalysisPaused(sequence: sequence, source: "sampleBuffer") else { return }
 
     if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
       let width = CVPixelBufferGetWidth(pixelBuffer)
@@ -1306,8 +3345,21 @@ final class StreamSessionViewModel: ObservableObject {
 
   private func shouldUpdatePreview(at now: Date) -> Bool {
     guard !forceTestFaceOverlay else { return true }
+    guard Self.shouldRenderPhonePreviewForLiveDAT(
+      phonePreviewEnabled: Self.liveDATPhonePreviewEnabled,
+      forceTestFaceOverlay: forceTestFaceOverlay
+    ) else { return false }
     guard let lastPreviewUpdateAt else { return true }
     return now.timeIntervalSince(lastPreviewUpdateAt) >= 1 / maxPreviewFPS
+  }
+
+  private func dropFrameIfAnalysisPaused(sequence: UInt64, source: String) -> Bool {
+    guard analysisPaused else { return false }
+    let result = VisionEnqueueResult.dropped(reason: "analysis paused")
+    logVisionSelection(sequence: sequence, source: source, result: result)
+    noteDroppedFrame(sequence: sequence, reason: "analysis paused", shouldLog: verboseFrameLogging)
+    emitAggregateFrameStatsIfNeeded(force: false)
+    return true
   }
 
   private func shouldSubmitVisionFrame(at now: Date) -> Bool {
@@ -1322,11 +3374,7 @@ final class StreamSessionViewModel: ObservableObject {
     guard inputMode == .realGlasses else {
       return 1 / maxVisionFPS
     }
-    guard isDATStreamUsableForHeavyWork else {
-      return .infinity
-    }
-    let delayRemaining = liveDATVisionDelayRemaining(at: now)
-    guard delayRemaining <= 0 else {
+    guard datVisionReadinessBlocker(at: now) == nil else {
       return .infinity
     }
     guard let liveDATFirstFrameAt else { return .infinity }
@@ -1353,18 +3401,14 @@ final class StreamSessionViewModel: ObservableObject {
     guard inputMode == .realGlasses else {
       return "vision throttle"
     }
-    guard isDATStreamUsableForHeavyWork else {
-      return "DAT stream not ready for vision"
-    }
-    let delayRemaining = liveDATVisionDelayRemaining(at: now)
-    if delayRemaining > 0 {
-      return String(format: "vision startup delay %.1fs", delayRemaining)
+    if let blocker = datVisionReadinessBlocker(at: now) {
+      return blocker
     }
     return "vision throttle"
   }
 
   private func logVisionBusyGate(sequence: UInt64, source: String, stage: String) {
-    guard verboseFrameLogging || sequence <= 5 || sequence % 30 == 0 else { return }
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
       "visionGate \(stage) frame=\(sequence) source=\(source) busy=\(isProcessingFrame) pending=\(statsWindowVisionPending) attemptedWindow=\(statsWindowVisionSubmittedFrames) processedWindow=\(statsWindowVisionProcessedFrames)"
@@ -1372,6 +3416,7 @@ final class StreamSessionViewModel: ObservableObject {
   }
 
   private func logVisionBusyDrop(sequence: UInt64, source: String) {
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
       "visionGate dropBusy frame=\(sequence) source=\(source) busy=\(isProcessingFrame) pending=\(statsWindowVisionPending)"
@@ -1379,6 +3424,7 @@ final class StreamSessionViewModel: ObservableObject {
   }
 
   private func logVisionBusySetTrue(sequence: UInt64, source: String) {
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
       "visionGate setBusy=true frame=\(sequence) source=\(source) pending=\(statsWindowVisionPending)"
@@ -1386,7 +3432,7 @@ final class StreamSessionViewModel: ObservableObject {
   }
 
   private func logVisionSelection(sequence: UInt64, source: String, result: VisionEnqueueResult) {
-    guard verboseFrameLogging || result.visionEnqueued || result.selectedForVision || sequence <= 20 || sequence % 30 == 0 else { return }
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
       "visionSelection frame=\(sequence) source=\(source) selectedForVision=\(result.selectedForVision) visionEnqueued=\(result.visionEnqueued) visionStarted=false visionProcessed=false visionSkippedReason=\(result.visionSkippedReason) pending=\(statsWindowVisionPending)"
@@ -1394,6 +3440,7 @@ final class StreamSessionViewModel: ObservableObject {
   }
 
   private func logVisionEnqueued(sequence: UInt64, source: String) {
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
       "visionEnqueued frame=\(sequence) source=\(source) pending=\(statsWindowVisionPending)"
@@ -1403,6 +3450,7 @@ final class StreamSessionViewModel: ObservableObject {
   private func markVisionStarted(sequence: UInt64, source: String) {
     visionSubmittedFrames += 1
     statsWindowVisionSubmittedFrames += 1
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
       "visionStarted frame=\(sequence) source=\(source) pending=\(statsWindowVisionPending) attemptedWindow=\(statsWindowVisionSubmittedFrames)"
@@ -1410,9 +3458,10 @@ final class StreamSessionViewModel: ObservableObject {
   }
 
   private func logVisionProcessed(sequence: UInt64, source: String, durationMS: Double, faces: Int) {
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
-      "visionProcessed frame=\(sequence) source=\(source) durationMs=\(String(format: "%.1f", durationMS)) faces=\(faces) pending=\(statsWindowVisionPending)"
+      "visionProcessed frame=\(sequence) source=\(source) durationMs=\(String(format: "%.1f", Double(durationMS))) faces=\(faces) pending=\(statsWindowVisionPending)"
     )
   }
 
@@ -1426,6 +3475,7 @@ final class StreamSessionViewModel: ObservableObject {
       )
     }
     isProcessingFrame = false
+    guard verboseFrameLogging else { return }
     AppLogger.log(
       .pipelineStats,
       "visionGate setBusy=false frame=\(sequence) source=\(source) pending=\(statsWindowVisionPending)"
@@ -1442,7 +3492,7 @@ final class StreamSessionViewModel: ObservableObject {
       || reason.localizedCaseInsensitiveContains("not ready") {
       statsWindowSkippedThrottle += 1
     }
-    if shouldLog || verboseFrameLogging {
+    if verboseFrameLogging && shouldLog {
       AppLogger.log(.frames, "Dropped \(inputMode.rawValue) frame #\(sequence): \(reason). dropped=\(totalDroppedFrames)")
     }
   }
@@ -1450,7 +3500,7 @@ final class StreamSessionViewModel: ObservableObject {
   private func emitAggregateFrameStatsIfNeeded(force: Bool) {
     let now = Date()
     let elapsed = now.timeIntervalSince(statsWindowStartedAt)
-    guard force || elapsed >= 2 else { return }
+    guard force || elapsed >= aggregateFrameStatsLogIntervalSeconds else { return }
     let fps = elapsed > 0 ? Double(statsWindowReceivedFrames) / elapsed : 0
     let avgVisionMS = statsWindowVisionDurationCount > 0
       ? statsWindowVisionDurationMS / Double(statsWindowVisionDurationCount)
@@ -1581,12 +3631,14 @@ final class StreamSessionViewModel: ObservableObject {
     if result.matchDecisionText == IdentityMatchResult.Decision.known.rawValue {
       statsWindowMatched += 1
     }
+    updateVideoFaceDebugMetrics(with: result.embeddingMetrics)
 
+    let effectiveIdentity = retainedRecognizedIdentity(for: result)
     let identityUIKey = [
-      result.activeIdentity.state.rawValue,
-      result.activeIdentity.personId?.uuidString ?? "none",
-      result.activeIdentity.displayName ?? "none",
-      String(format: "%.1f", result.activeIdentity.confidence * 10),
+      effectiveIdentity.state.rawValue,
+      effectiveIdentity.personId?.uuidString ?? "none",
+      effectiveIdentity.displayName ?? "none",
+      String(format: "%.1f", Double(effectiveIdentity.confidence * 10)),
       "\(result.faceCandidateCount)",
       "\(result.isUnknownPersonVisible)"
     ].joined(separator: "|")
@@ -1599,29 +3651,35 @@ final class StreamSessionViewModel: ObservableObject {
     lastIdentityUIKey = identityUIKey
     lastIdentityUIUpdateAt = now
 
-    activeFacePersonId = result.activeIdentity.personId
-    activeFaceName = result.activeIdentity.displayName
-    activeFaceConfidence = result.activeIdentity.confidence
-    activeFaceState = result.activeIdentity.state.rawValue
-    if result.activeIdentity.state == .confirmed, let personId = result.activeIdentity.personId {
-      recordSpeakerTimelineEntry(personId: personId, displayName: result.activeIdentity.displayName)
+    activeFacePersonId = effectiveIdentity.personId
+    activeFaceName = effectiveIdentity.displayName
+    activeFaceConfidence = effectiveIdentity.confidence
+    activeFaceState = effectiveIdentity.state.rawValue
+    if effectiveIdentity.state == .confirmed, let personId = effectiveIdentity.personId {
+      recordSpeakerTimelineEntry(personId: personId, displayName: effectiveIdentity.displayName)
       refreshPersonConversationSummaryForCurrentStreamIfNeeded(personId: personId)
     }
-    recordFaceEvidenceIfNeeded()
-    activeIdentityName = result.activeIdentity.displayName ?? {
-      switch result.activeIdentity.state {
+    recordFaceEvidenceIfNeeded(
+      personId: effectiveIdentity.personId,
+      displayName: effectiveIdentity.displayName,
+      confidence: effectiveIdentity.confidence,
+      state: effectiveIdentity.state.rawValue,
+      detectedFaceCount: result.faceCandidateCount
+    )
+    activeIdentityName = effectiveIdentity.displayName ?? {
+      switch effectiveIdentity.state {
       case .unknown:
         return "Unknown"
       case .possible, .ambiguous:
         return "Possible"
       case .confirmed:
-        return result.activeIdentity.personId?.uuidString ?? "Confirmed"
+        return effectiveIdentity.personId?.uuidString ?? "Confirmed"
       case .none, .noFace:
         return "None"
       }
     }()
-    activeIdentityConfidenceText = String(format: "%.2f", result.activeIdentity.confidence)
-    activeIdentityStateText = result.activeIdentity.state.rawValue
+    activeIdentityConfidenceText = String(format: "%.2f", Double(effectiveIdentity.confidence))
+    activeIdentityStateText = effectiveIdentity.state.rawValue
     detectedFaceCount = result.faceCandidateCount
     isUnknownPersonVisible = result.isUnknownPersonVisible
     if !isLiveDATStreamActive {
@@ -1647,7 +3705,471 @@ final class StreamSessionViewModel: ObservableObject {
     if let snapshot = result.runSessionSnapshot {
       applyRunSessionSnapshot(snapshot)
     }
-    maybeSpeakLiveAssistance()
+    updateGlassesFaceVisibility(for: result)
+    updateGlassesIdentityConfirmation(for: result)
+    updateLivePhoneAssistance()
+  }
+
+  private func retainedRecognizedIdentity(for result: IdentityProcessingResult) -> ActiveIdentityState {
+    if let personId = result.activeIdentity.personId,
+       result.activeIdentity.state == .confirmed || result.activeIdentity.state == .possible {
+      let displayName = result.activeIdentity.displayName ?? resolvedDisplayName(for: personId)
+      retainRecognizedIdentity(
+        personId: personId,
+        displayName: displayName,
+        confidence: result.activeIdentity.confidence,
+        source: "faceRecognition-\(result.activeIdentity.state.rawValue)"
+      )
+      return ActiveIdentityState(
+        personId: personId,
+        displayName: displayName,
+        confidence: max(result.activeIdentity.confidence, IdentityConfig.strongMatchThreshold),
+        state: .confirmed,
+        confirmedAt: result.activeIdentity.confirmedAt ?? Date(),
+        lastSeenAt: result.activeIdentity.lastSeenAt ?? Date()
+      )
+    }
+
+    if let personId = retainedRecognizedPersonId {
+      let displayName = retainedRecognizedName ?? resolvedDisplayName(for: personId)
+      return ActiveIdentityState(
+        personId: personId,
+        displayName: displayName,
+        confidence: max(retainedRecognizedConfidence, IdentityConfig.strongMatchThreshold),
+        state: .confirmed,
+        confirmedAt: retainedRecognizedAt,
+        lastSeenAt: retainedRecognizedAt
+      )
+    }
+
+    return result.activeIdentity
+  }
+
+  private func retainRecognizedIdentity(
+    personId: UUID,
+    displayName: String?,
+    confidence: Float,
+    source: String
+  ) {
+    let previousPersonId = retainedRecognizedPersonId
+    let previousConfidence = retainedRecognizedConfidence
+    let samePerson = previousPersonId == personId
+    retainedRecognizedPersonId = personId
+    if let trimmedName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !trimmedName.isEmpty {
+      retainedRecognizedName = trimmedName
+    }
+    retainedRecognizedConfidence = samePerson
+      ? max(retainedRecognizedConfidence, confidence)
+      : confidence
+    retainedRecognizedAt = Date()
+    guard previousPersonId != personId || confidence > previousConfidence + 0.01 else { return }
+    AppLogger.log(
+      .memory,
+      "Retained recognized identity person=\(personId.uuidString) name=\"\(retainedRecognizedName ?? "unknown")\" confidence=\(String(format: "%.3f", Double(retainedRecognizedConfidence))) source=\(source)"
+    )
+  }
+
+  private func clearRetainedRecognizedIdentity(reason: String) {
+    guard let retainedPersonId = retainedRecognizedPersonId else { return }
+    let retainedName = retainedRecognizedName
+    retainedRecognizedPersonId = nil
+    retainedRecognizedName = nil
+    retainedRecognizedConfidence = 0
+    retainedRecognizedAt = nil
+    if activeFacePersonId == retainedPersonId {
+      activeFacePersonId = nil
+      activeFaceName = nil
+      activeFaceConfidence = 0
+      activeFaceState = ActiveIdentityState.State.none.rawValue
+      activeIdentityName = "None"
+      activeIdentityConfidenceText = "0.00"
+      activeIdentityStateText = ActiveIdentityState.State.none.rawValue
+    }
+    if livePhoneAssistancePinnedPersonId == retainedPersonId {
+      livePhoneAssistancePinnedPersonId = nil
+    }
+    if currentGlassesDisplayPersonId == retainedPersonId {
+      currentGlassesDisplayPersonId = nil
+      currentGlassesDisplayName = nil
+    }
+    AppLogger.log(
+      .memory,
+      "Retained recognized identity cleared person=\(retainedPersonId.uuidString) name=\"\(retainedName ?? "unknown")\" reason=\(reason)"
+    )
+  }
+
+  private func updateGlassesFaceVisibility(for result: IdentityProcessingResult) {
+    let section: AssistanceDisplaySection?
+    let recognitionUnavailable = Self.shouldShowFaceRecognitionUnavailableStatus(
+      faceCandidateCount: result.faceCandidateCount,
+      qualityPassCount: result.qualityPassCount,
+      embeddingGenerated: result.embeddingGenerated,
+      matchDecisionText: result.matchDecisionText
+    )
+    if recognitionUnavailable,
+       Self.isCloudFaceRecognitionWarmingStatus(result.modelStatusText) {
+      section = AssistanceDisplaySection(
+        title: "Face recognition starting",
+        lines: [
+          "I can see a face. Recognition is still starting.",
+          result.modelStatusText
+        ]
+      )
+    } else if recognitionUnavailable {
+      section = AssistanceDisplaySection(
+        title: "Face recognition off",
+        lines: [
+          "I can see a face, but recognition is unavailable.",
+          result.modelStatusText
+        ]
+      )
+    } else if result.faceCandidateCount > 0, result.qualityPassCount == 0 {
+      section = AssistanceDisplaySection(
+        title: "Face not clear",
+        lines: [
+          "I can see a face, but it is not clear enough to recognize.",
+          "Move closer, center the face, and improve lighting."
+        ]
+      )
+    } else if result.alignmentRejectedCount > 0 {
+      section = AssistanceDisplaySection(
+        title: "Face not clear",
+        lines: [
+          "Face landmarks are not clear enough for recognition.",
+          "Ask the person to face the camera or move into better light."
+        ]
+      )
+    } else if result.faceCandidateCount == 0,
+              datIsStreamRunning,
+              hasReceivedFirstFrame {
+      section = AssistanceDisplaySection(
+        title: "No clear face",
+        lines: [
+          "I cannot see a face clearly yet.",
+          "Point the glasses toward the person."
+        ]
+      )
+    } else {
+      section = nil
+    }
+
+    currentGlassesFaceVisibilitySection = section
+  }
+
+  private func updateGlassesIdentityConfirmation(for result: IdentityProcessingResult) {
+    guard datIsStreamRunning else { return }
+    if case .selectingPerson = pendingIdentityConfirmation {
+      return
+    }
+
+    if Self.shouldShowFaceRecognitionUnavailableStatus(
+      faceCandidateCount: result.faceCandidateCount,
+      qualityPassCount: result.qualityPassCount,
+      embeddingGenerated: result.embeddingGenerated,
+      matchDecisionText: result.matchDecisionText
+    ) {
+      consecutiveUnknownIdentityAttempts = 0
+      if case .unknown = pendingIdentityConfirmation {
+        pendingIdentityConfirmation = nil
+        currentGlassesIdentityPromptSection = nil
+        currentIdentityConfirmationThumbnail = nil
+        clearIdentityDisplayImageURI()
+        sendCombinedGlassesDisplayCard(reason: "identity-confirm-suppressed-recognition-unavailable")
+      }
+      if !warnedUnavailableFaceEmbeddingPromptThisStream {
+        warnedUnavailableFaceEmbeddingPromptThisStream = true
+        AppLogger.log(
+          .display,
+          "warning...---- Suppressed unknown-person confirmation because face embedding did not run. matchDecision=\(result.matchDecisionText) modelStatus=\"\(result.modelStatusText)\""
+        )
+      }
+      return
+    }
+
+    if Self.shouldAskToConfirmRecognizedIdentity(
+      activeIdentityState: result.activeIdentity.state,
+      personId: result.activeIdentity.personId,
+      embeddingGenerated: result.embeddingGenerated,
+      matchDecisionText: result.matchDecisionText
+    ),
+       let personId = result.activeIdentity.personId {
+      consecutiveUnknownIdentityAttempts = 0
+      guard !promptedIdentityPersonIds.contains(personId) else { return }
+      let displayName = result.activeIdentity.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let name = displayName?.isEmpty == false ? displayName! : resolvedDisplayName(for: personId, fallback: "this person") ?? "this person"
+      promptedIdentityPersonIds.insert(personId)
+      pendingIdentityConfirmation = .recognized(personId: personId, displayName: name)
+      let thumbnailSelection = Self.identityConfirmationThumbnailForRecognizedPerson(
+        currentRecognitionFaceThumbnail: result.currentRecognitionFacePreview,
+        savedPersonThumbnail: thumbnailForPerson(personId)
+      )
+      currentIdentityConfirmationThumbnail = thumbnailSelection.image
+      clearIdentityDisplayImageURI()
+      startIdentityDisplayImageUpload(
+        from: currentIdentityConfirmationThumbnail,
+        purpose: "recognized-\(name)",
+        refreshReason: "identity-confirm-thumbnail-url-ready"
+      )
+      activeGlassesDisplayWindow = .live
+      currentGlassesIdentityPromptSection = AssistanceDisplaySection(
+        title: "Is this \(name)?",
+        lines: [
+          "Use the check button to confirm.",
+          "Use X to choose another person or Unknown."
+        ]
+      )
+      AppLogger.log(
+        .display,
+        "Identity confirmation prompt shown personId=\(personId.uuidString) name=\(name) state=\(result.activeIdentity.state.rawValue) confidence=\(String(format: "%.3f", Double(result.activeIdentity.confidence))) thumbnail=\(currentIdentityConfirmationThumbnail == nil ? "none" : "ready") thumbnailSource=\(thumbnailSelection.source) imageURI=\(currentIdentityConfirmationImageURI == nil ? "none" : "attached")"
+      )
+      publishPhoneIdentityPromptIfNeeded()
+      if currentIdentityConfirmationThumbnail == nil {
+        refreshIdentityConfirmationThumbnailIfNeeded(personId: personId)
+      }
+      sendCombinedGlassesDisplayCard(reason: "identity-confirm-recognized")
+      return
+    }
+
+    if Self.shouldAskToConfirmUnknownIdentity(
+      activeIdentityState: result.activeIdentity.state,
+      isUnknownPersonVisible: result.isUnknownPersonVisible,
+      embeddingGenerated: result.embeddingGenerated,
+      matchDecisionText: result.matchDecisionText
+    ) {
+      consecutiveUnknownIdentityAttempts += 1
+      guard consecutiveUnknownIdentityAttempts >= 3,
+            !promptedUnknownIdentityThisStream,
+            pendingIdentityConfirmation == nil else { return }
+      promptedUnknownIdentityThisStream = true
+      pendingIdentityConfirmation = .unknown
+      currentIdentityConfirmationThumbnail = result.pendingEnrollmentFacePreview
+        ?? result.lastEnrollmentCandidatePreview
+      clearIdentityDisplayImageURI()
+      startIdentityDisplayImageUpload(
+        from: currentIdentityConfirmationThumbnail,
+        purpose: "unknown-person",
+        refreshReason: "identity-confirm-thumbnail-url-ready"
+      )
+      activeGlassesDisplayWindow = .live
+      currentGlassesIdentityPromptSection = AssistanceDisplaySection(
+        title: "Is this person unknown?",
+        lines: [
+          "Use the check button to keep transcripts unknown.",
+          "Use X to choose a saved person."
+        ]
+      )
+      publishPhoneIdentityPromptIfNeeded()
+      sendCombinedGlassesDisplayCard(reason: "identity-confirm-unknown")
+    } else {
+      consecutiveUnknownIdentityAttempts = 0
+    }
+  }
+
+  private func confirmRecognizedPersonOnGlasses() {
+    guard case .recognized(let personId, let displayName) = pendingIdentityConfirmation else { return }
+    let promptThumbnail = currentIdentityConfirmationThumbnail ?? thumbnailForPerson(personId)
+    confirmConversationPartnerPresenceOnGlasses(
+      personId: personId,
+      displayName: displayName,
+      evidence: "glassesConfirmed"
+    )
+    retainRecognizedIdentity(
+      personId: personId,
+      displayName: displayName,
+      confidence: 1.0,
+      source: "glassesConfirmed"
+    )
+    recordSpeakerTimelineEntry(personId: personId, displayName: displayName)
+    livePhoneAssistancePinnedPersonId = personId
+    currentGlassesDisplayPersonId = personId
+    currentGlassesDisplayName = displayName
+    pendingIdentityConfirmation = nil
+    currentGlassesIdentityPromptSection = nil
+    currentIdentityConfirmationThumbnail = nil
+    clearIdentityDisplayImageURI()
+    phoneAssistanceDismissed = false
+    phoneAssistanceTitleText = displayName
+    phoneAssistanceDetailText = "Confirmed for live transcript attribution. Loading saved memory."
+    phoneAssistanceStatusText = "Identity confirmed"
+    phoneAssistanceThumbnail = promptThumbnail
+    let publishedCachedSummary = publishConfirmedPersonSummaryOrRefresh(personId: personId)
+    if !publishedCachedSummary {
+      sendCombinedGlassesDisplayCard(reason: "identity-confirmed-recognized")
+    }
+  }
+
+  private func confirmUnknownPersonOnGlasses() {
+    guard Self.shouldAcceptUnknownIdentityConfirmation(pendingIdentityConfirmation) else {
+      AppLogger.log(.display, "Ignored stale unknown-person confirmation because no unknown identity prompt is active")
+      return
+    }
+    let promptThumbnail = currentIdentityConfirmationThumbnail
+    clearRetainedRecognizedIdentity(reason: "glassesConfirmedUnknown")
+    glassesConfirmedConversationPersonId = nil
+    glassesConfirmedConversationPersonName = nil
+    pendingIdentityConfirmation = nil
+    currentGlassesIdentityPromptSection = nil
+    currentIdentityConfirmationThumbnail = nil
+    clearIdentityDisplayImageURI()
+    phoneAssistanceDismissed = false
+    phoneAssistanceTitleText = "Unknown confirmed"
+    phoneAssistanceDetailText = "Live transcripts will stay unassigned until you choose a saved person."
+    phoneAssistanceStatusText = "Identity confirmed"
+    phoneAssistanceThumbnail = promptThumbnail
+    sendCombinedGlassesDisplayCard(reason: "identity-confirmed-unknown")
+  }
+
+  nonisolated private static func shouldAcceptUnknownIdentityConfirmation(_ pending: GlassesIdentityConfirmation?) -> Bool {
+    switch pending {
+    case .unknown, .selectingPerson:
+      return true
+    case .recognized, nil:
+      return false
+    }
+  }
+
+  private func beginGlassesIdentityCorrection() async {
+    showGlassesIdentityCorrectionLoading()
+    await loadGlassesIdentityCorrectionEntries()
+  }
+
+  private func showGlassesIdentityCorrectionLoading() {
+    pendingIdentityConfirmation = .selectingPerson
+    activeGlassesDisplayWindow = .people
+    glassesIdentitySelectionEntries = []
+    glassesIdentitySelectionIndex = 0
+    currentGlassesIdentityPromptSection = AssistanceDisplaySection(
+      title: "Pick person",
+      lines: ["Loading saved people."]
+    )
+    currentIdentityConfirmationThumbnail = nil
+    clearIdentityDisplayImageURI()
+    publishPhoneIdentityPromptIfNeeded()
+    sendCombinedGlassesDisplayCard(reason: "identity-correction-loading")
+  }
+
+  private func loadGlassesIdentityCorrectionEntries() async {
+    let entries = await identityPipeline.loadPeopleForDictionary()
+    peopleDictionaryEntries = entries
+    glassesIdentitySelectionEntries = entries.sorted { left, right in
+      (left.lastSeen ?? .distantPast) > (right.lastSeen ?? .distantPast)
+    }
+    glassesIdentitySelectionIndex = 0
+    updateGlassesIdentitySelectionSection()
+    sendCombinedGlassesDisplayCard(reason: "identity-correction-picker")
+  }
+
+  private func moveGlassesIdentitySelection(offset: Int) {
+    guard case .selectingPerson = pendingIdentityConfirmation,
+          !glassesIdentitySelectionEntries.isEmpty else { return }
+    let count = glassesIdentitySelectionEntries.count
+    glassesIdentitySelectionIndex = (glassesIdentitySelectionIndex + offset + count) % count
+    updateGlassesIdentitySelectionSection()
+    sendCombinedGlassesDisplayCard(reason: "identity-correction-move")
+  }
+
+  private func confirmSelectedPersonOnGlasses() {
+    guard case .selectingPerson = pendingIdentityConfirmation else { return }
+    guard !glassesIdentitySelectionEntries.isEmpty else {
+      confirmUnknownPersonOnGlasses()
+      return
+    }
+    let selected = glassesIdentitySelectionEntries[min(glassesIdentitySelectionIndex, glassesIdentitySelectionEntries.count - 1)]
+    confirmConversationPartnerPresenceOnGlasses(
+      personId: selected.id,
+      displayName: selected.displayName,
+      evidence: "glassesCorrectionSelected"
+    )
+    retainRecognizedIdentity(
+      personId: selected.id,
+      displayName: selected.displayName,
+      confidence: 1.0,
+      source: "glassesCorrectionSelected"
+    )
+    recordSpeakerTimelineEntry(personId: selected.id, displayName: selected.displayName)
+    livePhoneAssistancePinnedPersonId = selected.id
+    currentGlassesDisplayPersonId = selected.id
+    currentGlassesDisplayName = selected.displayName
+    pendingIdentityConfirmation = nil
+    currentGlassesIdentityPromptSection = nil
+    currentIdentityConfirmationThumbnail = nil
+    clearIdentityDisplayImageURI()
+    phoneAssistanceDismissed = false
+    phoneAssistanceTitleText = selected.displayName
+    phoneAssistanceDetailText = "Selected for live transcript attribution. Loading saved memory."
+    phoneAssistanceStatusText = "Identity corrected"
+    phoneAssistanceThumbnail = selected.thumbnail
+    let publishedCachedSummary = publishConfirmedPersonSummaryOrRefresh(personId: selected.id)
+    if !publishedCachedSummary {
+      sendCombinedGlassesDisplayCard(reason: "identity-correction-selected")
+    }
+  }
+
+  private func confirmConversationPartnerPresenceOnGlasses(
+    personId: UUID,
+    displayName: String,
+    evidence: String
+  ) {
+    let now = Date()
+    glassesConfirmedConversationPersonId = personId
+    glassesConfirmedConversationPersonIds.insert(personId)
+    glassesConfirmedConversationPersonName = displayName
+    activeFacePersonId = personId
+    activeFaceName = displayName
+    activeFaceConfidence = 1.0
+    activeFaceState = ActiveIdentityState.State.confirmed.rawValue
+    activeIdentityName = displayName
+    activeIdentityConfidenceText = "1.00"
+    activeIdentityStateText = ActiveIdentityState.State.confirmed.rawValue
+    appendConversationPartnerEvidence(ConversationPartnerEvidence(
+      source: .userConfirmation,
+      personId: personId,
+      displayName: displayName,
+      confidence: 1.0,
+      timestamp: now,
+      validUntil: now.addingTimeInterval(180),
+      details: evidence
+    ))
+    refreshConversationPartnerState(now: now)
+    refreshLiveRecallPresenceLines()
+    AppLogger.log(
+      .display,
+      "Identity confirmation updated active presence personId=\(personId.uuidString) name=\"\(displayName)\" evidence=\(evidence)"
+    )
+  }
+
+  private func updateGlassesIdentitySelectionSection() {
+    if glassesIdentitySelectionEntries.isEmpty {
+      currentIdentityConfirmationThumbnail = nil
+      clearIdentityDisplayImageURI()
+      currentGlassesIdentityPromptSection = AssistanceDisplaySection(
+        title: "Pick person",
+        lines: [
+          "No saved people yet.",
+          "Choose Unknown to keep this person unenrolled."
+        ]
+      )
+      publishPhoneIdentityPromptIfNeeded()
+      return
+    }
+    let selected = glassesIdentitySelectionEntries[min(glassesIdentitySelectionIndex, glassesIdentitySelectionEntries.count - 1)]
+    currentIdentityConfirmationThumbnail = selected.thumbnail
+    clearIdentityDisplayImageURI()
+    startIdentityDisplayImageUpload(
+      from: selected.thumbnail,
+      purpose: "select-\(selected.displayName)",
+      refreshReason: "identity-selection-thumbnail-url-ready"
+    )
+    currentGlassesIdentityPromptSection = AssistanceDisplaySection(
+      title: "Pick person \(glassesIdentitySelectionIndex + 1)/\(glassesIdentitySelectionEntries.count)",
+      lines: [
+        "Selected: \(selected.displayName)",
+        "Previous or Next changes the selected person.",
+        "Check chooses this person; Unknown keeps unenrolled."
+      ]
+    )
+    publishPhoneIdentityPromptIfNeeded()
   }
 
   private func applyRunSessionSnapshot(_ snapshot: RunSessionSnapshot) {
@@ -1660,6 +4182,7 @@ final class StreamSessionViewModel: ObservableObject {
   }
 
   private func resetPostSessionAttributionState() {
+    clearRetainedRecognizedIdentity(reason: "resetPostSessionAttributionState")
     activeFacePersonId = nil
     activeFaceName = nil
     activeFaceConfidence = 0
@@ -1669,22 +4192,95 @@ final class StreamSessionViewModel: ObservableObject {
     latestMouthMovementScore = 0
     speakerEvidenceTimeline = []
     faceEvidenceTimeline = []
+    conversationPartnerEvidence = []
+    conversationPartnerTimeline = []
+    presenceTracker.reset()
+    lastSavedPresenceEpisodeSignatures = [:]
+    lastPresenceEpisodeSavedAt = [:]
+    lastNameAddressLLMAt = nil
+    activeConversationPartnerState = .empty
+    activityModeClassificationTask?.cancel()
+    activityModeClassificationTask = nil
+    currentActivityModeClassification = .unknown
+    currentActivityModeEpisode = nil
+    recentActivityModeSceneContexts = []
+    lastActivityModeClassificationAt = nil
+    activeConversationPartnerName = "None"
+    activeConversationPartnerStateText = "none"
+    activeConversationPartnerConfidenceText = "0.00"
+    activeConversationPartnerEvidenceText = "No partner evidence yet"
+    presencePipelineVerificationText = "Presence: waiting for name or identity evidence"
+    sceneContextPipelineVerificationText = "5W/1H: waiting for scene context"
+    activityModeVerificationText = "Activity mode: waiting for stream context"
   }
 
   private func resetLivePhoneAssistanceState() {
-    invalidateAssistanceWork(reason: "resetLivePhoneAssistanceState", stopAudio: true)
+    invalidateAssistanceWork(reason: "resetLivePhoneAssistanceState", cancelDisplayWork: false)
     livePhoneAssistancePinnedPersonId = nil
     livePhoneAssistanceDismissedPersonId = nil
     conversationSummaryRefreshedPersonIdsThisStream = []
     phoneAssistanceDismissed = false
-    phoneAssistanceTitleText = "Phone assistance"
-    phoneAssistanceDetailText = "Identify a person to show conversation memory."
-    phoneAssistanceStatusText = "Phone display fallback"
+    phoneAssistanceTitleText = "Memento"
+    phoneAssistanceDetailText = "Live memory will appear when the stream recognizes someone."
+    phoneAssistanceStatusText = "Ready"
+    phoneAssistanceThumbnail = nil
+    currentGlassesAssistanceCard = nil
+    currentGlassesSceneContextSections = []
+    currentGlassesLiveRecallSections = []
+    currentGlassesIdentityPromptSection = nil
+    currentIdentityConfirmationThumbnail = nil
+    clearIdentityDisplayImageURI()
+    currentGlassesFaceVisibilitySection = nil
+    activeGlassesDisplayWindow = .live
+    currentGlassesDisplayPersonId = nil
+    currentGlassesDisplayName = nil
+    lastGlassesDisplayCardForActions = nil
+    pendingIdentityConfirmation = nil
+    promptedIdentityPersonIds = []
+    promptedUnknownIdentityThisStream = false
+    consecutiveUnknownIdentityAttempts = 0
+    warnedUnavailableFaceEmbeddingPromptThisStream = false
+    glassesIdentitySelectionEntries = []
+    glassesIdentitySelectionIndex = 0
+    glassesConfirmedConversationPersonId = nil
+    glassesConfirmedConversationPersonIds = []
+    glassesConfirmedConversationPersonName = nil
+    glassesPeopleListPage = 0
+    lastRecordedGlassesDisplayCardKey = ""
+    liveCaptionDisplayLines = []
+    lastLiveCaptionDisplayText = ""
+    liveQuestionAssembler.reset()
+    liveMemoryTriggerInFlight = false
+    pendingLiveQuestionWorks.removeAll()
+    lastLiveMemoryTriggerText = ""
+    lastLiveMemoryTriggerAt = nil
+    memoryTriggerVerificationText = "Memory trigger: waiting for a past-reference question"
+    glassesDisplaySendTask?.cancel()
+    glassesDisplaySendTask = nil
   }
 
-  private func invalidateAssistanceWork(reason: String, stopAudio: Bool) {
+  private func prepareDisplayForStreamStop(reason: String) {
+    glassesDisplaySendTask?.cancel()
+    glassesDisplaySendTask = nil
+    currentGlassesFaceVisibilitySection = nil
+    currentGlassesIdentityPromptSection = nil
+    currentIdentityConfirmationThumbnail = nil
+    clearIdentityDisplayImageURI()
+    pendingIdentityConfirmation = nil
+    if activeGlassesDisplayWindow == .live {
+      currentGlassesAssistanceCard = nil
+    }
+    AppLogger.log(.display, "Live display state cleared for stream stop reason=\(reason)")
+  }
+
+  private func invalidateAssistanceWork(reason: String, cancelDisplayWork: Bool) {
     assistanceGeneration &+= 1
-    AppLogger.log(.audio, "Assistance work invalidated generation=\(assistanceGeneration) reason=\(reason) stopAudio=\(stopAudio)")
+    AppLogger.log(.memory, "Phone assistance work invalidated generation=\(assistanceGeneration) reason=\(reason) cancelDisplayWork=\(cancelDisplayWork)")
+    if cancelDisplayWork {
+      Task { @MainActor [weak self] in
+        await self?.datManager.detachAssistanceDisplay(reason: reason)
+      }
+    }
   }
 
   func dismissPhoneAssistance() {
@@ -1694,7 +4290,49 @@ final class StreamSessionViewModel: ObservableObject {
     AppLogger.log(.memory, "Phone assistance dismissed personId=\(livePhoneAssistanceDismissedPersonId?.uuidString ?? "none")")
   }
 
-  private func maybeSpeakLiveAssistance() {
+  func sendTestGlassesDisplayCard() {
+    activateGlassesDisplayControl()
+  }
+
+  func activateGlassesDisplayControl() {
+    inputMode = .realGlasses
+    sourceStateText = inputMode.rawValue
+    guard !datManager.isSimulator else {
+      showError("Real Meta glasses display requires a physical iPhone.")
+      return
+    }
+    guard datRegistrationStateText == "registered" else {
+      showError("Connect glasses before activating the Memento display.")
+      return
+    }
+
+    let readinessLine = canStartRealStream
+      ? "Ready to start stream"
+      : datStartReadinessReasonText
+    let deviceLine = datHasActiveDevice
+      ? "Glasses connected"
+      : "Waiting for active glasses"
+    let card = MementoGlassesDisplayRenderer.ready(
+      canStartStream: canStartRealStream,
+      deviceLine: deviceLine,
+      readinessLine: readinessLine
+    )
+
+    currentGlassesDisplayPersonId = nil
+    currentGlassesDisplayName = nil
+    currentGlassesAssistanceCard = card
+    activeGlassesDisplayWindow = .live
+    phoneAssistanceTitleText = "Memento"
+    phoneAssistanceDetailText = "Glasses controls are being sent."
+    phoneAssistanceStatusText = "Sending controls to glasses"
+    sendCombinedGlassesDisplayCard(reason: "display-control")
+  }
+
+  private func updateLivePhoneAssistance() {
+    if publishPhoneIdentityPromptIfNeeded() {
+      return
+    }
+
     let identity = currentAssistanceIdentity()
     if case .known = identity, let personId = activeFacePersonId {
       if livePhoneAssistanceDismissedPersonId == personId {
@@ -1715,8 +4353,13 @@ final class StreamSessionViewModel: ObservableObject {
         let status = conversationSummaryInFlight.contains(personId)
           ? "DeepSeek summarizing saved conversations"
           : phoneAssistanceStatusText
-        publishPhoneAssistanceCard(loadingCard, status: status)
-        AppLogger.log(.memory, "Phone assistance waiting for person summary personId=\(personId.uuidString) name=\(activeIdentityName) confidence=\(String(format: "%.3f", activeFaceConfidence)) state=\(activeIdentityStateText)")
+        publishPhoneAssistanceCard(loadingCard, status: status, personId: personId)
+        publishGlassesAssistanceCard(
+          identity: identity,
+          memory: currentAssistanceMemorySnapshot(personId: personId),
+          reason: "known-person-summary-loading"
+        )
+        AppLogger.log(.memory, "Phone assistance waiting for person summary personId=\(personId.uuidString) name=\(activeIdentityName) confidence=\(String(format: "%.3f", Double(activeFaceConfidence))) state=\(activeIdentityStateText)")
         return
       }
       let card = assistanceCardFormatter.makeCard(
@@ -1724,7 +4367,12 @@ final class StreamSessionViewModel: ObservableObject {
         memory: currentAssistanceMemorySnapshot(personId: personId),
         displayStatus: .fallback("phone")
       )
-      publishPhoneAssistanceCard(card, status: "Phone display fallback")
+      publishPhoneAssistanceCard(card, status: "Phone display fallback", personId: personId)
+      publishGlassesAssistanceCard(
+        identity: identity,
+        memory: currentAssistanceMemorySnapshot(personId: personId),
+        reason: "known-person-summary"
+      )
       return
     }
 
@@ -1742,7 +4390,12 @@ final class StreamSessionViewModel: ObservableObject {
           memory: currentAssistanceMemorySnapshot(personId: pinnedPersonId),
           displayStatus: .fallback("phone")
         )
-        publishPhoneAssistanceCard(card, status: "Pinned until stream ends")
+        publishPhoneAssistanceCard(card, status: "Pinned until stream ends", personId: pinnedPersonId)
+        publishGlassesAssistanceCard(
+          identity: pinnedIdentity,
+          memory: currentAssistanceMemorySnapshot(personId: pinnedPersonId),
+          reason: "pinned-known-person-summary"
+        )
       }
       return
     }
@@ -1754,15 +4407,1173 @@ final class StreamSessionViewModel: ObservableObject {
       displayStatus: .fallback("phone")
     )
     publishPhoneAssistanceCard(card, status: "Phone display fallback")
-    AppLogger.log(.memory, "Phone assistance updated without spoken trigger identity=\(identity) state=\(activeIdentityStateText) confidence=\(String(format: "%.3f", activeFaceConfidence)) faces=\(detectedFaceCount)")
+    if Self.shouldPublishLiveDisplayAfterNoConfirmedPerson(
+      datIsStreamRunning: datIsStreamRunning,
+      streamStateText: datStreamSessionStateText
+    ) {
+      publishGlassesAssistanceCard(
+        identity: identity,
+        memory: currentAssistanceMemorySnapshot(),
+        reason: "no-confirmed-person"
+      )
+    } else {
+      currentGlassesAssistanceCard = nil
+      currentGlassesFaceVisibilitySection = nil
+    }
+    AppLogger.log(.memory, "Phone assistance display updated identity=\(identity) state=\(activeIdentityStateText) confidence=\(String(format: "%.3f", Double(activeFaceConfidence))) faces=\(detectedFaceCount)")
   }
 
-  private func publishPhoneAssistanceCard(_ card: AssistanceDisplayCard, status: String) {
+  @discardableResult
+  private func publishPhoneIdentityPromptIfNeeded() -> Bool {
+    switch pendingIdentityConfirmation {
+    case .recognized(_, let displayName):
+      phoneAssistanceDismissed = false
+      phoneAssistanceTitleText = "Is this \(displayName)?"
+      phoneAssistanceDetailText = [
+        "Confirm the face match before using this identity for live transcripts.",
+        "Use the check button for Yes.",
+        "Use X to choose another saved person or Unknown."
+      ].joined(separator: "\n")
+      phoneAssistanceStatusText = "Waiting for identity feedback"
+      phoneAssistanceThumbnail = currentIdentityConfirmationThumbnail
+      return true
+    case .unknown:
+      phoneAssistanceDismissed = false
+      phoneAssistanceTitleText = "Is this person unknown?"
+      phoneAssistanceDetailText = [
+        "Confirm before keeping this person unassigned in live transcripts.",
+        "Use the check button for Unknown.",
+        "Use X to choose a saved person."
+      ].joined(separator: "\n")
+      phoneAssistanceStatusText = "Waiting for identity feedback"
+      phoneAssistanceThumbnail = currentIdentityConfirmationThumbnail
+      return true
+    case .selectingPerson:
+      phoneAssistanceDismissed = false
+      if glassesIdentitySelectionEntries.isEmpty {
+        phoneAssistanceTitleText = "Choose the correct person"
+        phoneAssistanceDetailText = "Loading saved people for identity correction."
+        phoneAssistanceThumbnail = nil
+      } else {
+        let selected = glassesIdentitySelectionEntries[min(glassesIdentitySelectionIndex, glassesIdentitySelectionEntries.count - 1)]
+        phoneAssistanceTitleText = "Choose the correct person"
+        phoneAssistanceDetailText = [
+          "Selected: \(selected.displayName)",
+          "Use Previous or Next to change the selection.",
+          "Use the check button to choose this person, or Unknown to keep unenrolled."
+        ].joined(separator: "\n")
+        phoneAssistanceThumbnail = selected.thumbnail
+      }
+      phoneAssistanceStatusText = "Waiting for identity correction"
+      return true
+    case nil:
+      return false
+    }
+  }
+
+  private func refreshIdentityConfirmationThumbnailIfNeeded(personId: UUID) {
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      guard self.currentIdentityConfirmationThumbnail == nil else { return }
+      guard let thumbnail = await self.identityPipeline.thumbnailImage(forPersonId: personId) else { return }
+      guard case .recognized(let pendingPersonId, _) = self.pendingIdentityConfirmation,
+            pendingPersonId == personId else { return }
+      self.currentIdentityConfirmationThumbnail = thumbnail
+      self.startIdentityDisplayImageUpload(
+        from: thumbnail,
+        purpose: "recognized-refresh-\(personId.uuidString.prefix(8))",
+        refreshReason: "identity-confirm-thumbnail-refresh"
+      )
+      self.publishPhoneIdentityPromptIfNeeded()
+    }
+  }
+
+  nonisolated static func identityConfirmationThumbnailForRecognizedPerson(
+    currentRecognitionFaceThumbnail: UIImage?,
+    savedPersonThumbnail: UIImage?
+  ) -> IdentityPromptThumbnailSelection {
+    if let currentRecognitionFaceThumbnail {
+      return IdentityPromptThumbnailSelection(image: currentRecognitionFaceThumbnail, source: "currentRecognitionFaceCrop")
+    }
+    if let savedPersonThumbnail {
+      return IdentityPromptThumbnailSelection(image: savedPersonThumbnail, source: "savedPersonThumbnail")
+    }
+    return IdentityPromptThumbnailSelection(image: nil, source: "none")
+  }
+
+  private func publishPhoneAssistanceCard(_ card: AssistanceDisplayCard, status: String, personId: UUID? = nil) {
     phoneAssistanceTitleText = card.title
     phoneAssistanceDetailText = card.lines.isEmpty
       ? "No saved conversation summary yet."
       : card.lines.joined(separator: "\n")
     phoneAssistanceStatusText = status
+    phoneAssistanceThumbnail = thumbnailForPerson(personId ?? card.personId ?? livePhoneAssistancePinnedPersonId ?? activeFacePersonId)
+  }
+
+  private func thumbnailForPerson(_ personId: UUID?) -> UIImage? {
+    guard let personId else { return nil }
+    return peopleDictionaryEntries.first(where: { $0.id == personId })?.thumbnail
+  }
+
+  private func startIdentityDisplayImageUpload(
+    from thumbnail: UIImage?,
+    purpose: String,
+    refreshReason: String
+  ) {
+    guard let thumbnail else { return }
+    guard let jpegData = Self.displayImageJPEGData(from: thumbnail) else {
+      AppLogger.log(.display, "Identity prompt thumbnail export failed purpose=\(purpose): image could not be encoded")
+      return
+    }
+    let token = UUID()
+    identityDisplayImageUploadTask?.cancel()
+    identityDisplayImageUploadTask = nil
+    identityDisplayImageUploadToken = token
+    AppLogger.log(.display, "Identity prompt thumbnail upload queued purpose=\(purpose) bytes=\(jpegData.count)")
+    identityDisplayImageUploadTask = Task.detached(priority: .utility) { [jpegData, purpose, refreshReason, token] in
+      do {
+        let url = try await Self.uploadDisplayImageForGlasses(jpegData: jpegData)
+        let probe = await Self.probeDisplayImageURL(url)
+        await MainActor.run { [weak self] in
+          guard let self, self.identityDisplayImageUploadToken == token else { return }
+          guard probe.isRenderable else {
+            AppLogger.log(
+              .display,
+              "Identity prompt thumbnail signed URL rejected purpose=\(purpose) scheme=\(url.scheme ?? "none") host=\(url.host ?? "none") path=\(url.path) bytes=\(url.absoluteString.utf8.count) probe=\(probe.summary)"
+            )
+            return
+          }
+          self.currentIdentityConfirmationImageURI = url.absoluteString
+          AppLogger.log(
+            .display,
+            "Identity prompt thumbnail signed URL ready purpose=\(purpose) scheme=\(url.scheme ?? "none") host=\(url.host ?? "none") path=\(url.path) bytes=\(url.absoluteString.utf8.count) probe=\(probe.summary)"
+          )
+          self.sendCombinedGlassesDisplayCard(reason: refreshReason, delayNanoseconds: 0)
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        await MainActor.run { [weak self] in
+          guard let self, self.identityDisplayImageUploadToken == token else { return }
+          AppLogger.log(.display, "Identity prompt thumbnail upload failed purpose=\(purpose): \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
+  private func clearIdentityDisplayImageURI() {
+    identityDisplayImageUploadTask?.cancel()
+    identityDisplayImageUploadTask = nil
+    identityDisplayImageUploadToken = nil
+    currentIdentityConfirmationImageURI = nil
+  }
+
+  nonisolated static func displayImageJPEGData(
+    from image: UIImage,
+    maxPixelDimension: CGFloat = 64,
+    contentScale: CGFloat = 0.76,
+    compressionQuality: CGFloat = 0.72
+  ) -> Data? {
+    let displayImage = resizedDisplayImage(
+      image,
+      maxPixelDimension: maxPixelDimension,
+      contentScale: contentScale
+    )
+    return displayImage.jpegData(compressionQuality: compressionQuality)
+  }
+
+  nonisolated private static func uploadDisplayImageForGlasses(jpegData: Data) async throws -> URL {
+    let client = try SupabaseClient.shared()
+    let ownerFolder = try await client.storageOwnerFolder()
+    let objectPath = "\(ownerFolder)/display-thumbnails/\(UUID().uuidString).jpg"
+    try await client.uploadStorageObject(
+      bucketID: displayImageBucketID,
+      objectPath: objectPath,
+      data: jpegData,
+      contentType: "image/jpeg"
+    )
+    return try await client.createSignedStorageURL(
+      bucketID: displayImageBucketID,
+      objectPath: objectPath,
+      expiresIn: displayImageSignedURLExpirationSeconds
+    )
+  }
+
+  private struct DisplayImageURLProbe: Sendable {
+    let status: Int?
+    let mime: String
+    let byteCount: Int
+    let imageSize: String
+    let error: String?
+
+    var isRenderable: Bool {
+      guard let status, (200..<300).contains(status), error == nil else { return false }
+      return imageSize != "decodeFailed"
+    }
+
+    var summary: String {
+      if let error {
+        return "failed=\(error)"
+      }
+      return "status=\(status ?? -1);mime=\(mime);bytes=\(byteCount);image=\(imageSize)"
+    }
+  }
+
+  nonisolated private static func probeDisplayImageURL(_ url: URL) async -> DisplayImageURLProbe {
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    request.timeoutInterval = 8
+    do {
+      let (data, response) = try await URLSession.shared.data(for: request)
+      let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+      let mime = response.mimeType ?? "unknown"
+      let decoded = UIImage(data: data)
+      let sizeText: String
+      if let decoded {
+        sizeText = "\(Int(decoded.size.width * decoded.scale))x\(Int(decoded.size.height * decoded.scale))"
+      } else {
+        sizeText = "decodeFailed"
+      }
+      return DisplayImageURLProbe(
+        status: status,
+        mime: mime,
+        byteCount: data.count,
+        imageSize: sizeText,
+        error: nil
+      )
+    } catch {
+      return DisplayImageURLProbe(
+        status: nil,
+        mime: "unknown",
+        byteCount: 0,
+        imageSize: "decodeFailed",
+        error: error.localizedDescription
+      )
+    }
+  }
+
+  nonisolated private static func resizedDisplayImage(
+    _ image: UIImage,
+    maxPixelDimension: CGFloat,
+    contentScale: CGFloat
+  ) -> UIImage {
+    let pixelWidth = image.size.width * image.scale
+    let pixelHeight = image.size.height * image.scale
+    let largestPixelDimension = max(pixelWidth, pixelHeight)
+    guard maxPixelDimension > 0, pixelWidth > 0, pixelHeight > 0 else { return image }
+
+    let targetPixelDimension = max(1, min(maxPixelDimension, largestPixelDimension).rounded())
+    let safeContentScale = min(max(contentScale, 0.45), 1)
+    let contentPixelDimension = max(1, (targetPixelDimension * safeContentScale).rounded())
+    let drawScale = min(contentPixelDimension / pixelWidth, contentPixelDimension / pixelHeight, 1)
+    let drawSize = CGSize(
+      width: max(1, (pixelWidth * drawScale).rounded()),
+      height: max(1, (pixelHeight * drawScale).rounded())
+    )
+    let targetSize = CGSize(width: targetPixelDimension, height: targetPixelDimension)
+    let drawRect = CGRect(
+      x: (targetSize.width - drawSize.width) / 2,
+      y: (targetSize.height - drawSize.height) / 2,
+      width: drawSize.width,
+      height: drawSize.height
+    )
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    format.opaque = true
+    return UIGraphicsImageRenderer(size: targetSize, format: format).image { context in
+      UIColor.black.setFill()
+      context.fill(CGRect(origin: .zero, size: targetSize))
+      image.draw(in: drawRect)
+    }
+  }
+
+  private func publishLiveCaptionDisplay(text: String, attribution: TranscriptAttribution) {
+    let caption = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard liveTranscriptionEnabled, !caption.isEmpty else { return }
+
+    let speaker = attribution.personId == nil ? nil : attribution.displayName?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let captionLine: String
+    if let speaker, !speaker.isEmpty {
+      captionLine = "\(speaker): \(caption)"
+    } else {
+      captionLine = caption
+    }
+
+    if let personId = attribution.personId {
+      currentGlassesDisplayPersonId = personId
+      currentGlassesDisplayName = resolvedDisplayName(for: personId, fallback: speaker)
+    }
+
+    guard captionLine != lastLiveCaptionDisplayText else { return }
+    lastLiveCaptionDisplayText = captionLine
+    liveCaptionDisplayLines.append(captionLine)
+    if liveCaptionDisplayLines.count > Self.liveCaptionDisplayLineLimit {
+      liveCaptionDisplayLines.removeFirst(liveCaptionDisplayLines.count - Self.liveCaptionDisplayLineLimit)
+    }
+
+    if activeGlassesDisplayWindow == .transcripts {
+      sendCombinedGlassesDisplayCard(reason: "live-caption")
+    }
+  }
+
+  private func publishSceneContextDisplay(_ record: SceneContextRecord, reason: String) {
+    if let personId = record.personId {
+      currentGlassesDisplayPersonId = personId
+      currentGlassesDisplayName = resolvedDisplayName(for: personId)
+    }
+    recentActivityModeSceneContexts.append(record)
+    if recentActivityModeSceneContexts.count > Self.activityModeSceneContextLimit {
+      recentActivityModeSceneContexts.removeFirst(
+        recentActivityModeSceneContexts.count - Self.activityModeSceneContextLimit
+      )
+    }
+    let timeText = record.createdAt.formatted(date: .omitted, time: .shortened)
+    currentGlassesSceneContextSections.append(AssistanceDisplaySection(
+      title: "Scene context \(timeText)",
+      lines: [
+        record.summary,
+        "Where: \(record.whereText)",
+        "What: \(record.what)",
+        "Why: \(record.why)",
+        "How: \(record.how)",
+        "Style: \(record.interactionStyle)",
+        "Confidence: \(Int((record.confidence * 100).rounded()))%"
+      ]
+      .map { Self.truncated($0, maxLength: 180) }
+      .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    ))
+    if currentGlassesSceneContextSections.count > Self.sceneContextDisplaySectionLimit {
+      currentGlassesSceneContextSections.removeFirst(
+        currentGlassesSceneContextSections.count - Self.sceneContextDisplaySectionLimit
+      )
+    }
+    sceneContextStatusText = "Scene context saved: \(Int((record.confidence * 100).rounded()))%"
+    let personText = record.personId.flatMap { resolvedDisplayName(for: $0) } ?? record.who
+    sceneContextPipelineVerificationText = "5W/1H saved: \(Self.truncated(record.summary, maxLength: 120)) | who=\(Self.truncated(personText, maxLength: 60)) | confidence=\(Int((record.confidence * 100).rounded()))%"
+    if activeGlassesDisplayWindow == .context {
+      sendCombinedGlassesDisplayCard(reason: reason)
+    }
+    scheduleActivityModeClassification(reason: reason)
+  }
+
+  private func scheduleActivityModeClassification(reason: String) {
+    guard datIsStreamRunning || lifecycleState.isStreamingSurfaceVisible else { return }
+    let now = Date()
+    if let lastActivityModeClassificationAt,
+       now.timeIntervalSince(lastActivityModeClassificationAt) < Self.activityModeMinimumClassificationInterval {
+      AppLogger.log(
+        .activityMode,
+        "classification skipped reason=\(reason) gate=interval elapsedSeconds=\(String(format: "%.1f", now.timeIntervalSince(lastActivityModeClassificationAt)))"
+      )
+      return
+    }
+    lastActivityModeClassificationAt = now
+    let request = currentActivityModeClassificationRequest(reason: reason)
+    let settings = SceneContextSettings.load()
+    let aiProxyConfigured = SupabaseEdgeFunctionClient.isConfigured()
+    activityModeClassificationTask?.cancel()
+    activityModeClassificationTask = Task { @MainActor [weak self, request, settings, reason, aiProxyConfigured] in
+      guard let self else { return }
+      if !aiProxyConfigured,
+         settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let fallback = ActivityModeClassifier.fallbackClassification(for: request)
+        self.applyActivityModeClassification(
+          fallback,
+          reason: reason,
+          source: "localFallback",
+          modelName: "localFallback"
+        )
+        AppLogger.log(
+          .activityMode,
+          "classification fallback reason=\(reason) source=localFallback cause=missingAPIKey mode=\(fallback.mode) confidence=\(String(format: "%.2f", fallback.confidence))"
+        )
+        return
+      }
+      do {
+        let classification = try await SceneContextClient(settings: settings).classifyActivityMode(request)
+        self.applyActivityModeClassification(
+          classification,
+          reason: reason,
+          source: "qwen",
+          modelName: settings.textModel.isEmpty ? SceneContextSettings.defaultTextModel : settings.textModel
+        )
+      } catch {
+        let fallback = ActivityModeClassifier.fallbackClassification(for: request)
+        self.applyActivityModeClassification(
+          fallback,
+          reason: "\(reason)-fallback",
+          source: "localFallback",
+          modelName: "localFallback"
+        )
+        AppLogger.log(
+          .activityMode,
+          "classification fallback reason=\(reason) source=localFallback cause=\"\(Self.truncated(error.localizedDescription, maxLength: 160))\" mode=\(fallback.mode) confidence=\(String(format: "%.2f", fallback.confidence))"
+        )
+      }
+    }
+  }
+
+  private func currentActivityModeClassificationRequest(reason: String) -> ActivityModeClassificationRequest {
+    let transcriptText: String
+    if Self.hasMeaningfulLiveTranscript(liveTranscriptPreviewText) {
+      transcriptText = liveTranscriptPreviewText
+    } else if recentConversationAttributionText.hasPrefix("Live transcript:") {
+      transcriptText = recentConversationAttributionText
+    } else {
+      transcriptText = ""
+    }
+    let attribution = currentTranscriptAttribution()
+    return ActivityModeClassificationRequest(
+      transcriptText: transcriptText,
+      sceneContexts: recentActivityModeSceneContexts,
+      recognizedPeople: activeStreamRecognizedPeopleNames(),
+      detectedFaceCount: detectedFaceCount,
+      identityEvidence: currentSceneContextIdentityEvidence(attribution: attribution),
+      locationLabel: sceneLocationProvider.currentSnapshot()?.label,
+      streamState: datStreamSessionStateText,
+      reason: reason
+    )
+  }
+
+  private func applyActivityModeClassification(
+    _ classification: ActivityModeClassification,
+    reason: String,
+    source: String,
+    modelName: String
+  ) {
+    guard ActivityModeClassifier.shouldApply(
+      current: currentActivityModeClassification,
+      candidate: classification
+    ) else {
+      activityModeVerificationText = "Activity mode held: \(currentActivityModeClassification.displayText)"
+      AppLogger.log(
+        .activityMode,
+        "classification held reason=\(reason) source=\(source) current=\(currentActivityModeClassification.mode) candidate=\(classification.mode) confidence=\(String(format: "%.2f", classification.confidence))"
+      )
+      return
+    }
+
+    let previousMode = currentActivityModeClassification.mode
+    currentActivityModeClassification = classification
+    activityModeVerificationText = "Activity mode: \(classification.displayText) (\(Int((classification.confidence * 100).rounded()))%)"
+    persistActivityModeEpisode(
+      classification,
+      reason: reason,
+      source: source,
+      modelName: modelName,
+      previousMode: previousMode
+    )
+    if activeGlassesDisplayWindow == .live {
+      sendCombinedGlassesDisplayCard(reason: "activity-mode-\(reason)")
+    }
+  }
+
+  private func persistActivityModeEpisode(
+    _ classification: ActivityModeClassification,
+    reason: String,
+    source: String,
+    modelName: String,
+    previousMode: String
+  ) {
+    guard let context = pipelineContext else {
+      AppLogger.log(.activityMode, "episode skipped reason=\(reason) cause=noPipelineContext mode=\(classification.mode)")
+      return
+    }
+    let now = Date()
+    let sameMode = ActivityModeTaxonomy.normalizedMode(previousMode) == ActivityModeTaxonomy.normalizedMode(classification.mode)
+    if var episode = currentActivityModeEpisode, sameMode {
+      episode.specificActivity = classification.specificActivity
+      episode.lastEvidenceAt = now
+      episode.confidence = classification.confidence
+      episode.reason = classification.reason
+      episode.source = source
+      episode.modelName = modelName
+      episode.promptVersion = ActivityModeClassifier.promptVersion
+      episode.updatedAt = now
+      currentActivityModeEpisode = episode
+      Task { await identityPipeline.saveActivityModeEpisode(episode) }
+      return
+    }
+
+    closeCurrentActivityModeEpisode(endedAt: now, reason: "modeSwitch-\(reason)")
+    let episode = ActivityModeEpisodeRecord(
+      id: UUID(),
+      appRunId: context.appRunId,
+      conversationSessionId: context.conversationSessionId,
+      mode: classification.mode,
+      specificActivity: classification.specificActivity,
+      startedAt: now,
+      lastEvidenceAt: now,
+      endedAt: nil,
+      confidence: classification.confidence,
+      reason: classification.reason,
+      source: source,
+      modelName: modelName,
+      promptVersion: ActivityModeClassifier.promptVersion,
+      updatedAt: now
+    )
+    currentActivityModeEpisode = episode
+    Task { await identityPipeline.saveActivityModeEpisode(episode) }
+    AppLogger.log(
+      .activityMode,
+      "episode started reason=\(reason) source=\(source) mode=\(episode.mode) specific=\"\(episode.specificActivity)\" confidence=\(String(format: "%.2f", episode.confidence)) session=\(context.conversationSessionId?.uuidString ?? "none")"
+    )
+  }
+
+  private func closeCurrentActivityModeEpisode(endedAt: Date = Date(), reason: String) {
+    guard var episode = currentActivityModeEpisode else { return }
+    episode.lastEvidenceAt = max(episode.lastEvidenceAt, endedAt)
+    episode.endedAt = endedAt
+    episode.updatedAt = endedAt
+    currentActivityModeEpisode = nil
+    Task { await identityPipeline.saveActivityModeEpisode(episode) }
+    AppLogger.log(
+      .activityMode,
+      "episode closed reason=\(reason) mode=\(episode.mode) durationSeconds=\(String(format: "%.1f", endedAt.timeIntervalSince(episode.startedAt)))"
+    )
+  }
+
+  private func publishGlassesAssistanceCard(
+    identity: AssistanceIdentityState,
+    memory: AssistanceMemorySnapshot,
+    reason: String,
+    sendImmediately: Bool = true
+  ) {
+    var card = glassesAssistanceCardFormatter.makeCard(
+      identity: identity,
+      memory: memory,
+      displayStatus: .glassesDisplay
+    )
+    let metadata = glassesDisplayMetadata(for: identity)
+    currentGlassesDisplayPersonId = metadata.personId
+    currentGlassesDisplayName = metadata.displayName
+    card.personId = metadata.personId
+    card.displayName = metadata.displayName
+    card.primaryAction = datIsStreamRunning ? .stopStream : (metadata.personId == nil ? .openPeople : .markReviewed)
+    card.secondaryAction = .openPeople
+    card.tertiaryAction = metadata.personId == nil ? nil : .markReviewed
+    currentGlassesAssistanceCard = card
+    if sendImmediately {
+      sendCombinedGlassesDisplayCard(reason: reason)
+    }
+  }
+
+  private func glassesDisplayMetadata(for identity: AssistanceIdentityState) -> (personId: UUID?, displayName: String?) {
+    switch identity {
+    case .known(let name, _, _):
+      let personId = livePhoneAssistancePinnedPersonId ?? activeFacePersonId
+      return (personId, resolvedDisplayName(for: personId, fallback: name))
+    case .possibleMatch(let name, _):
+      return (nil, name)
+    case .unknown, .noFaceDetected, .multipleFaces:
+      return (nil, nil)
+    }
+  }
+
+  private func resolvedDisplayName(for personId: UUID?, fallback: String? = nil) -> String? {
+    guard let personId else { return fallback }
+    if activeFacePersonId == personId, let activeFaceName, !activeFaceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return activeFaceName
+    }
+    if let summary = conversationSummaryCache[personId] {
+      return summary.displayName
+    }
+    if let entry = peopleDictionaryEntries.first(where: { $0.id == personId }) {
+      return entry.displayName
+    }
+    return fallback
+  }
+
+  private func combinedGlassesDisplayCard() -> AssistanceDisplayCard? {
+    let sections = activeGlassesDisplaySections()
+    guard !sections.isEmpty else { return nil }
+    let baseCard = currentGlassesAssistanceCard
+    let actions = activeGlassesDisplayActions(baseCard: baseCard)
+    return AssistanceDisplayCard(
+      title: activeGlassesDisplayTitle(),
+      lines: sections.first?.lines ?? [],
+      usesFallbackOutput: baseCard?.usesFallbackOutput ?? false,
+      sections: sections,
+      personId: baseCard?.personId ?? currentGlassesDisplayPersonId,
+      displayName: baseCard?.displayName ?? currentGlassesDisplayName,
+      thumbnailImageURI: nil,
+      primaryAction: actions.primary,
+      secondaryAction: actions.secondary,
+      tertiaryAction: actions.tertiary
+    )
+  }
+
+  private var activeIdentityPromptThumbnailImageURI: String? {
+    if shouldShowIdentityPromptOnLive || isGlassesIdentitySelectionActive {
+      return currentIdentityConfirmationImageURI
+    }
+    return nil
+  }
+
+  private var liveIdentityPromptSectionWithImage: AssistanceDisplaySection? {
+    guard shouldShowIdentityPromptOnLive,
+          let currentGlassesIdentityPromptSection else { return nil }
+    guard currentIdentityConfirmationThumbnail != nil || currentIdentityConfirmationImageURI != nil else {
+      return currentGlassesIdentityPromptSection
+    }
+
+    var lines = currentGlassesIdentityPromptSection.lines
+    if currentIdentityConfirmationImageURI == nil {
+      let loadingLine = "Photo loading for glasses display."
+      if !lines.contains(loadingLine) {
+        lines.append(loadingLine)
+      }
+    }
+    return AssistanceDisplaySection(
+      title: currentGlassesIdentityPromptSection.title,
+      lines: lines,
+      thumbnailImageURI: currentIdentityConfirmationImageURI,
+      thumbnailImageSize: .fill
+    )
+  }
+
+  private var activeIdentityPromptPhotoSection: AssistanceDisplaySection? {
+    guard isGlassesIdentitySelectionActive else { return nil }
+    guard currentIdentityConfirmationThumbnail != nil || currentIdentityConfirmationImageURI != nil else { return nil }
+    let title: String
+    switch pendingIdentityConfirmation {
+    case .recognized(_, let displayName):
+      title = "\(displayName) photo"
+    case .unknown:
+      title = "Person photo"
+    case .selectingPerson:
+      if !glassesIdentitySelectionEntries.isEmpty {
+        let selected = glassesIdentitySelectionEntries[min(glassesIdentitySelectionIndex, glassesIdentitySelectionEntries.count - 1)]
+        title = "\(selected.displayName) photo"
+      } else {
+        title = "Person photo"
+      }
+    case nil:
+      return nil
+    }
+    let imageReady = currentIdentityConfirmationImageURI != nil
+    return AssistanceDisplaySection(
+      title: title,
+      lines: imageReady ? [] : ["Photo loading for glasses display."],
+      thumbnailImageURI: currentIdentityConfirmationImageURI,
+      thumbnailImageSize: .icon
+    )
+  }
+
+  private func activeGlassesDisplaySections() -> [AssistanceDisplaySection] {
+    if shouldShowIdentityPromptOnLive {
+      return liveGlassesDisplaySections()
+    }
+    if isGlassesIdentitySelectionActive {
+      return peopleWindowDisplaySections()
+    }
+
+    switch activeGlassesDisplayWindow {
+    case .live:
+      return liveGlassesDisplaySections()
+    case .people:
+      return peopleWindowDisplaySections()
+    case .context:
+      return contextDisplaySections()
+    case .transcripts:
+      return transcriptDisplaySections()
+    }
+  }
+
+  private func liveGlassesDisplaySections() -> [AssistanceDisplaySection] {
+    let identityPromptSection = liveIdentityPromptSectionWithImage
+    if let identityPromptSection,
+       identityPromptSection.thumbnailImageURI != nil {
+      AppLogger.log(
+        .display,
+        "Identity confirmation prompt image attached title=\"\(identityPromptSection.title)\" imageURI=attached imageSize=\(identityPromptSection.thumbnailImageSize.rawValue)"
+      )
+    }
+    return MementoGlassesDisplayRenderer.liveViewSections(
+      assistanceCard: currentGlassesAssistanceCard,
+      recallSections: currentGlassesLiveRecallSections,
+      identityPromptSection: identityPromptSection,
+      identityPhotoSection: nil,
+      statusLine: liveGlassesStatusLine(),
+      isStreaming: datIsStreamRunning || datStreamSessionStateText.lowercased().contains("streaming"),
+      streamModeLine: streamRunningModeLineText,
+      recognizedPeopleLine: streamRunningRecognizedPeopleLineText
+    )
+  }
+
+  private var shouldShowIdentityPromptOnLive: Bool {
+    switch pendingIdentityConfirmation {
+    case .recognized, .unknown:
+      return true
+    case .selectingPerson, nil:
+      return false
+    }
+  }
+
+  private var isGlassesIdentitySelectionActive: Bool {
+    if case .selectingPerson = pendingIdentityConfirmation {
+      return true
+    }
+    return false
+  }
+
+  private func liveGlassesStatusLine() -> String {
+    if let faceStatus = currentGlassesFaceVisibilitySection?.lines.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !faceStatus.isEmpty {
+      return "Status: \(faceStatus)"
+    }
+    if datIsStreamRunning {
+      return hasReceivedFirstFrame
+        ? "Status: Stream running successfully."
+        : "Status: Starting stream."
+    }
+    return "Status: Display ready."
+  }
+
+  private func peopleWindowDisplaySections() -> [AssistanceDisplaySection] {
+    var sections: [AssistanceDisplaySection] = []
+    if isGlassesIdentitySelectionActive,
+       let currentGlassesIdentityPromptSection {
+      sections.append(currentGlassesIdentityPromptSection)
+      if let photoSection = activeIdentityPromptPhotoSection {
+        AppLogger.log(
+          .display,
+          "Identity selection photo page included title=\"\(photoSection.title)\" imageURI=\(currentIdentityConfirmationImageURI == nil ? "loading" : "attached")"
+        )
+        sections.append(photoSection)
+      }
+    }
+
+    if let current = liveGlassesDisplaySections().first {
+      sections.append(AssistanceDisplaySection(
+        title: "Current person",
+        lines: [current.title] + current.lines
+      ))
+    }
+
+    let dictionary = MementoGlassesDisplayRenderer.peopleList(
+      entries: peopleDictionaryEntries,
+      currentPersonId: activeFacePersonId ?? currentGlassesDisplayPersonId,
+      page: glassesPeopleListPage
+    )
+    sections.append(AssistanceDisplaySection(
+      title: dictionary.title,
+      lines: dictionary.lines
+    ))
+
+    if sections.isEmpty {
+      sections.append(AssistanceDisplaySection(
+        title: "People",
+        lines: ["No saved people yet."]
+      ))
+    }
+    return sections
+  }
+
+  private func contextDisplaySections() -> [AssistanceDisplaySection] {
+    let sections = Array(currentGlassesSceneContextSections.suffix(Self.sceneContextDisplaySectionLimit).reversed())
+    guard !sections.isEmpty else {
+      return [AssistanceDisplaySection(
+        title: "AI context",
+        lines: ["Waiting for multimodal scene context.", sceneContextStatusText]
+      )]
+    }
+    return sections
+  }
+
+  private func transcriptDisplaySections() -> [AssistanceDisplaySection] {
+    let captionLines = Array(liveCaptionDisplayLines.reversed())
+    guard !captionLines.isEmpty else {
+      return [AssistanceDisplaySection(
+        title: "Transcript",
+        lines: ["Waiting for live speech.", liveTranscriptionStatusText]
+      )]
+    }
+    return [AssistanceDisplaySection(title: "Transcript", lines: captionLines)]
+  }
+
+  private func activeGlassesDisplayTitle() -> String {
+    if shouldShowIdentityPromptOnLive {
+      return "Live view"
+    }
+    if isGlassesIdentitySelectionActive {
+      return "People"
+    }
+    switch activeGlassesDisplayWindow {
+    case .live:
+      return "Live view"
+    case .people:
+      return "People"
+    case .context:
+      return "AI context"
+    case .transcripts:
+      return "Transcript"
+    }
+  }
+
+  private func activeGlassesDisplayActions(
+    baseCard: AssistanceDisplayCard?
+  ) -> (primary: GlassesDisplayAction?, secondary: GlassesDisplayAction?, tertiary: GlassesDisplayAction?) {
+    if let primary = identityPromptPrimaryAction() {
+      return (primary, identityPromptSecondaryAction(), nil)
+    }
+
+    guard datIsStreamRunning else {
+      return (baseCard?.primaryAction, baseCard?.secondaryAction, baseCard?.tertiaryAction)
+    }
+
+    switch activeGlassesDisplayWindow {
+    case .live:
+      return (.openTranscripts, .openContext, nil)
+    case .people:
+      return (.backToHome, .openTranscripts, nil)
+    case .context:
+      return (.openTranscripts, .backToHome, nil)
+    case .transcripts:
+      return (.openContext, .backToHome, nil)
+    }
+  }
+
+  private func identityPromptPrimaryAction() -> GlassesDisplayAction? {
+    switch pendingIdentityConfirmation {
+    case .recognized:
+      return .confirmRecognizedPerson
+    case .unknown:
+      return .confirmUnknownPerson
+    case .selectingPerson:
+      return glassesIdentitySelectionEntries.isEmpty ? .selectUnknownPerson : .confirmSelectedPerson
+    case nil:
+      return nil
+    }
+  }
+
+  private func identityPromptSecondaryAction() -> GlassesDisplayAction? {
+    switch pendingIdentityConfirmation {
+    case .recognized:
+      return .rejectRecognizedPerson
+    case .unknown:
+      return .rejectUnknownPerson
+    case .selectingPerson:
+      return .selectUnknownPerson
+    case nil:
+      return nil
+    }
+  }
+
+  private func sendCombinedGlassesDisplayCard(reason: String, delayNanoseconds: UInt64 = 250_000_000) {
+    guard let card = combinedGlassesDisplayCard() else {
+      clearPhysicalGlassesAssistanceDisplay(reason: reason)
+      return
+    }
+    enqueueGlassesDisplayCard(card, reason: reason, delayNanoseconds: delayNanoseconds)
+  }
+
+  private func enqueueGlassesDisplayCard(
+    _ card: AssistanceDisplayCard,
+    reason: String,
+    delayNanoseconds: UInt64 = 250_000_000
+  ) {
+    lastGlassesDisplayCardForActions = card
+    glassesDisplaySendTask?.cancel()
+    glassesDisplaySendTask = Task { @MainActor [weak self] in
+      if delayNanoseconds > 0 {
+        do {
+          try await Task.sleep(nanoseconds: delayNanoseconds)
+        } catch {
+          return
+        }
+      }
+      guard let self else { return }
+      let sent = await self.datManager.sendAssistanceCard(card, reason: reason, resetPage: false)
+      if sent {
+        await self.recordGlassesDisplayInteractionIfNeeded(action: .displayed, source: "displaySend", card: card)
+      }
+      self.glassesDisplaySendTask = nil
+    }
+  }
+
+  private func clearGlassesAssistanceCard(reason: String) {
+    currentGlassesAssistanceCard = nil
+    if Self.shouldSendRemainingDisplayAfterClear(
+      datIsStreamRunning: datIsStreamRunning,
+      streamStateText: datStreamSessionStateText,
+      activeWindowIsLive: activeGlassesDisplayWindow == .live
+    ), let remainingCard = combinedGlassesDisplayCard() {
+      enqueueGlassesDisplayCard(remainingCard, reason: "\(reason)-remaining")
+      return
+    }
+    clearPhysicalGlassesAssistanceDisplay(reason: reason)
+  }
+
+  private func clearPhysicalGlassesAssistanceDisplay(reason: String) {
+    glassesDisplaySendTask?.cancel()
+    glassesDisplaySendTask = nil
+    Task { @MainActor [weak self] in
+      await self?.datManager.clearAssistanceDisplay(reason: reason)
+    }
+  }
+
+  private func sendImmediateGlassesDisplayCard(
+    _ card: AssistanceDisplayCard,
+    reason: String,
+    resetPage: Bool = true
+  ) {
+    currentGlassesAssistanceCard = card
+    currentGlassesDisplayPersonId = card.personId
+    currentGlassesDisplayName = card.displayName
+    lastGlassesDisplayCardForActions = card
+    glassesDisplaySendTask?.cancel()
+    glassesDisplaySendTask = nil
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      let sent = await self.datManager.sendAssistanceCard(card, reason: reason, resetPage: resetPage)
+      if sent {
+        await self.recordGlassesDisplayInteractionIfNeeded(action: .displayed, source: "displaySend", card: card)
+      }
+    }
+  }
+
+  private func sendCoalescedGlassesDisplayCard(
+    _ card: AssistanceDisplayCard,
+    reason: String,
+    resetPage: Bool,
+    delayNanoseconds: UInt64
+  ) {
+    currentGlassesAssistanceCard = card
+    currentGlassesDisplayPersonId = card.personId
+    currentGlassesDisplayName = card.displayName
+    lastGlassesDisplayCardForActions = card
+    glassesDisplaySendTask?.cancel()
+    glassesDisplaySendTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(nanoseconds: delayNanoseconds)
+      } catch {
+        return
+      }
+      guard let self else { return }
+      let sent = await self.datManager.sendAssistanceCard(card, reason: reason, resetPage: resetPage)
+      if sent {
+        await self.recordGlassesDisplayInteractionIfNeeded(action: .displayed, source: "displaySend", card: card)
+      }
+      self.glassesDisplaySendTask = nil
+    }
+  }
+
+  private func showGlassesStreamStatus(
+    title: String,
+    message: String,
+    reason: String,
+    allowStop: Bool = true,
+    sendTiming: GlassesDisplaySendTiming = .immediate
+  ) {
+    let card = MementoGlassesDisplayRenderer.streamStatus(
+      title: title,
+      message: message,
+      allowStop: allowStop
+    )
+    switch sendTiming {
+    case .immediate:
+      sendImmediateGlassesDisplayCard(card, reason: reason)
+    case .coalesced(let nanoseconds):
+      sendCoalescedGlassesDisplayCard(
+        card,
+        reason: reason,
+        resetPage: true,
+        delayNanoseconds: nanoseconds
+      )
+    }
+  }
+
+  private func showGlassesStreamingDashboard(reason: String) {
+    guard datIsStreamRunning || datStreamSessionStateText.lowercased().contains("streaming") else { return }
+    let dashboardText = Self.streamingDashboardText(
+      datFramesReceived: datFramesReceived,
+      lastFrameTimestampText: lastFrameTimestampText,
+      datLastErrorText: datLastErrorText,
+      hasReceivedFirstFrame: hasReceivedFirstFrame
+    )
+    let card = MementoGlassesDisplayRenderer.streaming(
+      currentPersonName: currentGlassesDisplayName ?? activeFaceName,
+      frameText: dashboardText.frameText,
+      statusText: dashboardText.statusText,
+      currentLineOverride: dashboardText.currentLineOverride
+    )
+    currentGlassesAssistanceCard = card
+    currentGlassesDisplayPersonId = card.personId ?? currentGlassesDisplayPersonId
+    currentGlassesDisplayName = card.displayName ?? currentGlassesDisplayName ?? activeFaceName
+    if activeGlassesDisplayWindow == .live || activeGlassesDisplayWindow == .people {
+      sendCombinedGlassesDisplayCard(reason: reason)
+    }
+  }
+
+  private func showGlassesPeopleDictionary() async {
+    let entries = await identityPipeline.loadPeopleForDictionary()
+    peopleDictionaryEntries = entries
+    activeGlassesDisplayWindow = .people
+    sendCombinedGlassesDisplayCard(reason: "glasses-people-list")
+  }
+
+  @discardableResult
+  func savePhotoFromVideoStream() -> UIImage? {
+    guard let image = currentVideoFrame else {
+      streamPhotoStatusText = "No stream frame available yet"
+      return nil
+    }
+    lastStreamPhotoSnapshot = image
+    streamPhotoStatusText = "Photo saved from latest video stream frame"
+    return image
+  }
+
+  private func handleGlassesDisplayAction(_ action: GlassesDisplayAction) async {
+    guard let card = lastGlassesDisplayCardForActions else { return }
+    if action == .displayed {
+      await recordGlassesDisplayInteractionIfNeeded(action: .displayed, source: "displaySend", card: card)
+      return
+    }
+    if action.isIdentityPromptAction {
+      handleIdentityPromptActionImmediately(action)
+      Task { @MainActor [weak self, card] in
+        await self?.recordGlassesDisplayInteraction(action: action, source: "glassesButton", card: card)
+      }
+      return
+    }
+    await recordGlassesDisplayInteraction(action: action, source: "glassesButton", card: card)
+
+    switch action {
+    case .openPeople:
+      await showGlassesPeopleDictionary()
+    case .openContext:
+      activeGlassesDisplayWindow = .context
+      sendCombinedGlassesDisplayCard(reason: "glasses-open-context")
+    case .openTranscripts:
+      activeGlassesDisplayWindow = .transcripts
+      sendCombinedGlassesDisplayCard(reason: "glasses-open-transcripts")
+    case .startStream:
+      phoneAssistanceStatusText = "Starting stream from glasses"
+      showGlassesStreamStatus(
+        title: "Starting stream",
+        message: "Preparing iPhone mic and glasses camera.",
+        reason: "start-stream-from-glasses"
+      )
+      await startRealGlassesStream()
+    case .stopStream:
+      phoneAssistanceStatusText = "Stopping stream from glasses"
+      AppLogger.log(.display, "Stop stream requested from glasses; deferring display refresh until DAT teardown settles")
+      await stopSession(reason: "glassesDisplay")
+      Task { @MainActor [weak self] in
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        self?.activateGlassesDisplayControl()
+      }
+    case .snapshotFrame:
+      let image = savePhotoFromVideoStream()
+      sendImmediateGlassesDisplayCard(
+        MementoGlassesDisplayRenderer.photoStatus(success: image != nil),
+        reason: "glasses-snapshot-frame"
+      )
+    case .markReviewed:
+      phoneAssistanceStatusText = "Reviewed on glasses"
+    case .hideCard:
+      clearGlassesAssistanceCard(reason: "glasses-hide")
+    case .backToHome:
+      if datIsStreamRunning || datStreamSessionStateText.lowercased().contains("streaming") {
+        activeGlassesDisplayWindow = .live
+        sendCombinedGlassesDisplayCard(reason: "glasses-back-to-streaming")
+      } else {
+        activateGlassesDisplayControl()
+      }
+    case .confirmRecognizedPerson:
+      confirmRecognizedPersonOnGlasses()
+    case .rejectRecognizedPerson:
+      clearRetainedRecognizedIdentity(reason: "glassesRejectedRecognized")
+      await beginGlassesIdentityCorrection()
+    case .confirmUnknownPerson:
+      confirmUnknownPersonOnGlasses()
+    case .rejectUnknownPerson:
+      await beginGlassesIdentityCorrection()
+    case .confirmSelectedPerson:
+      confirmSelectedPersonOnGlasses()
+    case .selectUnknownPerson:
+      confirmUnknownPersonOnGlasses()
+    case .nextPage:
+      moveGlassesIdentitySelection(offset: 1)
+    case .previousPage:
+      moveGlassesIdentitySelection(offset: -1)
+    case .displayed:
+      break
+    }
+  }
+
+  private func handleIdentityPromptActionImmediately(_ action: GlassesDisplayAction) {
+    switch action {
+    case .confirmRecognizedPerson:
+      confirmRecognizedPersonOnGlasses()
+    case .rejectRecognizedPerson:
+      clearRetainedRecognizedIdentity(reason: "glassesRejectedRecognized")
+      showGlassesIdentityCorrectionLoading()
+      Task { @MainActor [weak self] in
+        await self?.loadGlassesIdentityCorrectionEntries()
+      }
+    case .confirmUnknownPerson:
+      confirmUnknownPersonOnGlasses()
+    case .rejectUnknownPerson:
+      showGlassesIdentityCorrectionLoading()
+      Task { @MainActor [weak self] in
+        await self?.loadGlassesIdentityCorrectionEntries()
+      }
+    case .confirmSelectedPerson:
+      confirmSelectedPersonOnGlasses()
+    case .selectUnknownPerson:
+      confirmUnknownPersonOnGlasses()
+    default:
+      break
+    }
+  }
+
+  private func recordGlassesDisplayInteractionIfNeeded(
+    action: GlassesDisplayAction,
+    source: String,
+    card: AssistanceDisplayCard
+  ) async {
+    let key = "\(action.rawValue)|\(source)|\(card.text)"
+    guard key != lastRecordedGlassesDisplayCardKey else { return }
+    lastRecordedGlassesDisplayCardKey = key
+    await recordGlassesDisplayInteraction(action: action, source: source, card: card)
+  }
+
+  private func recordGlassesDisplayInteraction(
+    action: GlassesDisplayAction,
+    source: String,
+    card: AssistanceDisplayCard
+  ) async {
+    var context = await identityPipeline.currentContext()
+    if context == nil {
+      let snapshot = await identityPipeline.startAppRunIfNeeded()
+      context = await identityPipeline.currentContext()
+      pipelineContext = context
+      applyRunSessionSnapshot(snapshot)
+    }
+    guard let context else { return }
+
+    let personId = card.personId ?? currentGlassesDisplayPersonId
+    let displayName = card.displayName ?? resolvedDisplayName(for: personId) ?? currentGlassesDisplayName
+    let event = GlassesDisplayInteractionEvent(
+      appRunId: context.appRunId,
+      conversationSessionId: context.conversationSessionId,
+      personId: personId,
+      displayName: displayName,
+      cardTitle: card.title,
+      cardText: card.text,
+      action: action,
+      source: source,
+      createdAt: Date()
+    )
+    await identityPipeline.saveGlassesDisplayInteraction(event)
+
+    if personId != nil || showPeopleDictionary {
+      peopleDictionaryEntries = await identityPipeline.loadPeopleForDictionary()
+    }
   }
 
   private func refreshPersonConversationSummaryForCurrentStreamIfNeeded(personId: UUID) {
@@ -1770,6 +5581,40 @@ final class StreamSessionViewModel: ObservableObject {
     conversationSummaryRefreshedPersonIdsThisStream.insert(personId)
     AppLogger.log(.memory, "Person summary stream refresh requested personId=\(personId.uuidString)")
     refreshPersonConversationSummaryIfNeeded(personId: personId, forceSpeak: false, forceRefresh: true)
+  }
+
+  @discardableResult
+  private func publishConfirmedPersonSummaryOrRefresh(personId: UUID) -> Bool {
+    if let snapshot = conversationSummaryCache[personId] {
+      publishConfirmedPersonSummaryIfNeeded(snapshot, reason: "identity-confirmed-summary-cached")
+      return true
+    }
+    refreshPersonConversationSummaryForCurrentStreamIfNeeded(personId: personId)
+    return false
+  }
+
+  @discardableResult
+  private func publishConfirmedPersonSummaryIfNeeded(
+    _ summary: PersonConversationSummary,
+    reason: String
+  ) -> Bool {
+    guard glassesConfirmedConversationPersonId == summary.personId
+      || glassesConfirmedConversationPersonIds.contains(summary.personId) else { return false }
+    let section = MementoGlassesDisplayRenderer.confirmedPersonSummarySection(
+      for: summary,
+      presentPeople: activePresenceDisplayNames()
+    )
+    currentGlassesLiveRecallSections.removeAll { $0.title == section.title }
+    publishLiveRecallSection(
+      section,
+      personId: summary.personId,
+      status: "Last interaction loaded",
+      verification: "Confirmed person memory: \(Self.truncated(section.lines.first ?? section.title, maxLength: 140))",
+      reason: reason,
+      shouldSwitchToLive: datIsStreamRunning || datStreamSessionStateText.lowercased().contains("streaming")
+    )
+    AppLogger.log(.memory, "Confirmed person summary stacked personId=\(summary.personId.uuidString) name=\(summary.displayName) stack=\(currentGlassesLiveRecallSections.count)")
+    return true
   }
 
   private func invalidateAndRefreshConversationSummaries(
@@ -1802,13 +5647,14 @@ final class StreamSessionViewModel: ObservableObject {
     }
     if !forceRefresh, conversationSummaryCache[personId] != nil { return }
     let settings = DeepSeekSettings(apiKey: deepSeekAPIKeyText, model: deepSeekModelText)
-    let hasDeepSeekKey = !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let hasDeepSeekCloud = SupabaseEdgeFunctionClient.isConfigured()
+      || !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     conversationSummaryInFlight.insert(personId)
     let generation = assistanceGeneration
-    phoneAssistanceStatusText = hasDeepSeekKey
+    phoneAssistanceStatusText = hasDeepSeekCloud
       ? "DeepSeek summarizing saved conversations"
       : "Loading saved conversation summary"
-    AppLogger.log(.memory, "Person summary requested personId=\(personId.uuidString) model=\(settings.model) forceRefresh=\(forceRefresh) hasDeepSeekKey=\(hasDeepSeekKey)")
+    AppLogger.log(.memory, "Person summary requested personId=\(personId.uuidString) model=\(settings.model) forceRefresh=\(forceRefresh) hasDeepSeekCloud=\(hasDeepSeekCloud) proxy=\(SupabaseEdgeFunctionClient.isConfigured())")
     Task { [weak self] in
       guard let self else { return }
       let entries = await self.identityPipeline.loadPeopleForDictionary()
@@ -1829,19 +5675,32 @@ final class StreamSessionViewModel: ObservableObject {
       let transcriptContext = Self.personConversationTranscriptContext(entry)
       do {
         let summary: String
+        var summaryUsedCloud = hasDeepSeekCloud
         if transcriptContext.isEmpty {
           summary = "No saved attributed conversations yet."
+          summaryUsedCloud = false
           AppLogger.log(.memory, "Person summary has no saved attributed conversations personId=\(personId.uuidString) name=\(entry.displayName)")
-        } else if !hasDeepSeekKey {
+        } else if !hasDeepSeekCloud {
           summary = Self.localPersonConversationSummary(entry, transcriptContext: transcriptContext)
+          summaryUsedCloud = false
           AppLogger.log(.memory, "Person summary using local saved-conversation fallback personId=\(personId.uuidString) name=\(entry.displayName)")
         } else {
-          let client = try DeepSeekAssistanceClient(apiKey: settings.apiKey, model: settings.model)
-          summary = try await client.summarizePersonConversations(
-            personName: entry.displayName,
-            lastSeenText: lastSeenText,
-            conversationTranscript: transcriptContext
-          )
+          // DeepSeek is configured, but an empty answer (proxy 500
+          // empty_response) or any transient cloud error must NOT break the
+          // person summary. Fall back to the local saved-conversation summary
+          // so the user always sees something useful.
+          do {
+            let client = try DeepSeekAssistanceClient(apiKey: settings.apiKey, model: settings.model)
+            summary = try await client.summarizePersonConversations(
+              personName: entry.displayName,
+              lastSeenText: lastSeenText,
+              conversationTranscript: transcriptContext
+            )
+          } catch {
+            summary = Self.localPersonConversationSummary(entry, transcriptContext: transcriptContext)
+            summaryUsedCloud = false
+            AppLogger.log(.memory, "Person summary fell back to local saved-conversation summary personId=\(personId.uuidString) name=\(entry.displayName) reason=\(error.localizedDescription)")
+          }
         }
 
         let snapshot = PersonConversationSummary(
@@ -1863,13 +5722,14 @@ final class StreamSessionViewModel: ObservableObject {
             }
             return
           }
+          self.peopleDictionaryEntries = entries
           self.conversationSummaryCache[personId] = snapshot
           self.conversationSummaryInFlight.remove(personId)
           let needsRefresh = self.conversationSummaryRefreshPendingPersonIds.remove(personId) != nil
           AppLogger.log(.memory, "Person summary ready personId=\(personId.uuidString) name=\(entry.displayName) conversations=\(entry.conversationTranscripts.count) transcriptChars=\(transcriptContext.count)")
           self.deepSeekStatusText = transcriptContext.isEmpty
             ? "No saved conversation transcript for \(entry.displayName)"
-            : hasDeepSeekKey
+            : summaryUsedCloud
               ? "DeepSeek summarized \(entry.conversationTranscripts.count) convo(s)"
               : "Loaded saved conversation summary"
           let identity = AssistanceIdentityState.known(
@@ -1885,7 +5745,18 @@ final class StreamSessionViewModel: ObservableObject {
           if self.livePhoneAssistanceDismissedPersonId != personId {
             self.phoneAssistanceDismissed = false
             self.livePhoneAssistancePinnedPersonId = personId
-            self.publishPhoneAssistanceCard(card, status: "Phone display fallback")
+            self.publishPhoneAssistanceCard(card, status: "Phone display fallback", personId: personId)
+            let shouldStackConfirmedSummary = self.glassesConfirmedConversationPersonId == personId
+              || self.glassesConfirmedConversationPersonIds.contains(personId)
+            self.publishGlassesAssistanceCard(
+              identity: identity,
+              memory: self.currentAssistanceMemorySnapshot(personId: personId),
+              reason: "person-summary-ready",
+              sendImmediately: !shouldStackConfirmedSummary
+            )
+            if shouldStackConfirmedSummary {
+              self.publishConfirmedPersonSummaryIfNeeded(snapshot, reason: "person-summary-ready")
+            }
           }
           if needsRefresh {
             self.refreshPersonConversationSummaryIfNeeded(personId: personId, forceSpeak: false, forceRefresh: true)
@@ -1965,11 +5836,29 @@ final class StreamSessionViewModel: ObservableObject {
   }
 
   private func currentAssistanceIdentity() -> AssistanceIdentityState {
+    let partner = activeConversationPartnerState
+    if partner.phase == .confirmed, let primary = partner.primary {
+      return .known(
+        name: primary.displayName ?? primary.personId?.uuidString ?? "Confirmed",
+        confidence: primary.score,
+        userConfirmed: true
+      )
+    }
+    if partner.phase == .possible, let primary = partner.primary {
+      return .possibleMatch(
+        name: primary.displayName ?? primary.personId?.uuidString ?? "Possible",
+        confidence: primary.score
+      )
+    }
+    if partner.phase == .conflicted {
+      return .unknown
+    }
+    if partner.phase == .multiplePeople {
+      return .multipleFaces(count: max(detectedFaceCount, 2))
+    }
+
     if detectedFaceCount > 1 {
       return .multipleFaces(count: detectedFaceCount)
-    }
-    if detectedFaceCount == 0 || activeIdentityStateText == ActiveIdentityState.State.noFace.rawValue {
-      return .noFaceDetected
     }
     if activeIdentityStateText == ActiveIdentityState.State.confirmed.rawValue {
       return .known(
@@ -1981,11 +5870,18 @@ final class StreamSessionViewModel: ObservableObject {
     if activeIdentityStateText == ActiveIdentityState.State.possible.rawValue {
       return .possibleMatch(name: activeIdentityName, confidence: activeFaceConfidence)
     }
+    if detectedFaceCount == 0 || activeIdentityStateText == ActiveIdentityState.State.noFace.rawValue {
+      return .noFaceDetected
+    }
     return .unknown
   }
 
   private func currentAssistanceMemorySnapshot(personId: UUID? = nil) -> AssistanceMemorySnapshot {
     var topics: [String] = []
+    let partner = activeConversationPartnerState
+    if let partnerTopic = assistancePartnerTopic(from: partner) {
+      topics.append(partnerTopic)
+    }
     if !recentConversationAttributionText.hasPrefix("No transcript") {
       topics.append(recentConversationAttributionText)
     }
@@ -1993,20 +5889,62 @@ final class StreamSessionViewModel: ObservableObject {
       topics.append(identitySummaryText)
     }
 
-    let reminder: String? = activeSpeakerStateText == "confirmed" && !activeSpeakerName.isEmpty
-      ? "Current speaker appears to be \(activeSpeakerName)"
-      : nil
+    let reminder: String?
+    switch partner.phase {
+    case .conflicted:
+      reminder = "Identity conflict: confirm person"
+    case .multiplePeople:
+      reminder = "Multiple people visible: hide private memory"
+    case .confirmed:
+      reminder = partner.primary?.displayName.map { "Current partner appears to be \($0)" }
+    case .possible:
+      reminder = partner.primary?.displayName.map { "Possible partner: \($0)" }
+    case .unknown, .none:
+      reminder = activeSpeakerStateText == "confirmed" && !activeSpeakerName.isEmpty
+        ? "Current speaker appears to be \(activeSpeakerName)"
+        : nil
+    }
 
-    let personSummary = (personId ?? activeFacePersonId).flatMap { conversationSummaryCache[$0] }
+    let canShowPrivateMemory = personId != nil
+      || partner.allowsPrivateMemory
+      || (partner.phase == .none && activeIdentityStateText == ActiveIdentityState.State.confirmed.rawValue)
+    let resolvedPersonId = personId ?? (canShowPrivateMemory ? (partner.primary?.personId ?? activeFacePersonId) : nil)
+    let personSummary = resolvedPersonId.flatMap { conversationSummaryCache[$0] }
 
     return AssistanceMemorySnapshot(
       lastInteraction: topics.first,
-      lastSeen: personSummary?.lastSeenText,
-      conversationSummary: personSummary?.summary,
+      lastSeen: canShowPrivateMemory ? personSummary?.lastSeenText : nil,
+      conversationSummary: canShowPrivateMemory ? personSummary?.summary : nil,
       contextTopics: Array(topics.dropFirst()),
       reminder: reminder,
       suggestedAction: "Keep the reply short and confirm uncertain details"
     )
+  }
+
+  private func assistancePartnerTopic(from state: ConversationPartnerState) -> String? {
+    switch state.phase {
+    case .confirmed:
+      guard let name = state.primary?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !name.isEmpty else {
+        return "Partner confirmed"
+      }
+      return "Partner: \(name)"
+    case .possible:
+      guard let name = state.primary?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !name.isEmpty else {
+        return "Possible partner"
+      }
+      let confidence = Int(((state.primary?.score ?? 0) * 100).rounded())
+      return "Possible partner: \(name) (\(confidence)%)"
+    case .conflicted:
+      return "Identity conflict"
+    case .multiplePeople:
+      return "Multiple people visible"
+    case .unknown:
+      return "Partner unknown"
+    case .none:
+      return nil
+    }
   }
 
   private var isLiveDATStreamActive: Bool {
@@ -2015,52 +5953,351 @@ final class StreamSessionViewModel: ObservableObject {
       && datStreamSessionStateText.lowercased().contains("streaming")
   }
 
+  private var isDATAnalysisPaused: Bool {
+    analysisPaused && inputMode == .realGlasses
+  }
+
+  private func handleAnalysisPausedChanged() {
+    AppLogger.log(.stream, "Pause analysis changed paused=\(analysisPaused) inputMode=\(inputMode.rawValue) datStream=\(datStreamSessionStateText) datRunning=\(datIsStreamRunning)")
+    guard inputMode == .realGlasses else { return }
+    if analysisPaused {
+      Task { @MainActor [weak self] in
+        await self?.pauseDATAnalysisConsumers(reason: "userToggle")
+      }
+    } else {
+      resumeDATAnalysisConsumers(reason: "userToggle")
+    }
+  }
+
+  private func pauseDATAnalysisConsumers(reason: String) async {
+    guard inputMode == .realGlasses else { return }
+    deferredCloudWorkerStartTask?.cancel()
+    deferredCloudWorkerStartTask = nil
+    speechManager.onAudioBuffer = { _ in }
+    stopLiveTranscriptionForStream()
+    resetPostSessionAttributionState()
+    let discardedURL = audioRecorder.stop()
+    if let discardedURL {
+      try? FileManager.default.removeItem(at: discardedURL)
+    }
+    streamAudioStart = nil
+    speakerTimeline = []
+    cloudDiarizationState = .idle
+    activeSpeakerStateText = "analysis paused"
+    activeSpeakerName = ""
+    activeSpeakerPersonId = nil
+    activeSpeakerSimilarity = 0
+    voiceSpeechBufferSeconds = 0
+    voiceMatchStatusText = "Analysis paused"
+    iPhoneVoiceSimilarityStatusText = "iPhone local estimate: analysis paused"
+    workerVoiceSimilarityStatusText = "AWS canonical: analysis paused"
+    wearerVoiceSimilarityStatusText = "Wearer: analysis paused"
+    liveTranscriptPreviewText = "Analysis paused"
+    liveTranscriptionStatusText = "Alibaba ASR paused"
+    sceneContextStatusText = "Scene context paused"
+    await speakerPipeline.resetRuntimeState(reason: "analysisPaused-\(reason)")
+    await stopCloudSpeakerWorkerForStream(reason: "analysisPaused-\(reason)")
+    await stopCloudFaceWorkerForStream(reason: "analysisPaused-\(reason)")
+    cloudFaceEmbeddingStatusText = "AWS AdaFace paused"
+    cloudSpeakerEmbeddingStatusText = "AWS canonical speaker paused"
+    workerVoiceSimilarityStatusText = "AWS canonical: analysis paused"
+    AppLogger.log(.stream, "Paused nonessential DAT stream analysis; DAT stream and iPhone audio session are left intact reason=\(reason)")
+  }
+
+  private func resumeDATAnalysisConsumers(reason: String) {
+    guard inputMode == .realGlasses else { return }
+    guard livePhoneAudioSessionActive else {
+      AppLogger.log(.stream, "Analysis resumed while live phone audio is inactive reason=\(reason)")
+      return
+    }
+    configureLiveAudioBufferHandling(reason: "analysisResumed-\(reason)")
+    startLiveTranscriptionForStream(reason: "analysisResumed-\(reason)")
+    streamAudioStart = Date()
+    speakerTimeline = []
+    cloudDiarizationState = .recording
+    audioRecorder.start()
+    startCloudWorkersForStream(reason: "analysisResumed-\(reason)", includeSpeaker: liveVoiceEmbeddingEnabled)
+    AppLogger.log(.stream, "Resumed DAT stream analysis consumers reason=\(reason)")
+  }
+
+  private func isVoicePreviewBlockedByDATStream() -> Bool {
+    guard isLiveDATStreamActive else { return false }
+    AppLogger.log(.audio, "Voice preview blocked while DAT stream is active to avoid routing output to Meta/Ray-Ban glasses")
+    return true
+  }
+
   func saveDeepSeekSettings() {
     DeepSeekSettings(apiKey: deepSeekAPIKeyText, model: deepSeekModelText).save()
-    deepSeekStatusText = deepSeekAPIKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      ? "DeepSeek key missing"
-      : "DeepSeek configured: \(deepSeekModelText)"
-    AppLogger.log(.audio, "DeepSeek settings saved model=\(deepSeekModelText) hasApiKey=\(!deepSeekAPIKeyText.isEmpty)")
+    let aiProxyConfigured = SupabaseEdgeFunctionClient.isConfigured()
+    deepSeekStatusText = aiProxyConfigured
+      ? "DeepSeek via Supabase Edge: \(deepSeekModelText)"
+      : deepSeekAPIKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ? "DeepSeek key missing"
+        : "DeepSeek configured: \(deepSeekModelText)"
+    AppLogger.log(.audio, "DeepSeek settings saved model=\(deepSeekModelText) hasApiKey=\(!deepSeekAPIKeyText.isEmpty) proxy=\(aiProxyConfigured)")
+  }
+
+  func saveSceneContextSettings() {
+    SceneContextSettings.save(enabled: sceneContextEnabled, locationEnabled: sceneLocationContextEnabled)
+    let settings = SceneContextSettings.load()
+    let aiProxyConfigured = SupabaseEdgeFunctionClient.isConfigured()
+    sceneContextStatusText = sceneContextEnabled
+      ? (aiProxyConfigured ? "Scene context via Supabase Edge: \(settings.model)" : settings.apiKey.isEmpty ? "Scene context key missing" : "Scene context saved: \(settings.model)")
+      : "Scene context off"
+    AppLogger.log(.sceneContext, "settings saved enabled=\(sceneContextEnabled) location=\(sceneLocationContextEnabled) model=\(settings.model) hasKey=\(!settings.apiKey.isEmpty) proxy=\(aiProxyConfigured)")
+    if livePhoneAudioSessionActive {
+      startSceneContextForStream(reason: "settingsChanged")
+    } else if !sceneContextEnabled {
+      stopSceneContextForStream()
+    }
   }
 
   func saveCloudFaceEmbeddingSettings() {
+    // Persist the worker-facing settings: when EC2 lifecycle is active the
+    // endpoint comes from the Lambda's describeLive response, so the saved
+    // endpoint stays empty and is only honored when EC2 lifecycle is off.
+    let lifecycle = CloudFaceEmbeddingLifecycleSettings.load()
+    let useEC2Lifecycle = lifecycle.useEC2Lifecycle
     CloudFaceEmbeddingSettings(
       enabled: cloudFaceEmbeddingEnabled,
-      endpoint: cloudFaceEmbeddingEndpointText,
-      apiKey: cloudFaceEmbeddingAPIKeyText
+      endpoint: useEC2Lifecycle ? "" : cloudFaceEmbeddingEndpointText,
+      apiKey: cloudFaceEmbeddingAPIKeyText.isEmpty ? CloudFaceEmbeddingLifecycleSettings.defaultAPIKey : cloudFaceEmbeddingAPIKeyText
+    ).save()
+    CloudFaceEmbeddingLifecycleSettings(
+      enabled: cloudFaceEmbeddingEnabled,
+      endpointOverride: useEC2Lifecycle ? "" : cloudFaceEmbeddingEndpointText,
+      apiKey: cloudFaceEmbeddingAPIKeyText.isEmpty ? CloudFaceEmbeddingLifecycleSettings.defaultAPIKey : cloudFaceEmbeddingAPIKeyText,
+      lambdaFunctionName: CloudFaceEmbeddingLifecycleSettings.defaultLambdaFunctionName,
+      workerPort: CloudFaceEmbeddingLifecycleSettings.defaultWorkerPort,
+      useEC2Lifecycle: useEC2Lifecycle,
+      stopOnStreamEnd: lifecycle.stopOnStreamEnd
     ).save()
     cloudFaceEmbeddingStatusText = cloudFaceEmbeddingEnabled
-      ? "Cloud AdaFace saved; restart app to apply"
+      ? "AWS AdaFace saved; starts with active or next stream"
       : "Cloud face embedding off"
-    AppLogger.log(.faceEmbeddingModel, "Cloud face embedding settings saved enabled=\(cloudFaceEmbeddingEnabled) endpoint=\(cloudFaceEmbeddingEndpointText) hasApiKey=\(!cloudFaceEmbeddingAPIKeyText.isEmpty)")
+    AppLogger.log(
+      .faceEmbeddingModel,
+      "Cloud face embedding settings saved enabled=\(cloudFaceEmbeddingEnabled) endpointOverride=\(cloudFaceEmbeddingEndpointText) hasApiKey=\(!cloudFaceEmbeddingAPIKeyText.isEmpty) useEC2Lifecycle=\(useEC2Lifecycle)"
+    )
+    guard livePhoneAudioSessionActive else { return }
+    if cloudFaceEmbeddingEnabled {
+      startCloudFaceWorkerForStream()
+    } else {
+      Task { await stopCloudFaceWorkerForStream(reason: "settingsChanged") }
+    }
+  }
+
+  func saveCloudSpeakerEmbeddingSettings() {
+    CloudSpeakerEmbeddingSettings(
+      enabled: cloudSpeakerEmbeddingEnabled,
+      endpoint: "",
+      apiKey: cloudSpeakerEmbeddingAPIKeyText,
+      lambdaFunctionName: CloudSpeakerEmbeddingSettings.defaultLambdaFunctionName,
+      workerPort: CloudSpeakerEmbeddingSettings.defaultWorkerPort,
+      useEC2Lifecycle: true,
+      stopOnStreamEnd: true
+    ).save()
+    cloudSpeakerEmbeddingStatusText = cloudSpeakerEmbeddingEnabled
+      ? "AWS canonical speaker saved; starts with active or next stream"
+      : "AWS canonical speaker embeddings off"
+    AppLogger.log(
+      .speakerEmbeddingModel,
+      "AWS live speaker settings saved enabled=\(cloudSpeakerEmbeddingEnabled) endpointOverride=\(cloudSpeakerEmbeddingEndpointText) hasApiKey=\(!cloudSpeakerEmbeddingAPIKeyText.isEmpty)"
+    )
+    guard livePhoneAudioSessionActive else { return }
+    if cloudSpeakerEmbeddingEnabled {
+      startCloudSpeakerWorkerForStream()
+    } else {
+      Task { await stopCloudSpeakerWorkerForStream(reason: "settingsChanged") }
+    }
   }
 
   private func recordSpeakerEvidenceIfNeeded(_ result: SpeakerProcessingResult) {
+    let now = Date()
+    if let wearerMatch = result.wearerSimilarity, wearerMatch.decision == .known {
+      appendConversationPartnerEvidence(ConversationPartnerEvidence(
+        source: .wearerVoice,
+        personId: nil,
+        displayName: "Me",
+        confidence: wearerMatch.bestSimilarity,
+        timestamp: now,
+        validUntil: now.addingTimeInterval(SpeakerIdentityConfig.holdIdentitySeconds),
+        details: "wearerVoice;\(wearerMatch.reason ?? "match")"
+      ))
+    }
+
+    if let diagnostic = result.iPhoneSimilarity,
+       let match = diagnostic.matchResult,
+       match.bestSimilarity >= SpeakerIdentityConfig.weakMatchThreshold {
+      appendConversationPartnerEvidence(ConversationPartnerEvidence(
+        source: .voiceLocal,
+        personId: match.bestPersonId,
+        displayName: result.activeIdentity.displayName,
+        confidence: match.bestSimilarity,
+        timestamp: now,
+        validUntil: now.addingTimeInterval(SpeakerIdentityConfig.holdIdentitySeconds),
+        details: "iPhone;\(match.reason ?? "\(match.decision)")"
+      ))
+    }
+
+    if let diagnostic = result.workerSimilarity,
+       let match = diagnostic.matchResult,
+       match.bestSimilarity >= SpeakerIdentityConfig.weakMatchThreshold {
+      appendConversationPartnerEvidence(ConversationPartnerEvidence(
+        source: .voiceAWS,
+        personId: match.bestPersonId,
+        displayName: result.activeIdentity.displayName,
+        confidence: match.bestSimilarity,
+        timestamp: now,
+        validUntil: now.addingTimeInterval(SpeakerIdentityConfig.holdIdentitySeconds),
+        details: "AWS;\(match.reason ?? "\(match.decision)")"
+      ))
+    }
+
+    refreshConversationPartnerState(now: now)
+
     guard let personId = result.activeIdentity.personId else { return }
     let confidence = max(result.activeIdentity.confidence, result.matchResult?.bestSimilarity ?? 0)
     guard confidence > 0 else { return }
     speakerEvidenceTimeline.append(TimedSpeakerEvidence(
-      timestamp: Date(),
+      timestamp: now,
       personId: personId,
       displayName: result.activeIdentity.displayName,
       confidence: confidence,
       state: result.activeIdentity.phase.rawValue
     ))
     speakerEvidenceTimeline = Array(speakerEvidenceTimeline.suffix(240))
+    refreshConversationPartnerState(now: now)
   }
 
-  private func recordFaceEvidenceIfNeeded() {
-    guard let personId = activeFacePersonId else { return }
-    guard activeFaceConfidence > 0 else { return }
+  private func recordFaceEvidenceIfNeeded(
+    personId: UUID?,
+    displayName: String?,
+    confidence: Float,
+    state: String,
+    detectedFaceCount: Int
+  ) {
+    let now = Date()
+    let faceSource: ConversationPartnerEvidence.Source = faceEmbeddingModelStatusText.localizedCaseInsensitiveContains("adaface")
+      ? .faceAWS
+      : .faceLocal
+    if confidence > 0 || detectedFaceCount > 1 {
+      appendConversationPartnerEvidence(ConversationPartnerEvidence(
+        source: faceSource,
+        personId: personId,
+        displayName: displayName,
+        confidence: confidence,
+        timestamp: now,
+        validUntil: now.addingTimeInterval(IdentityConfig.holdIdentitySeconds),
+        details: "state=\(state);faceCount=\(detectedFaceCount);model=\(safeEvidenceValue(faceEmbeddingModelStatusText))"
+      ))
+    }
+    if latestMouthMovementScore > 0 {
+      appendConversationPartnerEvidence(ConversationPartnerEvidence(
+        source: .mouthMovement,
+        personId: personId,
+        displayName: displayName,
+        confidence: latestMouthMovementScore,
+        timestamp: now,
+        validUntil: now.addingTimeInterval(1.5),
+        details: "mouthMovement"
+      ))
+    }
+
+    refreshConversationPartnerState(now: now)
+
+    guard let personId else { return }
+    guard confidence > 0 else { return }
     faceEvidenceTimeline.append(TimedFaceEvidence(
-      timestamp: Date(),
+      timestamp: now,
       personId: personId,
-      displayName: activeFaceName,
-      confidence: activeFaceConfidence,
-      state: activeFaceState,
+      displayName: displayName,
+      confidence: confidence,
+      state: state,
       mouthMovementScore: latestMouthMovementScore
     ))
     faceEvidenceTimeline = Array(faceEvidenceTimeline.suffix(240))
+  }
+
+  private func appendConversationPartnerEvidence(_ evidence: ConversationPartnerEvidence) {
+    conversationPartnerEvidence.append(evidence)
+    conversationPartnerEvidence = conversationPartnerEvidence
+      .filter { $0.validUntil >= evidence.timestamp.addingTimeInterval(-2) }
+      .suffix(320)
+      .map { $0 }
+    if let episode = presenceTracker.record(evidence: evidence, now: evidence.timestamp) {
+      persistPresenceEpisode(episode, reason: evidence.source.rawValue, now: evidence.timestamp)
+    }
+  }
+
+  private func persistPresenceEpisode(
+    _ episode: PersonPresenceEpisode,
+    reason: String,
+    now: Date = Date(),
+    force: Bool = false
+  ) {
+    guard let context = pipelineContext else { return }
+    let record = PresenceEpisodeRecord(episode: episode, context: context, updatedAt: now)
+    let signature = record.syncSignature
+    if !force,
+       record.status == .active,
+       let lastSavedAt = lastPresenceEpisodeSavedAt[record.id],
+       now.timeIntervalSince(lastSavedAt) < 5 {
+      return
+    }
+    guard force || lastSavedPresenceEpisodeSignatures[record.id] != signature else { return }
+    lastSavedPresenceEpisodeSignatures[record.id] = signature
+    lastPresenceEpisodeSavedAt[record.id] = now
+    Task { [identityPipeline] in
+      await identityPipeline.savePresenceEpisode(record)
+    }
+    AppLogger.log(
+      .database,
+      "\(context.logPrefix) presenceEpisode queued id=\(record.id.uuidString) status=\(record.status.rawValue) person=\(record.personId?.uuidString ?? "unknown") reason=\(reason)"
+    )
+  }
+
+  private func persistFinalPresenceEpisodes(reason: String) {
+    let now = Date()
+    let episodes = presenceTracker.closeAllActive(now: now, evidence: "streamEnded:\(reason)")
+    for episode in episodes {
+      persistPresenceEpisode(episode, reason: reason, now: now, force: true)
+    }
+    clearRetainedRecognizedIdentity(reason: "streamEnded-\(reason)")
+  }
+
+  private func refreshConversationPartnerState(now: Date = Date()) {
+    let state = conversationPartnerResolver.resolve(evidence: conversationPartnerEvidence, now: now)
+    activeConversationPartnerState = state
+    activeConversationPartnerStateText = state.phase.rawValue
+    activeConversationPartnerName = state.primary?.displayName
+      ?? state.primary?.personId?.uuidString
+      ?? {
+        switch state.phase {
+        case .none:
+          return "None"
+        case .unknown:
+          return "Unknown"
+        case .multiplePeople:
+          return "Multiple people"
+        case .conflicted:
+          return "Conflict"
+        case .possible:
+          return "Possible"
+        case .confirmed:
+          return "Confirmed"
+        }
+      }()
+    activeConversationPartnerConfidenceText = String(format: "%.2f", Double(state.primary?.score ?? 0))
+    activeConversationPartnerEvidenceText = state.sourceSummary
+    if state.phase == .confirmed, let personId = state.primary?.personId {
+      refreshPersonConversationSummaryForCurrentStreamIfNeeded(personId: personId)
+    }
+    conversationPartnerTimeline.append(TimedConversationPartnerState(timestamp: now, state: state))
+    conversationPartnerTimeline = conversationPartnerTimeline
+      .filter { now.timeIntervalSince($0.timestamp) <= 120 }
+      .suffix(240)
+      .map { $0 }
   }
 
   private func finalizeConversationTranscriptAfterStream(reason: String) async {
@@ -2085,6 +6322,247 @@ final class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  private func scheduleLatestStreamSummary(reason: String) async {
+    let endedAt = Date()
+    let chunks = await identityPipeline.currentConversationTranscriptChunks()
+      .filter { $0.isFinal && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    let sceneContexts = await identityPipeline.currentConversationSceneContexts()
+    let conversationSessionId = pipelineContext?.conversationSessionId
+    guard !chunks.isEmpty || !sceneContexts.isEmpty else {
+      let startedAt = streamAudioStart ?? endedAt
+      let analysis = StreamSummaryAnalysis(
+        summary: "No transcript or scene context was captured for the latest stream.",
+        who: "unknown",
+        whereText: "unknown",
+        what: "No transcript or scene context captured",
+        whenText: endedAt.formatted(date: .numeric, time: .shortened),
+        why: "unknown",
+        how: "unknown",
+        people: [],
+        keyMoments: [],
+        outline: ["No transcript was captured", "No multimodal scene context was saved"],
+        confidence: 0
+      )
+      latestStreamSummaryTimeText = endedAt.formatted(date: .omitted, time: .shortened)
+      latestStreamSummaryText = analysis.summary
+      latestStreamSummaryStatusText = "Stream summary skipped"
+      recordStreamSummaryHistory(
+        analysis,
+        conversationSessionId: conversationSessionId,
+        startedAt: startedAt,
+        endedAt: endedAt,
+        modelName: "local",
+        statusText: latestStreamSummaryStatusText
+      )
+      AppLogger.log(.sceneContext, "Stream summary final source=local reason=\(reason) fallbackReason=noContent chunks=0 contexts=0 status=skipped")
+      return
+    }
+
+    let settings = SceneContextSettings.load()
+    let summaryModel = settings.textModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      ? SceneContextSettings.defaultTextModel
+      : settings.textModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    let startedAt = streamAudioStart
+      ?? chunks.compactMap(\.startedAt).min()
+      ?? sceneContexts.map(\.startedAt).min()
+      ?? endedAt
+    let attribution = currentTranscriptAttribution()
+    let identityEvidence = currentSceneContextIdentityEvidence(attribution: attribution)
+    let request = StreamSummaryRequest(
+      transcripts: chunks,
+      sceneContexts: sceneContexts,
+      startedAt: startedAt,
+      endedAt: endedAt,
+      identityEvidence: identityEvidence
+    )
+    latestStreamSummaryTask?.cancel()
+    latestStreamSummaryTimeText = endedAt.formatted(date: .omitted, time: .shortened)
+    latestStreamSummaryText = "Summarizing latest stream..."
+    let aiProxyConfigured = SupabaseEdgeFunctionClient.isConfigured()
+    latestStreamSummaryStatusText = aiProxyConfigured
+      ? "Alibaba summary proxy: \(summaryModel)"
+      : settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ? "Alibaba summary key missing"
+        : "Alibaba summarizing: \(summaryModel)"
+    AppLogger.log(
+      .sceneContext,
+      "Stream summary requested reason=\(reason) source=alibaba model=\(summaryModel) chunks=\(chunks.count) contexts=\(sceneContexts.count) proxy=\(aiProxyConfigured)"
+    )
+
+    latestStreamSummaryTask = Task { @MainActor [weak self, request, settings, reason, conversationSessionId, startedAt, identityEvidence, summaryModel] in
+      guard let self else { return }
+      do {
+        let analysis = try await SceneContextClient(settings: settings).summarizeStreamLongSafe(request)
+        guard !Task.isCancelled else { return }
+        self.latestStreamSummaryText = analysis.summary
+        self.latestStreamSummaryStatusText = "Alibaba summary ready: \(summaryModel)"
+        self.recordStreamSummaryHistory(
+          analysis,
+          conversationSessionId: conversationSessionId,
+          startedAt: startedAt,
+          endedAt: request.endedAt,
+          modelName: summaryModel,
+          statusText: self.latestStreamSummaryStatusText
+        )
+        AppLogger.log(
+          .sceneContext,
+          "Stream summary final source=alibaba reason=\(reason) model=\(summaryModel) chunks=\(request.transcripts.count) contexts=\(request.sceneContexts.count) summaryChars=\(analysis.summary.count) confidence=\(String(format: "%.2f", analysis.confidence)) people=\(analysis.people.joined(separator: ","))"
+        )
+      } catch is CancellationError {
+        return
+      } catch {
+        guard !Task.isCancelled else { return }
+        let fallbackReason = SceneContextClient.streamSummaryFallbackReason(for: error)
+        let fallback = Self.localLatestStreamSummaryAnalysis(
+          transcripts: request.transcripts,
+          sceneContexts: request.sceneContexts,
+          startedAt: startedAt,
+          endedAt: request.endedAt,
+          identityEvidence: identityEvidence
+        )
+        self.latestStreamSummaryText = fallback.summary
+        self.latestStreamSummaryStatusText = "Alibaba summary failed; local summary shown"
+        self.recordStreamSummaryHistory(
+          fallback,
+          conversationSessionId: conversationSessionId,
+          startedAt: startedAt,
+          endedAt: request.endedAt,
+          modelName: "local",
+          statusText: self.latestStreamSummaryStatusText
+        )
+        AppLogger.log(
+          .sceneContext,
+          "Stream summary final source=local reason=\(reason) alibabaModel=\(summaryModel) fallbackReason=\"\(fallbackReason)\" chunks=\(request.transcripts.count) contexts=\(request.sceneContexts.count) summaryChars=\(fallback.summary.count)"
+        )
+      }
+    }
+  }
+
+  private func recordStreamSummaryHistory(
+    _ analysis: StreamSummaryAnalysis,
+    conversationSessionId: UUID?,
+    startedAt: Date,
+    endedAt: Date,
+    modelName: String,
+    statusText: String
+  ) {
+    let entry = StreamSummaryHistoryEntry(
+      conversationSessionId: conversationSessionId,
+      startedAt: startedAt,
+      endedAt: endedAt,
+      analysis: analysis,
+      modelName: modelName,
+      statusText: statusText
+    )
+    var entries = StreamSummaryHistoryStore.load()
+    if let conversationSessionId {
+      entries.removeAll { $0.conversationSessionId == conversationSessionId }
+    } else {
+      entries.removeAll {
+        abs($0.endedAt.timeIntervalSince(endedAt)) < 1
+          && $0.summary == analysis.summary
+      }
+    }
+    entries.insert(entry, at: 0)
+    StreamSummaryHistoryStore.save(entries)
+    streamSummaryHistory = StreamSummaryHistoryStore.load()
+  }
+
+  private static func localLatestStreamSummaryAnalysis(
+    transcripts: [TranscriptChunk],
+    sceneContexts: [SceneContextRecord],
+    startedAt: Date,
+    endedAt: Date,
+    identityEvidence: SceneContextIdentityEvidence?
+  ) -> StreamSummaryAnalysis {
+    let latestContext = sceneContexts.sorted(by: { $0.createdAt > $1.createdAt }).first
+    let text = transcripts
+      .sorted { ($0.startedAt ?? $0.createdAt) < ($1.startedAt ?? $1.createdAt) }
+      .map(\.text)
+      .joined(separator: " ")
+      .split(whereSeparator: \.isWhitespace)
+      .joined(separator: " ")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let people = uniqueDisplayStrings(
+      (identityEvidence?.activePeople.map(\.displayName) ?? [])
+        + (identityEvidence?.conversationPartnerName.map { [$0] } ?? [])
+        + sceneContexts.flatMap { context in
+          context.who
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+    )
+    let summary: String
+    if let context = latestContext,
+       !context.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      summary = truncated(context.summary, maxLength: 220)
+    } else if !text.isEmpty {
+      summary = truncated(text, maxLength: 220)
+    } else {
+      summary = "No usable latest-stream content was captured."
+    }
+    let who = people.isEmpty ? latestContext?.who ?? "unknown" : people.joined(separator: ", ")
+    let whereText = semanticWhereText(latestContext?.whereText)
+    let what = latestContext?.what ?? (text.isEmpty ? "unknown" : truncated(text, maxLength: 120))
+    let whenText = "\(startedAt.formatted(date: .numeric, time: .shortened)) to \(endedAt.formatted(date: .numeric, time: .shortened))"
+    let why = latestContext?.why ?? "unknown"
+    let how = latestContext?.how ?? "unknown"
+    let keyMoments = sceneContexts
+      .sorted { $0.createdAt < $1.createdAt }
+      .map { truncated($0.summary, maxLength: 96) }
+      .filter { !$0.isEmpty }
+    let outline = [
+      "Who: \(who)",
+      "Where: \(whereText)",
+      "What: \(what)"
+    ].filter { !$0.hasSuffix(": unknown") }
+    return StreamSummaryAnalysis(
+      summary: summary,
+      who: who,
+      whereText: whereText,
+      what: what,
+      whenText: whenText,
+      why: why,
+      how: how,
+      people: people,
+      keyMoments: Array(keyMoments.prefix(4)),
+      outline: outline,
+      confidence: latestContext?.confidence ?? (text.isEmpty ? 0 : 0.35)
+    )
+  }
+
+  nonisolated private static func uniqueDisplayStrings(_ values: [String]) -> [String] {
+    var seen: Set<String> = []
+    var output: [String] = []
+    let ignoredValues: Set<String> = [
+      "none",
+      "unknown",
+      "unknown person",
+      "confirmed",
+      "possible",
+      "conflict",
+      "multiple people"
+    ]
+    for value in values {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty, !ignoredValues.contains(trimmed.lowercased()) else { continue }
+      let key = trimmed.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current).lowercased()
+      guard seen.insert(key).inserted else { continue }
+      output.append(trimmed)
+    }
+    return output
+  }
+
+  private static func semanticWhereText(_ value: String?) -> String {
+    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !trimmed.isEmpty else { return "unknown" }
+    let lower = trimmed.lowercased()
+    if lower.contains("lat ") || lower.contains("lon ") || lower.contains("location ") {
+      return "unknown"
+    }
+    return truncated(trimmed, maxLength: 96)
+  }
+
   private func pendingPostSessionAttribution() -> TranscriptAttribution {
     TranscriptAttribution(
       personId: nil,
@@ -2099,7 +6577,14 @@ final class StreamSessionViewModel: ObservableObject {
     _ chunk: TranscriptChunk,
     speakerSegments: [SpeakerDiarizationSegmentSnapshot]
   ) -> TranscriptAttribution {
-    if let diarized = diarizationAttributionForEndedChunk(chunk, speakerSegments: speakerSegments) {
+    let diarized = diarizationAttributionForEndedChunk(chunk, speakerSegments: speakerSegments)
+    if let diarized, diarized.personId != nil {
+      return diarized
+    }
+    if let partner = partnerAttributionForEndedChunk(chunk) {
+      return partner
+    }
+    if let diarized {
       return diarized
     }
 
@@ -2134,12 +6619,12 @@ final class StreamSessionViewModel: ObservableObject {
 
     if let voice, voice.evidence.confidence >= SpeakerIdentityConfig.weakMatchThreshold {
       var confidence = voice.evidence.confidence
-      var evidenceText = "postFusion:voice=\(String(format: "%.2f", voice.evidence.confidence));voiceDt=\(String(format: "%.1f", voice.distance))"
+      var evidenceText = "postFusion:voice=\(String(format: "%.2f", Double(voice.evidence.confidence)));voiceDt=\(String(format: "%.1f", Double(voice.distance)))"
       if let face, face.evidence.personId == voice.evidence.personId {
         confidence = min(1, (voice.evidence.confidence * 0.65) + (face.evidence.confidence * 0.25) + (face.evidence.mouthMovementScore * 0.10))
-        evidenceText += ";face=\(String(format: "%.2f", face.evidence.confidence));mouth=\(String(format: "%.2f", face.evidence.mouthMovementScore));faceDt=\(String(format: "%.1f", face.distance))"
+        evidenceText += ";face=\(String(format: "%.2f", Double(face.evidence.confidence)));mouth=\(String(format: "%.2f", Double(face.evidence.mouthMovementScore)));faceDt=\(String(format: "%.1f", Double(face.distance)))"
       } else if let face {
-        evidenceText += ";faceDisagrees=\(String(format: "%.2f", face.evidence.confidence));mouth=\(String(format: "%.2f", face.evidence.mouthMovementScore));faceDt=\(String(format: "%.1f", face.distance))"
+        evidenceText += ";faceDisagrees=\(String(format: "%.2f", Double(face.evidence.confidence)));mouth=\(String(format: "%.2f", Double(face.evidence.mouthMovementScore)));faceDt=\(String(format: "%.1f", Double(face.distance)))"
       }
       return TranscriptAttribution(
         personId: voice.evidence.personId,
@@ -2157,7 +6642,7 @@ final class StreamSessionViewModel: ObservableObject {
         displayName: face.evidence.displayName ?? displayNamesById[face.evidence.personId],
         confidence: confidence,
         state: "postFusedFaceMouth",
-        sourceEvidence: "postFusion:face=\(String(format: "%.2f", face.evidence.confidence));mouth=\(String(format: "%.2f", face.evidence.mouthMovementScore));faceDt=\(String(format: "%.1f", face.distance));voice=none"
+        sourceEvidence: "postFusion:face=\(String(format: "%.2f", Double(face.evidence.confidence)));mouth=\(String(format: "%.2f", Double(face.evidence.mouthMovementScore)));faceDt=\(String(format: "%.1f", Double(face.distance)));voice=none"
       )
     }
 
@@ -2166,7 +6651,7 @@ final class StreamSessionViewModel: ObservableObject {
       displayName: nil,
       confidence: 0,
       state: "unknown",
-      sourceEvidence: "postFusion:unknown;voice=\(voice.map { String(format: "%.2f", $0.evidence.confidence) } ?? "none");face=\(face.map { String(format: "%.2f", $0.evidence.confidence) } ?? "none");mouth=\(face.map { String(format: "%.2f", $0.evidence.mouthMovementScore) } ?? "none")"
+      sourceEvidence: "postFusion:unknown;voice=\(voice.map { String(format: "%.2f", Double($0.evidence.confidence)) } ?? "none");face=\(face.map { String(format: "%.2f", Double($0.evidence.confidence)) } ?? "none");mouth=\(face.map { String(format: "%.2f", Double($0.evidence.mouthMovementScore)) } ?? "none")"
     )
   }
 
@@ -2194,7 +6679,7 @@ final class StreamSessionViewModel: ObservableObject {
     guard let best, best.overlap > 0 || best.distance <= 8 else { return nil }
     let speakerName = best.segment.speakerName
     let state = best.segment.personId == nil ? "diarizedSpeaker" : "diarizedKnown"
-    let evidence = "\(best.segment.source);speakerLabel=\(safeEvidenceValue(speakerName));overlap=\(String(format: "%.2f", best.overlap));distance=\(String(format: "%.2f", best.distance))"
+    let evidence = "\(best.segment.source);speakerLabel=\(safeEvidenceValue(speakerName));overlap=\(String(format: "%.2f", Double(best.overlap)));distance=\(String(format: "%.2f", Double(best.distance)))"
     return TranscriptAttribution(
       personId: best.segment.personId,
       displayName: speakerName,
@@ -2208,6 +6693,47 @@ final class StreamSessionViewModel: ObservableObject {
     value.replacingOccurrences(of: ";", with: ",")
   }
 
+  private func partnerAttributionForEndedChunk(_ chunk: TranscriptChunk) -> TranscriptAttribution? {
+    guard !conversationPartnerTimeline.isEmpty else { return nil }
+    let chunkStart = chunk.startedAt ?? chunk.createdAt
+    let rawEnd = chunk.endedAt ?? chunk.transcriptUpdatedAt
+    let chunkEnd = max(rawEnd, chunkStart.addingTimeInterval(0.25))
+    let chunkMid = Date(timeIntervalSince1970: (chunkStart.timeIntervalSince1970 + chunkEnd.timeIntervalSince1970) / 2)
+    guard let best = conversationPartnerTimeline
+      .map({ snapshot in
+        (snapshot: snapshot, distance: abs(snapshot.timestamp.timeIntervalSince(chunkMid)))
+      })
+      .filter({ $0.distance <= 8 })
+      .min(by: { $0.distance < $1.distance }) else {
+      return nil
+    }
+
+    let state = best.snapshot.state
+    let evidence = "partnerResolver:\(safeEvidenceValue(state.sourceSummary));dt=\(String(format: "%.1f", Double(best.distance)))"
+    switch state.phase {
+    case .confirmed, .possible:
+      guard let primary = state.primary else { return nil }
+      let displayName = primary.personId == nil ? nil : primary.displayName
+      return TranscriptAttribution(
+        personId: primary.personId,
+        displayName: displayName,
+        confidence: primary.score,
+        state: state.attributionState,
+        sourceEvidence: evidence
+      )
+    case .conflicted, .multiplePeople:
+      return TranscriptAttribution(
+        personId: nil,
+        displayName: nil,
+        confidence: 0,
+        state: state.attributionState,
+        sourceEvidence: evidence
+      )
+    case .none, .unknown:
+      return nil
+    }
+  }
+
   // MARK: - Cloud diarization
 
   private func recordSpeakerTimelineEntry(personId: UUID?, displayName: String?) {
@@ -2216,44 +6742,112 @@ final class StreamSessionViewModel: ObservableObject {
     speakerTimeline.append(SpeakerTimelineEntry(timestamp: Date(), personId: personId, displayName: displayName))
   }
 
-  private func submitCloudDiarizationJob(audioURL: URL, streamStart: Date,
-                                          speakerTimeline: [SpeakerTimelineEntry],
-                                          faceEvidenceTimeline: [TimedFaceEvidence],
-                                          pipelineContext: PipelineContext?) async {
-    cloudDiarizationState = .uploading
+  nonisolated private static func runCloudDiarizationJob(
+    audioURL: URL,
+    streamStart: Date,
+    speakerTimeline: [SpeakerTimelineEntry],
+    speakerEvidenceTimeline: [TimedSpeakerEvidence],
+    faceEvidenceTimeline: [TimedFaceEvidence],
+    pipelineContext: PipelineContext?,
+    cloudDiarizationService: CloudDiarizationService,
+    identityPipeline: IdentityPipeline
+  ) async throws -> CloudDiarizationProcessingOutput? {
+    guard let audioSeconds = Self.audioDurationSeconds(audioURL) else {
+      AppLogger.log(.audio, "[CloudDiarization] Skipping AWS job because recorded audio duration could not be read file=\(audioURL.lastPathComponent)")
+      return nil
+    }
+    guard audioSeconds >= CloudDiarizationTuning.minimumAudioSeconds else {
+      AppLogger.log(
+        .audio,
+        "[CloudDiarization] Skipping AWS job because audio is shorter than \(String(format: "%.1f", Double(CloudDiarizationTuning.minimumAudioSeconds)))s seconds=\(String(format: "%.2f", Double(audioSeconds))) file=\(audioURL.lastPathComponent)"
+      )
+      return nil
+    }
+
+    let result = try await cloudDiarizationService.submitJob(
+      audioFileURL: audioURL,
+      streamStart: streamStart,
+      conversationSessionId: pipelineContext?.conversationSessionId
+    )
+    guard !Task.isCancelled else { throw CancellationError() }
+    return try await Self.processDiarizationResult(
+      result,
+      audioURL: audioURL,
+      streamStart: streamStart,
+      speakerTimeline: speakerTimeline,
+      speakerEvidenceTimeline: speakerEvidenceTimeline,
+      faceEvidenceTimeline: faceEvidenceTimeline,
+      pipelineContext: pipelineContext,
+      cloudDiarizationService: cloudDiarizationService,
+      identityPipeline: identityPipeline
+    )
+  }
+
+  nonisolated private static func audioDurationSeconds(_ url: URL) -> Double? {
     do {
-      let result = try await cloudDiarizationService.submitJob(audioFileURL: audioURL, streamStart: streamStart)
-      cloudDiarizationState = .processing
-      await applyDiarizationResult(result, streamStart: streamStart,
-                                   speakerTimeline: speakerTimeline,
-                                   faceEvidenceTimeline: faceEvidenceTimeline,
-                                   pipelineContext: pipelineContext)
-      try? FileManager.default.removeItem(at: audioURL)
-      cloudDiarizationState = .done
+      let file = try AVAudioFile(forReading: url)
+      let sampleRate = file.processingFormat.sampleRate
+      guard sampleRate > 0 else { return nil }
+      return Double(file.length) / sampleRate
     } catch {
-      AppLogger.log(.audio, "[CloudDiarization] Job failed: \(error.localizedDescription)")
-      try? FileManager.default.removeItem(at: audioURL)
-      cloudDiarizationState = .failed(error.localizedDescription)
+      AppLogger.log(.audio, "[CloudDiarization] Could not inspect audio duration: \(error.localizedDescription)")
+      return nil
     }
   }
 
-  private func applyDiarizationResult(_ result: DiarizenResult, streamStart: Date,
-                                       speakerTimeline: [SpeakerTimelineEntry],
-                                       faceEvidenceTimeline: [TimedFaceEvidence],
-                                       pipelineContext: PipelineContext?) async {
-    guard let ctx = pipelineContext, let sessionId = ctx.conversationSessionId else { return }
+  nonisolated private static func processDiarizationResult(
+    _ result: DiarizenResult,
+    audioURL: URL,
+    streamStart: Date,
+    speakerTimeline: [SpeakerTimelineEntry],
+    speakerEvidenceTimeline: [TimedSpeakerEvidence],
+    faceEvidenceTimeline: [TimedFaceEvidence],
+    pipelineContext: PipelineContext?,
+    cloudDiarizationService: CloudDiarizationService,
+    identityPipeline: IdentityPipeline
+  ) async throws -> CloudDiarizationProcessingOutput? {
+    guard let ctx = pipelineContext, let sessionId = ctx.conversationSessionId else { return nil }
 
-    // Build a lookup: given time offset (seconds from streamStart), find the confirmed person
-    func personId(forOffset offset: Double) -> (UUID?, String?) {
-      let ts = streamStart.addingTimeInterval(offset)
-      // Walk the timeline backwards from the segment midpoint
-      for entry in speakerTimeline.reversed() {
-        if entry.timestamp <= ts { return (entry.personId, entry.displayName) }
+    // Build a bounded lookup: given a diarized segment, find a nearby confirmed
+    // speaker/person without letting an old identity bleed across later speakers.
+    func attribution(for segment: DiarizenSegment) -> (personId: UUID?, displayName: String?, source: String) {
+      let midpoint = (segment.start + segment.end) / 2
+      let ts = streamStart.addingTimeInterval(midpoint)
+
+      let speakerCandidates: [(evidence: TimedSpeakerEvidence, distance: TimeInterval)] = speakerEvidenceTimeline.compactMap { evidence in
+        let distance = abs(evidence.timestamp.timeIntervalSince(ts))
+        guard distance <= CloudDiarizationTuning.maxSpeakerEvidenceAge else { return nil }
+        return (evidence: evidence, distance: distance)
       }
+      if let voice = speakerCandidates.max(by: { lhs, rhs in
+        let lhsScore = lhs.evidence.confidence - Float(lhs.distance * 0.025)
+        let rhsScore = rhs.evidence.confidence - Float(rhs.distance * 0.025)
+        return lhsScore < rhsScore
+      }) {
+        return (
+          voice.evidence.personId,
+          voice.evidence.displayName,
+          "speakerEvidence distance=\(String(format: "%.1f", Double(voice.distance))) confidence=\(String(format: "%.3f", Double(voice.evidence.confidence)))"
+        )
+      }
+
+      // The legacy timeline also receives face/user-confirmation entries. Keep it
+      // useful for immediate confirmations, but never let it carry indefinitely.
+      for entry in speakerTimeline.reversed() {
+        let age = ts.timeIntervalSince(entry.timestamp)
+        guard age >= 0 else { continue }
+        guard age <= CloudDiarizationTuning.maxTimelineEvidenceAge else { break }
+        return (
+          entry.personId,
+          entry.displayName,
+          "recentTimeline age=\(String(format: "%.1f", Double(age)))"
+        )
+      }
+
       let face = faceEvidenceTimeline
         .filter {
           $0.confidence >= IdentityConfig.weakMatchThreshold
-            && abs($0.timestamp.timeIntervalSince(ts)) <= 12
+            && abs($0.timestamp.timeIntervalSince(ts)) <= CloudDiarizationTuning.maxFaceEvidenceAge
         }
         .max { lhs, rhs in
           let lhsScore = lhs.confidence - Float(abs(lhs.timestamp.timeIntervalSince(ts)) * 0.02)
@@ -2261,23 +6855,37 @@ final class StreamSessionViewModel: ObservableObject {
           return lhsScore < rhsScore
         }
       if let face {
-        return (face.personId, face.displayName)
+        let distance = abs(face.timestamp.timeIntervalSince(ts))
+        return (
+          face.personId,
+          face.displayName,
+          "faceEvidence distance=\(String(format: "%.1f", Double(distance))) confidence=\(String(format: "%.3f", Double(face.confidence)))"
+        )
       }
-      return (nil, nil)
+      return (nil, nil, "unresolved")
     }
 
     // Group unknown speakers for enrollment prompt
     var unknownSpeakers: [Int: UnknownDiarizationSpeaker] = [:]
+    var unknownPreviewCandidates: [Int: [DiarizenSegment]] = [:]
     var savedChunkCount = 0
     var attributedPersonIds: Set<UUID> = []
 
     for segment in result.segments where !segment.text.isEmpty {
+      guard !Task.isCancelled else { throw CancellationError() }
       let segStart = streamStart.addingTimeInterval(segment.start)
       let segEnd   = streamStart.addingTimeInterval(segment.end)
-      let (resolvedPersonId, resolvedName) = personId(forOffset: (segment.start + segment.end) / 2)
+      let resolved = attribution(for: segment)
+      let resolvedPersonId = resolved.personId
+      let resolvedName = resolved.displayName
       if let resolvedPersonId {
         attributedPersonIds.insert(resolvedPersonId)
       }
+      let dur = max(0, segment.end - segment.start)
+      AppLogger.log(
+        .speakerEnrollment,
+        "[CloudDiarization] segment speaker=\(segment.speakerIndex) seconds=\(String(format: "%.2f", Double(dur))) textLen=\(segment.text.count) attributed=\(resolvedPersonId?.uuidString ?? "unknown") name=\"\(resolvedName ?? "unknown")\" source=\(resolved.source)"
+      )
 
       let chunk = TranscriptChunk(
         id: UUID(),
@@ -2301,7 +6909,18 @@ final class StreamSessionViewModel: ObservableObject {
       // Track unknown speakers
       if resolvedPersonId == nil {
         let idx = segment.speakerIndex
-        let dur = segment.end - segment.start
+        if dur >= CloudDiarizationTuning.minSpeakerEnrollmentPreviewSeconds {
+          unknownPreviewCandidates[idx, default: []].append(segment)
+          AppLogger.log(
+            .speakerEnrollment,
+            "[CloudDiarization] preview candidate accepted speaker=\(idx) seconds=\(String(format: "%.2f", Double(dur))) fallback=\(dur < SpeakerIdentityConfig.minSpeechSecondsForEmbedding)"
+          )
+        } else {
+          AppLogger.log(
+            .speakerEnrollment,
+            "[CloudDiarization] preview candidate skipped speaker=\(idx) reason=tooShort seconds=\(String(format: "%.2f", Double(dur))) minSeconds=\(String(format: "%.1f", Double(CloudDiarizationTuning.minSpeakerEnrollmentPreviewSeconds)))"
+          )
+        }
         if unknownSpeakers[idx] == nil {
           unknownSpeakers[idx] = UnknownDiarizationSpeaker(
             id: "Speaker \(idx)",
@@ -2325,24 +6944,226 @@ final class StreamSessionViewModel: ObservableObject {
       }
     }
 
-    AppLogger.log(.audio, "[CloudDiarization] Saved \(savedChunkCount) transcript chunks, \(unknownSpeakers.count) unknown speakers")
-    invalidateAndRefreshConversationSummaries(for: attributedPersonIds, reason: "cloudDiarizationSavedChunks")
-
-    // Refresh dictionary and publish unknown speakers
-    let entries = await identityPipeline.loadPeopleForDictionary()
-    await MainActor.run { self.peopleDictionaryEntries = entries }
-    let unknownList = unknownSpeakers.values.sorted { $0.speakerIndex < $1.speakerIndex }
-    unknownDiarizationSpeakers = unknownList
+    AppLogger.log(.speakerEnrollment, "[CloudDiarization] Saved \(savedChunkCount) transcript chunks, \(unknownSpeakers.count) unknown speakers")
+    AppLogger.log(
+      .speakerEnrollment,
+      "[CloudDiarization] result clusters=\(result.speakerCount) segments=\(result.segments.count) savedChunks=\(savedChunkCount) unknownSpeakers=\(unknownSpeakers.count) attributedPeople=\(attributedPersonIds.count)"
+    )
+    await identityPipeline.reconcileSceneContextsForConversation(sessionId: sessionId)
+    var unknownList = unknownSpeakers.values.sorted { $0.speakerIndex < $1.speakerIndex }
 
     // Pre-fetch speaker clip data for enrollment UI
     for speaker in unknownList {
-      guard let key = speaker.clipS3Key else { continue }
-      if let data = try? await cloudDiarizationService.downloadSpeakerClip(s3Key: key) {
-        if let idx = unknownDiarizationSpeakers.firstIndex(where: { $0.speakerIndex == speaker.speakerIndex }) {
-          unknownDiarizationSpeakers[idx].clipData = data
+      let workerClipData: Data?
+      if let clipS3Key = speaker.clipS3Key {
+        do {
+          let downloaded = try await cloudDiarizationService.downloadSpeakerClip(s3Key: clipS3Key)
+          workerClipData = Self.makeNormalizedSpeakerPreviewClip(
+            fromWAVData: downloaded,
+            speakerIndex: speaker.speakerIndex,
+            source: "s3"
+          )
+          if workerClipData == nil {
+            AppLogger.log(
+              .speakerEnrollment,
+              "[CloudDiarization] worker preview clip unusable speaker=\(speaker.speakerIndex) key=\(clipS3Key) bytes=\(downloaded.count)"
+            )
+          }
+        } catch {
+          workerClipData = nil
+          AppLogger.log(
+            .speakerEnrollment,
+            "[CloudDiarization] worker preview download failed speaker=\(speaker.speakerIndex) key=\(clipS3Key) error=\(error.localizedDescription)"
+          )
         }
+      } else {
+        workerClipData = nil
+      }
+
+      let fallbackSegment = Self.preferredUnknownSpeakerPreviewSegment(unknownPreviewCandidates[speaker.speakerIndex] ?? [])
+      let fallbackClipData = workerClipData == nil
+        ? fallbackSegment.flatMap { Self.makeSingleSpeakerPreviewClip(audioURL: audioURL, segment: $0) }
+        : nil
+
+      if let data = workerClipData ?? fallbackClipData {
+        if let idx = unknownList.firstIndex(where: { $0.speakerIndex == speaker.speakerIndex }) {
+          unknownList[idx].clipData = data
+        }
+        AppLogger.log(
+          .speakerEnrollment,
+          "[CloudDiarization] preview ready speaker=\(speaker.speakerIndex) source=\(workerClipData == nil ? "localSegment" : "workerClip") bytes=\(data.count) segmentSeconds=\(fallbackSegment.map { String(format: "%.2f", Double($0.end - $0.start)) } ?? "n/a")"
+        )
+      } else {
+        AppLogger.log(
+          .speakerEnrollment,
+          "[CloudDiarization] No playable preview clip for Speaker\(speaker.speakerIndex); prompt suppressed until a >=\(String(format: "%.1f", Double(CloudDiarizationTuning.minSpeakerEnrollmentPreviewSeconds)))s single segment is available"
+        )
+        AppLogger.log(
+          .speakerEnrollment,
+          "[CloudDiarization] preview unavailable speaker=\(speaker.speakerIndex) reason=noPlayableSingleSpeakerSegment candidates=\(unknownPreviewCandidates[speaker.speakerIndex]?.count ?? 0) minSeconds=\(String(format: "%.1f", Double(CloudDiarizationTuning.minSpeakerEnrollmentPreviewSeconds)))"
+        )
       }
     }
+
+    return CloudDiarizationProcessingOutput(
+      savedChunkCount: savedChunkCount,
+      unknownSpeakers: unknownList,
+      attributedPersonIds: attributedPersonIds
+    )
+  }
+
+  nonisolated static func preferredUnknownSpeakerPreviewSegment(_ segments: [DiarizenSegment]) -> DiarizenSegment? {
+    let usable = segments.filter {
+      max(0, $0.end - $0.start) >= CloudDiarizationTuning.minSpeakerEnrollmentPreviewSeconds
+    }
+    guard !usable.isEmpty else { return nil }
+    let embeddingLength = usable.filter {
+      max(0, $0.end - $0.start) >= SpeakerIdentityConfig.minSpeechSecondsForEmbedding
+    }
+    let candidates = embeddingLength.isEmpty ? usable : embeddingLength
+    return candidates.max { lhs, rhs in
+      (lhs.end - lhs.start) < (rhs.end - rhs.start)
+    }
+  }
+
+  nonisolated private static func makeSingleSpeakerPreviewClip(audioURL: URL, segment: DiarizenSegment) -> Data? {
+    do {
+      let source = try AVAudioFile(forReading: audioURL)
+      let format = source.processingFormat
+      let sampleRate = format.sampleRate
+      guard sampleRate > 0, format.channelCount == 1 else {
+        AppLogger.log(.speakerEnrollment, "[CloudDiarization] preview clip rejected unsupported format=\(format)")
+        return nil
+      }
+
+      let maxSeconds = SpeakerIdentityConfig.maxSpeechBufferSeconds
+      let segmentDuration = max(0, segment.end - segment.start)
+      guard segmentDuration >= CloudDiarizationTuning.minSpeakerEnrollmentPreviewSeconds else { return nil }
+      let clipDuration = min(maxSeconds, segmentDuration)
+      let clipStart = segment.start + max(0, (segmentDuration - clipDuration) / 2)
+      let startFrame = max(0, AVAudioFramePosition((clipStart * sampleRate).rounded(.down)))
+      let frameCount = min(
+        AVAudioFrameCount((clipDuration * sampleRate).rounded(.down)),
+        AVAudioFrameCount(max(0, source.length - startFrame))
+      )
+      guard frameCount > 0 else { return nil }
+
+      source.framePosition = startFrame
+      guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
+      try source.read(into: buffer, frameCount: frameCount)
+      guard buffer.frameLength > 0 else { return nil }
+
+      let boosted = try Self.normalizedMonoInt16Buffer(from: buffer)
+      let stats = Self.int16Stats(boosted)
+      guard stats.rms >= 300, stats.peak >= 1200 else {
+        AppLogger.log(
+          .speakerEnrollment,
+          "[CloudDiarization] preview clip rejected as too quiet speaker=\(segment.speakerIndex) rms=\(String(format: "%.0f", Double(stats.rms))) peak=\(stats.peak)"
+        )
+        return nil
+      }
+
+      let data = try MonoPCM16WAVData.make(samples: boosted, sampleRate: sampleRate)
+      AppLogger.log(
+        .speakerEnrollment,
+        "[CloudDiarization] prepared single-speaker preview speaker=\(segment.speakerIndex) seconds=\(String(format: "%.2f", Double(boosted.count) / sampleRate)) rms=\(String(format: "%.0f", Double(stats.rms))) peak=\(stats.peak)"
+      )
+      return data
+    } catch {
+      AppLogger.log(.speakerEnrollment, "[CloudDiarization] preview clip creation failed speaker=\(segment.speakerIndex): \(error.localizedDescription)")
+      return nil
+    }
+  }
+
+  nonisolated private static func makeNormalizedSpeakerPreviewClip(
+    fromWAVData data: Data,
+    speakerIndex: Int,
+    source: String
+  ) -> Data? {
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("diarizen-speaker-preview-\(UUID().uuidString).wav")
+    do {
+      try data.write(to: url, options: .atomic)
+      defer { try? FileManager.default.removeItem(at: url) }
+
+      let sourceFile = try AVAudioFile(forReading: url)
+      let format = sourceFile.processingFormat
+      let sampleRate = format.sampleRate
+      guard sampleRate > 0, format.channelCount == 1 else {
+        AppLogger.log(.speakerEnrollment, "[CloudDiarization] \(source) preview rejected unsupported format=\(format)")
+        return nil
+      }
+      let frameCount = AVAudioFrameCount(min(
+        sourceFile.length,
+        AVAudioFramePosition(SpeakerIdentityConfig.maxSpeechBufferSeconds * sampleRate)
+      ))
+      guard frameCount > 0,
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+        return nil
+      }
+      try sourceFile.read(into: buffer, frameCount: frameCount)
+      guard buffer.frameLength > 0 else { return nil }
+
+      let boosted = try Self.normalizedMonoInt16Buffer(from: buffer)
+      let stats = Self.int16Stats(boosted)
+      guard stats.rms >= 300, stats.peak >= 1200 else {
+        AppLogger.log(
+          .speakerEnrollment,
+          "[CloudDiarization] \(source) preview rejected as too quiet speaker=\(speakerIndex) rms=\(String(format: "%.0f", Double(stats.rms))) peak=\(stats.peak)"
+        )
+        return nil
+      }
+      let normalized = try MonoPCM16WAVData.make(samples: boosted, sampleRate: sampleRate)
+      AppLogger.log(
+        .speakerEnrollment,
+        "[CloudDiarization] prepared \(source) speaker preview speaker=\(speakerIndex) seconds=\(String(format: "%.2f", Double(boosted.count) / sampleRate)) rms=\(String(format: "%.0f", Double(stats.rms))) peak=\(stats.peak)"
+      )
+      return normalized
+    } catch {
+      try? FileManager.default.removeItem(at: url)
+      AppLogger.log(.speakerEnrollment, "[CloudDiarization] \(source) preview normalization failed speaker=\(speakerIndex): \(error.localizedDescription)")
+      return nil
+    }
+  }
+
+  nonisolated private static func normalizedMonoInt16Buffer(from buffer: AVAudioPCMBuffer) throws -> [Int16] {
+    let count = Int(buffer.frameLength)
+    guard count > 0 else { return [] }
+    var samples = [Int16](repeating: 0, count: count)
+    if let source = buffer.int16ChannelData?[0] {
+      for i in 0..<count { samples[i] = source[i] }
+    } else if let source = buffer.floatChannelData?[0] {
+      for i in 0..<count {
+        let value = max(-1, min(1, source[i]))
+        samples[i] = Int16(value * Float(Int16.max))
+      }
+    } else {
+      throw NSError(domain: "CloudDiarizationPreview", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unsupported preview buffer format"])
+    }
+    let peak = samples.reduce(Int32(0)) { current, sample in
+      max(current, abs(Int32(sample)))
+    }
+    guard peak > 0 else { return samples }
+    let targetPeak: Float = 24_000
+    let gain = min(24, max(1, targetPeak / Float(peak)))
+    guard gain > 1 else { return samples }
+    for i in samples.indices {
+      let scaled = Float(samples[i]) * gain
+      samples[i] = Int16(max(Float(Int16.min), min(Float(Int16.max), scaled)))
+    }
+    return samples
+  }
+
+  nonisolated private static func int16Stats(_ samples: [Int16]) -> (rms: Float, peak: Int32) {
+    guard !samples.isEmpty else { return (0, 0) }
+    var sum: Double = 0
+    var peak: Int32 = 0
+    for sample in samples {
+      let value = Int32(sample)
+      peak = max(peak, abs(value))
+      sum += Double(value) * Double(value)
+    }
+    return (Float(sqrt(sum / Double(samples.count))), peak)
   }
 
   // Renames all transcript chunks for an unknown speaker and optionally merges into an existing person.
@@ -2358,6 +7179,7 @@ final class StreamSessionViewModel: ObservableObject {
       }
       guard let resolvedPersonId = personId else {
         AppLogger.log(.database, "[CloudDiarization] renameUnknownSpeaker failed to resolve person name=\"\(name)\" speakerIndex=\(speakerIndex)")
+        AppLogger.log(.speakerEnrollment, "[CloudDiarization] rename unknown speaker failed speaker=\(speakerIndex) reason=personResolveFailed")
         return
       }
       await self.identityPipeline.reattributeChunks(
@@ -2369,6 +7191,10 @@ final class StreamSessionViewModel: ObservableObject {
       await MainActor.run {
         self.peopleDictionaryEntries = entries
         self.unknownDiarizationSpeakers.removeAll { $0.speakerIndex == speakerIndex }
+        AppLogger.log(
+          .speakerEnrollment,
+          "[CloudDiarization] renamed unknown speaker speaker=\(speakerIndex) personId=\(resolvedPersonId.uuidString) remainingUnknown=\(self.unknownDiarizationSpeakers.count)"
+        )
         self.invalidateAndRefreshConversationSummaries(
           for: [resolvedPersonId],
           reason: "unknownSpeakerRenamed"
@@ -2389,9 +7215,54 @@ final class StreamSessionViewModel: ObservableObject {
       }
       guard let resolvedPersonId = personId else {
         AppLogger.log(.database, "[CloudDiarization] enrollUnknownSpeaker failed to resolve person name=\"\(name)\" speakerIndex=\(speakerIndex)")
+        AppLogger.log(.speakerEnrollment, "[CloudDiarization] enrollment failed speaker=\(speakerIndex) reason=personResolveFailed")
         return
       }
-      await self.speakerPipeline.enrollFromAudioData(clipData, personId: resolvedPersonId, name: name)
+      AppLogger.log(
+        .speakerEnrollment,
+        "[CloudDiarization] enrollment started speaker=\(speakerIndex) personId=\(resolvedPersonId.uuidString) name=\"\(name)\" clipBytes=\(clipData.count)"
+      )
+      let result = await self.speakerPipeline.enrollFromAudioData(
+        clipData,
+        personId: resolvedPersonId,
+        name: name,
+        preferAWS: true,
+        allowLocalFallback: false
+      )
+      if result.pending {
+        // Preview saved, but no usable voice embedding yet (AWS worker warming/
+        // unavailable). The enrollment is explicitly PENDING and will finish
+        // automatically once the worker is reachable. Do NOT mark as enrolled.
+        await MainActor.run {
+          self.voiceEnrollmentStatusText = "\(result.message)"
+          self.pendingVoiceEnrollmentPersonIds.insert(resolvedPersonId)
+          AppLogger.log(
+            .speakerEnrollment,
+            "[CloudDiarization] enrollment pending speaker=\(speakerIndex) personId=\(resolvedPersonId.uuidString) reason=\"\(result.message)\" previewBytes=\(clipData.count) — voice embedding queued for retry"
+          )
+        }
+        // Still relabel transcripts so the name is attached; voice recognition
+        // catches up when the pending embedding lands.
+        self.renameUnknownSpeaker(speakerIndex: speakerIndex, sessionId: sessionId, name: name, existingPersonId: resolvedPersonId)
+        return
+      }
+      guard result.saved else {
+        await MainActor.run {
+          self.voiceEnrollmentStatusText = result.message
+        }
+        AppLogger.log(.speakerIdentity, "[CloudDiarization] enrollUnknownSpeaker failed speakerIndex=\(speakerIndex) personId=\(resolvedPersonId.uuidString) reason=\(result.message)")
+        AppLogger.log(.speakerEnrollment, "[CloudDiarization] enrollment failed speaker=\(speakerIndex) personId=\(resolvedPersonId.uuidString) reason=\"\(result.message)\"")
+        return
+      }
+      await MainActor.run {
+        self.voiceEnrollmentStatusText = result.message
+        self.enrolledVoicePersonIds.insert(resolvedPersonId)
+        self.pendingVoiceEnrollmentPersonIds.remove(resolvedPersonId)
+        AppLogger.log(
+          .speakerEnrollment,
+          "[CloudDiarization] enrollment saved speaker=\(speakerIndex) personId=\(resolvedPersonId.uuidString) previewBytes=\(clipData.count)"
+        )
+      }
       self.renameUnknownSpeaker(speakerIndex: speakerIndex, sessionId: sessionId, name: name, existingPersonId: resolvedPersonId)
     }
   }
@@ -2404,11 +7275,189 @@ final class StreamSessionViewModel: ObservableObject {
       return "Wearer: incompatible enrollment"
     default:
       let decision = match.decision == .known ? "same voice" : "different voice"
-      return "Wearer cosine: \(String(format: "%.3f", match.bestSimilarity)) · \(decision)"
+      return "Wearer cosine: \(String(format: "%.3f", Double(match.bestSimilarity))) · \(decision)"
     }
   }
 
+  private func processTranscriptNamePresence(text: String, timestamp: Date) {
+    let people = knownPeopleForNameAddress()
+    guard !people.isEmpty else {
+      presencePipelineVerificationText = "Presence: no saved people available for name matching"
+      return
+    }
+
+    if let signal = TranscriptNameSignalResolver.resolve(text: text, people: people) {
+      presencePipelineVerificationText = "Name signal: \(signal.displayName) \(signal.intent.rawValue) \(Int((signal.confidence * 100).rounded()))% via \(signal.evidence)"
+      applyTranscriptNameSignal(signal, timestamp: timestamp)
+    }
+
+    let settings = SceneContextSettings.load()
+    guard sceneContextEnabled,
+          (SupabaseEdgeFunctionClient.isConfigured()
+            || !settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty),
+          containsKnownPersonName(in: text, people: people) else { return }
+    if let lastNameAddressLLMAt,
+       timestamp.timeIntervalSince(lastNameAddressLLMAt) < 4 {
+      return
+    }
+    lastNameAddressLLMAt = timestamp
+
+    let activePeople = presenceTracker.snapshot(now: timestamp).active
+    presencePipelineVerificationText = "Name signal: asking LLM to classify known-person transcript intent"
+    Task { [weak self] in
+      do {
+        let analysis = try await SceneContextClient(settings: settings).analyzeNameAddress(NameAddressRequest(
+          transcriptText: text,
+          people: people,
+          activePeople: activePeople,
+          timestamp: timestamp
+        ))
+        await MainActor.run { [weak self] in
+          guard let self else { return }
+          guard let signal = TranscriptNameSignalResolver.resolve(
+            text: text,
+            people: people,
+            llmAnalysis: analysis
+          ) else {
+            self.presencePipelineVerificationText = "Name signal: LLM returned no actionable direct-address/departure intent"
+            return
+          }
+          self.presencePipelineVerificationText = "Name signal: \(signal.displayName) \(signal.intent.rawValue) \(Int((signal.confidence * 100).rounded()))% via LLM"
+          self.applyTranscriptNameSignal(signal, timestamp: timestamp)
+        }
+      } catch {
+        Task { @MainActor [weak self] in
+          self?.presencePipelineVerificationText = "Name signal: LLM failed, heuristic path still active"
+        }
+        AppLogger.log(.sceneContext, "name-address analysis skipped: \(error.localizedDescription)")
+      }
+    }
+  }
+
+  private func knownPeopleForNameAddress() -> [PersonNameCandidate] {
+    var byId: [UUID: PersonNameCandidate] = [:]
+    for entry in peopleDictionaryEntries {
+      byId[entry.id] = PersonNameCandidate(personId: entry.id, displayName: entry.displayName)
+    }
+    if let id = activeFacePersonId, let name = activeFaceName, !name.isEmpty {
+      byId[id] = PersonNameCandidate(personId: id, displayName: name)
+    }
+    if let id = activeSpeakerPersonId, !activeSpeakerName.isEmpty {
+      byId[id] = PersonNameCandidate(personId: id, displayName: activeSpeakerName)
+    }
+    if let id = glassesConfirmedConversationPersonId,
+       let name = glassesConfirmedConversationPersonName ?? resolvedDisplayName(for: id),
+       !name.isEmpty {
+      byId[id] = PersonNameCandidate(personId: id, displayName: name)
+    }
+    for id in glassesConfirmedConversationPersonIds {
+      guard byId[id] == nil,
+            let name = resolvedDisplayName(for: id),
+            !name.isEmpty else { continue }
+      byId[id] = PersonNameCandidate(personId: id, displayName: name)
+    }
+    return Array(byId.values).sorted { $0.displayName < $1.displayName }
+  }
+
+  private func containsKnownPersonName(in text: String, people: [PersonNameCandidate]) -> Bool {
+    let normalized = text.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current).lowercased()
+    return people.contains { person in
+      let name = person.displayName.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current).lowercased()
+      return !name.isEmpty && normalized.contains(name)
+    }
+  }
+
+  private func applyTranscriptNameSignal(_ signal: TranscriptNameSignal, timestamp: Date) {
+    if let episode = presenceTracker.record(nameSignal: signal, now: timestamp) {
+      persistPresenceEpisode(episode, reason: signal.evidence, now: timestamp)
+    }
+    switch signal.intent {
+    case .directAddress, .introduction:
+      appendConversationPartnerEvidence(ConversationPartnerEvidence(
+        source: .transcript,
+        personId: signal.personId,
+        displayName: signal.displayName,
+        confidence: signal.confidence,
+        timestamp: timestamp,
+        validUntil: timestamp.addingTimeInterval(90),
+        details: signal.evidence
+      ))
+      if let personId = signal.personId {
+        recordSpeakerTimelineEntry(personId: personId, displayName: signal.displayName)
+      }
+    case .departure:
+      removeConversationEvidenceForDepartedPerson(signal)
+      if let personId = signal.personId {
+        glassesConfirmedConversationPersonIds.remove(personId)
+        if glassesConfirmedConversationPersonId == personId {
+          glassesConfirmedConversationPersonId = nil
+          glassesConfirmedConversationPersonName = nil
+        }
+      }
+      if transcriptSignalMatchesRetainedRecognizedIdentity(signal) {
+        clearRetainedRecognizedIdentity(reason: "transcriptDeparture-\(signal.displayName)")
+      }
+      recordSpeakerTimelineEntry(personId: nil, displayName: nil)
+    case .reference:
+      break
+    }
+    refreshConversationPartnerState(now: timestamp)
+    let snapshot = presenceTracker.snapshot(now: timestamp)
+    let active = snapshot.active.map(\.displayName).joined(separator: ", ")
+    let departed = snapshot.departed.prefix(3).map(\.displayName).joined(separator: ", ")
+    let activeText = active.isEmpty ? "none" : active
+    let departedText = departed.isEmpty ? "none" : departed
+    presencePipelineVerificationText = "Presence: \(signal.displayName) \(signal.intent.rawValue) | active=\(activeText) | departed=\(departedText)"
+    refreshLiveRecallPresenceLines()
+    if activeGlassesDisplayWindow == .live, !currentGlassesLiveRecallSections.isEmpty {
+      phoneAssistanceDetailText = Self.liveRecallPhoneDetailText(from: currentGlassesLiveRecallSections)
+      sendCombinedGlassesDisplayCard(reason: "presence-\(signal.intent.rawValue)")
+    }
+  }
+
+  private func removeConversationEvidenceForDepartedPerson(_ signal: TranscriptNameSignal) {
+    let normalizedName = signal.displayName.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current).lowercased()
+    conversationPartnerEvidence.removeAll { evidence in
+      if let personId = signal.personId, evidence.personId == personId {
+        return true
+      }
+      let evidenceName = evidence.displayName?.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current).lowercased()
+      return evidenceName == normalizedName
+    }
+  }
+
+  private func transcriptSignalMatchesRetainedRecognizedIdentity(_ signal: TranscriptNameSignal) -> Bool {
+    if let personId = signal.personId, personId == retainedRecognizedPersonId {
+      return true
+    }
+    guard let retainedName = retainedRecognizedName else { return false }
+    let normalizedRetainedName = retainedName
+      .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+      .lowercased()
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let normalizedSignalName = signal.displayName
+      .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+      .lowercased()
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    return !normalizedRetainedName.isEmpty && normalizedRetainedName == normalizedSignalName
+  }
+
   private func currentTranscriptAttribution() -> TranscriptAttribution {
+    refreshConversationPartnerState()
+    if let confirmedPersonId = glassesConfirmedConversationPersonId {
+      return TranscriptAttribution(
+        personId: confirmedPersonId,
+        displayName: glassesConfirmedConversationPersonName ?? resolvedDisplayName(for: confirmedPersonId),
+        confidence: 1.0,
+        state: "glassesConfirmed",
+        sourceEvidence: "glasses:userConfirmed"
+      )
+    }
+    let partner = activeConversationPartnerState
+    if let attribution = transcriptAttribution(from: partner, prefix: "fusion") {
+      return attribution
+    }
+
     let voicePersonId = activeSpeakerPersonId
     let voiceConfidence = activeSpeakerSimilarity
     let voiceState = activeSpeakerStateText
@@ -2425,12 +7474,12 @@ final class StreamSessionViewModel: ObservableObject {
 
     if voiceUsable, let voicePersonId {
       var confidence = voiceConfidence
-      var evidence = "fusion:voice=\(String(format: "%.2f", voiceConfidence))"
+      var evidence = "fusion:voice=\(String(format: "%.2f", Double(voiceConfidence)))"
       if facePersonId == voicePersonId {
         confidence = min(1, (voiceConfidence * 0.65) + (faceConfidence * 0.25) + (mouthScore * 0.10))
-        evidence += ";face=\(String(format: "%.2f", faceConfidence));mouth=\(String(format: "%.2f", mouthScore))"
+        evidence += ";face=\(String(format: "%.2f", Double(faceConfidence)));mouth=\(String(format: "%.2f", Double(mouthScore)))"
       } else if faceUsable {
-        evidence += ";faceDisagrees=\(String(format: "%.2f", faceConfidence));mouth=\(String(format: "%.2f", mouthScore))"
+        evidence += ";faceDisagrees=\(String(format: "%.2f", Double(faceConfidence)));mouth=\(String(format: "%.2f", Double(mouthScore)))"
       }
       return TranscriptAttribution(
         personId: voicePersonId,
@@ -2448,7 +7497,7 @@ final class StreamSessionViewModel: ObservableObject {
         displayName: activeFaceName ?? displayNamesById[facePersonId],
         confidence: confidence,
         state: "fusedFaceMouth",
-        sourceEvidence: "fusion:face=\(String(format: "%.2f", faceConfidence));mouth=\(String(format: "%.2f", mouthScore));voice=none"
+        sourceEvidence: "fusion:face=\(String(format: "%.2f", Double(faceConfidence)));mouth=\(String(format: "%.2f", Double(mouthScore)));voice=none"
       )
     }
 
@@ -2458,7 +7507,18 @@ final class StreamSessionViewModel: ObservableObject {
         displayName: activeFaceName ?? displayNamesById[facePersonId],
         confidence: faceConfidence,
         state: "fusedFaceOnly",
-        sourceEvidence: "fusion:face=\(String(format: "%.2f", faceConfidence));mouth=\(String(format: "%.2f", mouthScore));voice=none"
+        sourceEvidence: "fusion:face=\(String(format: "%.2f", Double(faceConfidence)));mouth=\(String(format: "%.2f", Double(mouthScore)));voice=none"
+      )
+    }
+
+    let activePresence = presenceTracker.snapshot().active
+    if activePresence.count == 1, let episode = activePresence.first {
+      return TranscriptAttribution(
+        personId: episode.personId,
+        displayName: episode.displayName,
+        confidence: min(episode.confidence, 0.74),
+        state: "presenceActive",
+        sourceEvidence: "presence:\(safeEvidenceValue(episode.evidenceSummary));last=\(String(format: "%.1f", Date().timeIntervalSince(episode.lastEvidenceAt)))s"
       )
     }
 
@@ -2467,8 +7527,95 @@ final class StreamSessionViewModel: ObservableObject {
       displayName: nil,
       confidence: 0,
       state: "unknown",
-      sourceEvidence: "fusion:unknown;voice=\(String(format: "%.2f", voiceConfidence));face=\(String(format: "%.2f", faceConfidence));mouth=\(String(format: "%.2f", mouthScore))"
+      sourceEvidence: "fusion:unknown;voice=\(String(format: "%.2f", Double(voiceConfidence)));face=\(String(format: "%.2f", Double(faceConfidence)));mouth=\(String(format: "%.2f", Double(mouthScore)))"
     )
+  }
+
+  private func currentSceneContextIdentityEvidence(attribution: TranscriptAttribution) -> SceneContextIdentityEvidence? {
+    refreshConversationPartnerState()
+    let presence = presenceTracker.snapshot()
+    let activePresence = presence.active.map(SceneContextPersonPresence.init)
+    let departedPresence = presence.departed.prefix(6).map(SceneContextPersonPresence.init)
+    let partner = activeConversationPartnerState
+    if let primary = partner.primary,
+       partner.phase == .confirmed || partner.phase == .possible {
+      return SceneContextIdentityEvidence(
+        wearerName: "you",
+        conversationPartnerName: primary.displayName ?? attribution.displayName,
+        conversationPartnerPersonId: primary.personId ?? attribution.personId,
+        conversationPartnerState: partner.phase.rawValue,
+        confidence: Double(primary.score),
+        sourceSummary: [partner.sourceSummary, presenceTracker.summary()].filter { !$0.isEmpty }.joined(separator: ";"),
+        activePeople: activePresence,
+        departedPeople: Array(departedPresence)
+      )
+    }
+    if attribution.personId != nil || attribution.displayName != nil {
+      return SceneContextIdentityEvidence(
+        wearerName: "you",
+        conversationPartnerName: attribution.displayName,
+        conversationPartnerPersonId: attribution.personId,
+        conversationPartnerState: attribution.state,
+        confidence: Double(attribution.confidence),
+        sourceSummary: [attribution.sourceEvidence, presenceTracker.summary()].filter { !$0.isEmpty }.joined(separator: ";"),
+        activePeople: activePresence,
+        departedPeople: Array(departedPresence)
+      )
+    }
+    if let primaryPresence = presence.active.first {
+      return SceneContextIdentityEvidence(
+        wearerName: "you",
+        conversationPartnerName: primaryPresence.displayName,
+        conversationPartnerPersonId: primaryPresence.personId,
+        conversationPartnerState: presence.active.count == 1 ? "presenceActive" : "presenceMultiple",
+        confidence: Double(primaryPresence.confidence),
+        sourceSummary: presenceTracker.summary(),
+        activePeople: activePresence,
+        departedPeople: Array(departedPresence)
+      )
+    }
+    if !departedPresence.isEmpty {
+      return SceneContextIdentityEvidence(
+        wearerName: "you",
+        conversationPartnerName: nil,
+        conversationPartnerPersonId: nil,
+        conversationPartnerState: "presenceDeparted",
+        confidence: 0.5,
+        sourceSummary: presenceTracker.summary(),
+        activePeople: [],
+        departedPeople: Array(departedPresence)
+      )
+    }
+    return nil
+  }
+
+  private func transcriptAttribution(
+    from state: ConversationPartnerState,
+    prefix: String
+  ) -> TranscriptAttribution? {
+    let evidence = "\(prefix):\(safeEvidenceValue(state.sourceSummary))"
+    switch state.phase {
+    case .confirmed, .possible:
+      guard let primary = state.primary else { return nil }
+      let displayName = primary.personId == nil ? nil : primary.displayName
+      return TranscriptAttribution(
+        personId: primary.personId,
+        displayName: displayName,
+        confidence: primary.score,
+        state: state.attributionState,
+        sourceEvidence: evidence
+      )
+    case .conflicted, .multiplePeople:
+      return TranscriptAttribution(
+        personId: nil,
+        displayName: nil,
+        confidence: 0,
+        state: state.attributionState,
+        sourceEvidence: evidence
+      )
+    case .none, .unknown:
+      return nil
+    }
   }
 
   func savePendingPersonEnrollment() {
@@ -2478,6 +7625,7 @@ final class StreamSessionViewModel: ObservableObject {
     Task { [weak self] in
       guard let self else { return }
       do {
+        await self.ensureCloudFaceEmbeddingReadyForEnrollmentIfNeeded()
         let result = try await identityPipeline.savePendingUnknown(name: name)
         await MainActor.run {
           self.pendingEnrollmentName = ""
@@ -2523,6 +7671,7 @@ final class StreamSessionViewModel: ObservableObject {
     enrollmentStatusText = "Saving sample..."
     Task { [weak self] in
       guard let self else { return }
+      await self.ensureCloudFaceEmbeddingReadyForEnrollmentIfNeeded()
       let result = await identityPipeline.saveCurrentEnrollmentSample(name: name)
       await MainActor.run {
         self.applyIdentityResult(result)
@@ -2534,6 +7683,7 @@ final class StreamSessionViewModel: ObservableObject {
     let name = lastEnrollmentCandidateName
     Task { [weak self] in
       guard let self else { return }
+      await self.ensureCloudFaceEmbeddingReadyForEnrollmentIfNeeded()
       let result = await identityPipeline.saveLastEnrollmentCandidateWithName(name)
       await MainActor.run {
         if !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2548,6 +7698,7 @@ final class StreamSessionViewModel: ObservableObject {
     let name = lastEnrollmentCandidateName
     Task { [weak self] in
       guard let self else { return }
+      await self.ensureCloudFaceEmbeddingReadyForEnrollmentIfNeeded()
       let result = await identityPipeline.saveFirstCapturedFaceGroupAsNewPerson(name: name)
       await MainActor.run {
         if !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2720,6 +7871,64 @@ final class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  nonisolated static func speakerEnrollmentSuppressionReason(for speaker: UnknownDiarizationSpeaker) -> String? {
+    guard let clipData = speaker.clipData, !clipData.isEmpty else {
+      return "missingPreviewClip"
+    }
+    return nil
+  }
+
+  nonisolated static func promptableUnknownSpeakers(_ speakers: [UnknownDiarizationSpeaker]) -> [UnknownDiarizationSpeaker] {
+    var seenClipData: Set<Data> = []
+    return speakers
+      .sorted { $0.speakerIndex < $1.speakerIndex }
+      .filter { speaker in
+        guard speakerEnrollmentSuppressionReason(for: speaker) == nil,
+              let clipData = speaker.clipData else {
+          return false
+        }
+        return seenClipData.insert(clipData).inserted
+      }
+  }
+
+  private func publishUnknownSpeakerEnrollmentPromptsIfNeeded(
+    speakers: [UnknownDiarizationSpeaker],
+    savedChunkCount: Int
+  ) {
+    let promptableSpeakers = Self.promptableUnknownSpeakers(speakers)
+    AppLogger.log(
+      .speakerEnrollment,
+      "[CloudDiarization] prompt scan chunks=\(savedChunkCount) unknownSpeakers=\(speakers.count) promptable=\(promptableSpeakers.count) peopleSheetOpen=\(showPeopleDictionary) summarySheetOpen=\(showStreamSummaryHistory)"
+    )
+    for speaker in speakers.sorted(by: { $0.speakerIndex < $1.speakerIndex }) {
+      let clipBytes = speaker.clipData?.count ?? 0
+      let reason = Self.speakerEnrollmentSuppressionReason(for: speaker) ?? "eligible"
+      AppLogger.log(
+        .speakerEnrollment,
+        "[CloudDiarization] unknown speaker id=\(speaker.id) cluster=\(speaker.speakerIndex) segments=\(speaker.segmentCount) seconds=\(String(format: "%.1f", Double(speaker.totalSeconds))) clipKey=\(speaker.clipS3Key ?? "local") clipBytes=\(clipBytes) prompt=\(reason == "eligible") reason=\(reason)"
+      )
+    }
+    guard !promptableSpeakers.isEmpty else { return }
+    guard !showPeopleDictionary else { return }
+    guard !showStreamSummaryHistory else {
+      AppLogger.log(
+        .speakerEnrollment,
+        "[CloudDiarization] enrollment prompt delayed reason=streamSummarySheetOpen promptable=\(promptableSpeakers.count)"
+      )
+      return
+    }
+    showPeopleDictionary = true
+    AppLogger.log(
+      .speakerEnrollment,
+      "[CloudDiarization] opened people dictionary for unknown speaker enrollment prompt count=\(promptableSpeakers.count)"
+    )
+  }
+
+  func openStreamSummaryHistory() {
+    streamSummaryHistory = StreamSummaryHistoryStore.load()
+    showStreamSummaryHistory = true
+  }
+
   func deletePerson(id: UUID) {
     Task { [weak self] in
       guard let self else { return }
@@ -2733,6 +7942,18 @@ final class StreamSessionViewModel: ObservableObject {
           self.activeSpeakerPersonId = nil
           self.activeSpeakerName = ""
           self.activeSpeakerStateText = "none"
+        }
+        if self.activeFacePersonId == id {
+          self.activeFacePersonId = nil
+          self.activeFaceName = nil
+          self.activeFaceState = "none"
+          self.activeFaceConfidence = 0
+          self.activeIdentityName = "None"
+          self.activeIdentityConfidenceText = "0.00"
+          self.activeIdentityStateText = "none"
+        }
+        if self.retainedRecognizedPersonId == id {
+          self.clearRetainedRecognizedIdentity(reason: "deletePerson")
         }
       }
     }
@@ -2750,6 +7971,12 @@ final class StreamSessionViewModel: ObservableObject {
           self.activeFaceName = nil
           self.activeFaceState = "none"
           self.activeFaceConfidence = 0
+          self.activeIdentityName = "None"
+          self.activeIdentityConfidenceText = "0.00"
+          self.activeIdentityStateText = "none"
+        }
+        if self.retainedRecognizedPersonId == personId {
+          self.clearRetainedRecognizedIdentity(reason: "deleteFaceEnrollment")
         }
       }
     }
@@ -2780,7 +8007,11 @@ final class StreamSessionViewModel: ObservableObject {
       await MainActor.run { [weak self] in
         guard let self else { return }
         let seconds = Double(samples.count) / SpeakerIdentityConfig.targetSampleRate
-        AppLogger.log(.audio, "Voice preview requested source=enrollment personId=\(personId.uuidString) samples=\(samples.count) seconds=\(String(format: "%.2f", seconds))")
+        AppLogger.log(.audio, "Voice preview requested source=enrollment personId=\(personId.uuidString) samples=\(samples.count) seconds=\(String(format: "%.2f", Double(seconds)))")
+        guard !self.isVoicePreviewBlockedByDATStream() else {
+          self.voiceEnrollmentStatusText = "Voice preview is disabled while DAT streaming."
+          return
+        }
         guard !samples.isEmpty else {
           self.voiceEnrollmentStatusText = "No saved voice preview for this person."
           return
@@ -2800,7 +8031,11 @@ final class StreamSessionViewModel: ObservableObject {
       await MainActor.run { [weak self] in
         guard let self else { return }
         let seconds = Double(samples.count) / SpeakerIdentityConfig.targetSampleRate
-        AppLogger.log(.audio, "Voice preview requested source=capturedClip id=\(id.uuidString) samples=\(samples.count) seconds=\(String(format: "%.2f", seconds))")
+        AppLogger.log(.audio, "Voice preview requested source=capturedClip id=\(id.uuidString) samples=\(samples.count) seconds=\(String(format: "%.2f", Double(seconds)))")
+        guard !self.isVoicePreviewBlockedByDATStream() else {
+          self.voiceEnrollmentStatusText = "Voice preview is disabled while DAT streaming."
+          return
+        }
         guard !samples.isEmpty else {
           self.voiceEnrollmentStatusText = "No captured voice preview available."
           return
@@ -2821,6 +8056,78 @@ final class StreamSessionViewModel: ObservableObject {
     videoProvider?.stop()
     videoProvider = nil
     lastFrameArrival = nil
+  }
+
+  private func scheduleCloudDiarizationJob(
+    audioURL: URL,
+    streamStart: Date,
+    speakerTimeline: [SpeakerTimelineEntry],
+    speakerEvidenceTimeline: [TimedSpeakerEvidence],
+    faceEvidenceTimeline: [TimedFaceEvidence],
+    pipelineContext: PipelineContext?
+  ) {
+    cloudDiarizationTask?.cancel()
+    cloudDiarizationState = .uploading
+    let cloudDiarizationService = cloudDiarizationService
+    let identityPipeline = identityPipeline
+    cloudDiarizationTask = Task.detached(priority: .utility) { [weak self] in
+      defer {
+        try? FileManager.default.removeItem(at: audioURL)
+      }
+
+      do {
+        let output = try await Self.runCloudDiarizationJob(
+          audioURL: audioURL,
+          streamStart: streamStart,
+          speakerTimeline: speakerTimeline,
+          speakerEvidenceTimeline: speakerEvidenceTimeline,
+          faceEvidenceTimeline: faceEvidenceTimeline,
+          pipelineContext: pipelineContext,
+          cloudDiarizationService: cloudDiarizationService,
+          identityPipeline: identityPipeline
+        )
+        guard !Task.isCancelled else { throw CancellationError() }
+        guard let output else {
+          await MainActor.run {
+            self?.cloudDiarizationState = .idle
+            self?.cloudDiarizationTask = nil
+          }
+          return
+        }
+
+        let entries = await identityPipeline.loadPeopleForDictionary()
+        await MainActor.run {
+          guard let self else { return }
+          self.peopleDictionaryEntries = entries
+          self.unknownDiarizationSpeakers = output.unknownSpeakers
+          self.invalidateAndRefreshConversationSummaries(
+            for: output.attributedPersonIds,
+            reason: "cloudDiarizationSavedChunks"
+          )
+          self.cloudDiarizationState = .done
+          self.cloudDiarizationTask = nil
+          AppLogger.log(
+            .speakerEnrollment,
+            "[CloudDiarization] Published result chunks=\(output.savedChunkCount) unknownSpeakers=\(output.unknownSpeakers.count)"
+          )
+          self.publishUnknownSpeakerEnrollmentPromptsIfNeeded(
+            speakers: output.unknownSpeakers,
+            savedChunkCount: output.savedChunkCount
+          )
+        }
+      } catch is CancellationError {
+        await MainActor.run {
+          self?.cloudDiarizationState = .idle
+          self?.cloudDiarizationTask = nil
+        }
+      } catch {
+        AppLogger.log(.audio, "[CloudDiarization] Job failed: \(error.localizedDescription)")
+        await MainActor.run {
+          self?.cloudDiarizationState = .failed(error.localizedDescription)
+          self?.cloudDiarizationTask = nil
+        }
+      }
+    }
   }
 
   private func resetVideoState(reason: String, logStop: Bool = true) {
@@ -2845,6 +8152,9 @@ final class StreamSessionViewModel: ObservableObject {
     liveDATStreamingStartedAt = nil
     liveDATFirstFrameAt = nil
     liveDATLastFrameAt = nil
+    liveDATTerminalVisionInvalidated = false
+    liveAudioCaptureReadyForVision = false
+    resetDebugEmbeddingMetrics()
     lastFrameTimestampText = "none"
     if logStop {
       AppLogger.log(
@@ -2862,9 +8172,108 @@ final class StreamSessionViewModel: ObservableObject {
     }
   }
 
+  private struct EmbeddingMetricAggregate {
+    var count: UInt64 = 0
+    var totalLatencyMS: Double = 0
+    var lastLatencyMS: Double = 0
+
+    var averageLatencyMS: Double {
+      count > 0 ? totalLatencyMS / Double(count) : 0
+    }
+
+    mutating func record(latencyMS: Double) {
+      count += 1
+      totalLatencyMS += latencyMS
+      lastLatencyMS = latencyMS
+    }
+  }
+
+  private func resetDebugEmbeddingMetrics() {
+    debugMetricSessionStartedAt = Date()
+    videoAWSFaceMetrics = EmbeddingMetricAggregate()
+    videoLocalFaceMetrics = EmbeddingMetricAggregate()
+    audioIPhoneSpeakerMetrics = EmbeddingMetricAggregate()
+    audioWorkerSpeakerMetrics = EmbeddingMetricAggregate()
+    videoFaceEmbeddingMetricsText = "Video face: waiting for accepted face"
+    videoFaceRecognitionMetricsText = "Recognition source: waiting"
+    audioSpeakerEmbeddingMetricsText = "Audio speaker: waiting for speech"
+  }
+
+  private func updateVideoFaceDebugMetrics(with metrics: [FaceEmbeddingDebugMetric]) {
+    guard !metrics.isEmpty else { return }
+
+    for metric in metrics {
+      if metric.sourceLabel == "aws-AdaFace" || metric.modelName == "AdaFace" {
+        videoAWSFaceMetrics.record(latencyMS: metric.latencyMS)
+      } else if metric.sourceLabel == "local-MobileFaceNet" || metric.modelName == "MobileFaceNet" {
+        videoLocalFaceMetrics.record(latencyMS: metric.latencyMS)
+      }
+    }
+
+    let elapsed = max(Date().timeIntervalSince(debugMetricSessionStartedAt), 0.1)
+    videoFaceEmbeddingMetricsText = [
+      "AWS AdaFace \(formatAggregate(videoAWSFaceMetrics, elapsedSeconds: elapsed))",
+      "Local MobileFaceNet \(formatAggregate(videoLocalFaceMetrics, elapsedSeconds: elapsed))"
+    ].joined(separator: " | ")
+
+    let selected = metrics.first(where: \.selectedForRecognition) ?? metrics.first
+    let selectedText = selected.map { metric in
+      let compatText = "\(metric.compatibleAverageCount) avg/\(metric.compatibleSampleCount) samples"
+      return "Using \(metric.sourceLabel): \(metric.decisionText) sim \(String(format: "%.3f", Double(metric.bestSimilarity))) compatible \(compatText)"
+    } ?? "Recognition source: waiting"
+    let otherText = metrics
+      .filter { !$0.selectedForRecognition }
+      .map { metric in
+        "\(metric.sourceLabel) \(metric.decisionText) sim \(String(format: "%.3f", Double(metric.bestSimilarity)))"
+      }
+      .joined(separator: " · ")
+    videoFaceRecognitionMetricsText = otherText.isEmpty ? selectedText : "\(selectedText) · \(otherText)"
+  }
+
+  private func updateAudioSpeakerDebugMetrics(with result: SpeakerProcessingResult) {
+    guard result.embeddingTriggered else {
+      if audioSpeakerEmbeddingMetricsText == "Audio speaker: waiting for speech" {
+        audioSpeakerEmbeddingMetricsText = "Audio speaker: buffer \(String(format: "%.1f", Double(result.accumulatedSpeechSeconds)))s; embeds start at \(String(format: "%.1f", Double(SpeakerIdentityConfig.minSpeechSecondsForEmbedding)))s"
+      }
+      return
+    }
+
+    if let latency = result.iPhoneSimilarity?.latencyMS {
+      audioIPhoneSpeakerMetrics.record(latencyMS: latency)
+    }
+    if let latency = result.workerSimilarity?.latencyMS {
+      audioWorkerSpeakerMetrics.record(latencyMS: latency)
+    }
+
+    let elapsed = max(Date().timeIntervalSince(debugMetricSessionStartedAt), 0.1)
+    let decision = result.matchResult.map {
+      "\($0.decision) sim \(String(format: "%.3f", Double($0.bestSimilarity)))"
+    } ?? result.vadDecision
+    audioSpeakerEmbeddingMetricsText = [
+      "iPhone TitaNet \(formatAggregate(audioIPhoneSpeakerMetrics, elapsedSeconds: elapsed))",
+      "AWS TitaNet \(formatAggregate(audioWorkerSpeakerMetrics, elapsedSeconds: elapsed))",
+      decision
+    ].joined(separator: " | ")
+  }
+
+  private func formatAggregate(_ aggregate: EmbeddingMetricAggregate, elapsedSeconds: TimeInterval) -> String {
+    guard aggregate.count > 0 else {
+      return "0 runs"
+    }
+    let runsPerMinute = Double(aggregate.count) * 60 / max(elapsedSeconds, 0.1)
+    return String(
+      format: "%llu runs %.1f/min last %.0fms avg %.0fms",
+      aggregate.count,
+      runsPerMinute,
+      aggregate.lastLatencyMS,
+      aggregate.averageLatencyMS
+    )
+  }
+
   private func syncLifecycleFromDATState(_ stateText: String) {
     let lower = stateText.lowercased()
     if lower.contains("streaming") {
+      liveDATTerminalVisionInvalidated = false
       if liveDATStreamingStartedAt == nil {
         liveDATStreamingStartedAt = Date()
         lastVisionSubmissionAt = nil
@@ -2884,12 +8293,18 @@ final class StreamSessionViewModel: ObservableObject {
       lifecycleState = .waiting
       streamingStatus = .waiting
     } else if lower.contains("stopping") {
+      if Self.isDATTerminalState(stateText), shouldInvalidateLiveDATVisionWorkOnTerminalState() {
+        invalidateLiveDATVisionWork(reason: "datStream-\(stateText)")
+      }
       liveDATStreamingStartedAt = nil
       liveDATFirstFrameAt = nil
       liveDATLastFrameAt = nil
       lifecycleState = .stopping
       streamingStatus = .waiting
     } else if lower.contains("stopped") {
+      if Self.isDATTerminalState(stateText), shouldInvalidateLiveDATVisionWorkOnTerminalState() {
+        invalidateLiveDATVisionWork(reason: "datStream-\(stateText)")
+      }
       liveDATStreamingStartedAt = nil
       liveDATFirstFrameAt = nil
       liveDATLastFrameAt = nil
@@ -2945,8 +8360,8 @@ final class StreamSessionViewModel: ObservableObject {
           ? "Guided prompts complete. Save when ready."
           : String(
             format: "Read the next prompt. %.1f / %.0f s total recorded.",
-            snapshot.recordingSeconds,
-            SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds
+            Double(snapshot.recordingSeconds),
+            Double(SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds)
           )
       }
     }
@@ -2986,7 +8401,11 @@ final class StreamSessionViewModel: ObservableObject {
       await MainActor.run { [weak self] in
         guard let self else { return }
         let seconds = Double(samples.count) / SpeakerIdentityConfig.targetSampleRate
-        AppLogger.log(.audio, "Voice preview requested source=wearer samples=\(samples.count) seconds=\(String(format: "%.2f", seconds))")
+        AppLogger.log(.audio, "Voice preview requested source=wearer samples=\(samples.count) seconds=\(String(format: "%.2f", Double(seconds)))")
+        guard !self.isVoicePreviewBlockedByDATStream() else {
+          self.wearerVoiceStatusText = "My voice preview is disabled while DAT streaming."
+          return
+        }
         guard !samples.isEmpty else {
           self.wearerVoiceStatusText = "No my voice preview available yet."
           return
@@ -3006,13 +8425,17 @@ final class StreamSessionViewModel: ObservableObject {
       await MainActor.run { [weak self] in
         guard let self else { return }
         let seconds = Double(samples.count) / SpeakerIdentityConfig.targetSampleRate
-        AppLogger.log(.audio, "Voice preview requested source=current samples=\(samples.count) seconds=\(String(format: "%.2f", seconds))")
+        AppLogger.log(.audio, "Voice preview requested source=current samples=\(samples.count) seconds=\(String(format: "%.2f", Double(seconds)))")
+        guard !self.isVoicePreviewBlockedByDATStream() else {
+          self.voiceEnrollmentStatusText = "Voice preview is disabled while DAT streaming."
+          return
+        }
         guard !samples.isEmpty else {
           self.voiceEnrollmentStatusText = "No voice preview available yet."
           return
         }
         guard seconds >= SpeakerIdentityConfig.minSpeechSecondsForEmbedding else {
-          self.voiceEnrollmentStatusText = String(format: "Keep speaking until %.1f s before previewing.", SpeakerIdentityConfig.minSpeechSecondsForEmbedding)
+          self.voiceEnrollmentStatusText = String(format: "Keep speaking until %.1f s before previewing.", Double(SpeakerIdentityConfig.minSpeechSecondsForEmbedding))
           return
         }
         self.isPlayingVoicePreview = true
@@ -3145,7 +8568,10 @@ final class StreamSessionViewModel: ObservableObject {
   private func refreshEnrolledVoicePersonIds() async {
     let pipeline = speakerPipeline
     let ids = await pipeline.enrolledPersonIds()
+    let pending = await pipeline.pendingDiarizedEnrollmentPersonIds()
     enrolledVoicePersonIds = ids
+    // Pending enrollments are those still missing a usable embedding.
+    pendingVoiceEnrollmentPersonIds = Set(pending).subtracting(ids)
   }
 
   @MainActor
@@ -3153,5 +8579,56 @@ final class StreamSessionViewModel: ObservableObject {
     let pipeline = speakerPipeline
     wearerVoiceProfile = await pipeline.wearerVoiceProfileSnapshot()
     wearerVoiceStatusText = wearerVoiceProfile.isEnrolled ? "My voice profile ready." : "My voice not enrolled"
+  }
+}
+
+enum MonoPCM16WAVData {
+  static func make(samples: [Int16], sampleRate: Double) throws -> Data {
+    guard sampleRate.isFinite, sampleRate > 0, sampleRate <= Double(UInt32.max) else {
+      throw NSError(domain: "MonoPCM16WAVData", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid WAV sample rate"])
+    }
+    let dataByteCount = samples.count * MemoryLayout<Int16>.size
+    guard dataByteCount <= Int(UInt32.max) - 36 else {
+      throw NSError(domain: "MonoPCM16WAVData", code: 2, userInfo: [NSLocalizedDescriptionKey: "WAV clip is too large"])
+    }
+
+    let sampleRateValue = UInt32(sampleRate.rounded())
+    let channelCount: UInt16 = 1
+    let bitsPerSample: UInt16 = 16
+    let blockAlign = channelCount * bitsPerSample / 8
+    let byteRate = sampleRateValue * UInt32(blockAlign)
+    var data = Data()
+    data.reserveCapacity(44 + dataByteCount)
+
+    data.appendASCII("RIFF")
+    data.appendLittleEndian(UInt32(36 + dataByteCount))
+    data.appendASCII("WAVE")
+    data.appendASCII("fmt ")
+    data.appendLittleEndian(UInt32(16))
+    data.appendLittleEndian(UInt16(1))
+    data.appendLittleEndian(channelCount)
+    data.appendLittleEndian(sampleRateValue)
+    data.appendLittleEndian(byteRate)
+    data.appendLittleEndian(blockAlign)
+    data.appendLittleEndian(bitsPerSample)
+    data.appendASCII("data")
+    data.appendLittleEndian(UInt32(dataByteCount))
+    for sample in samples {
+      data.appendLittleEndian(UInt16(bitPattern: sample))
+    }
+    return data
+  }
+}
+
+private extension Data {
+  mutating func appendASCII(_ value: String) {
+    append(contentsOf: value.utf8)
+  }
+
+  mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+    var littleEndian = value.littleEndian
+    Swift.withUnsafeBytes(of: &littleEndian) { bytes in
+      append(contentsOf: bytes)
+    }
   }
 }

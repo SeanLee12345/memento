@@ -13,6 +13,13 @@ actor IdentityPipeline {
     var recognizedPersonName: String?
   }
 
+  private struct CaptureGroupMatch {
+    let index: Int
+    let method: String
+    let score: Float?
+    let reason: String
+  }
+
   private struct CalibrationObservation {
     let profile: PersonProfile?
     let frameSequence: UInt64
@@ -21,8 +28,17 @@ actor IdentityPipeline {
     let state: ActiveIdentityState
   }
 
+  private struct FaceEnrollmentEmbeddingSource {
+    let label: String
+    let model: FaceEmbeddingModel
+  }
+
   private let store: IdentityStore
-  private let embeddingModel: FaceEmbeddingModel
+  private var embeddingModel: FaceEmbeddingModel
+  private var cloudFaceEmbeddingEnabled = false
+  private var cloudFaceEmbeddingDisabledReason: String?
+  private var cloudEnrollmentEmbeddingModel: FaceEmbeddingModel?
+  private var localEnrollmentEmbeddingModel: FaceEmbeddingModel?
   private let matcher = FaceMatcher()
   private var confirmor = RollingIdentityConfirmor()
   private var isProcessing = false
@@ -60,29 +76,329 @@ actor IdentityPipeline {
   private let maxSamplesPerCaptureGroup = 60
   private let maxSessionCaptures = 300
 
-  init(store: IdentityStore = LocalIdentityStore()) {
+  // Default store is the Supabase-syncing wrapper around LocalIdentityStore.
+  // Reads stay on the fast local path; writes also enqueue a cloud mirror via
+  // IdentitySyncQueue. Passing a bare LocalIdentityStore is still valid for
+  // tests that want to bypass network mirroring.
+  init(store: IdentityStore = SyncingIdentityStore()) {
     self.store = store
     AppLogger.log(.identityConfig, IdentityConfig.startupLogText)
     AppLogger.log(.faceEmbeddingModel, FaceEmbeddingModelFactory.diagnosticsText())
     AppLogger.log(.faceEmbeddingModel, FaceEmbeddingModelFactory.expectedModelResourceInstructions())
-    embeddingModel = FaceEmbeddingModelFactory.makeModel()
+    let localModel = Self.localEmbeddingModelIfAvailable()
+    localEnrollmentEmbeddingModel = localModel
+    let baseModel = localModel ?? FaceEmbeddingModelFactory.makeModel()
+    embeddingModel = baseModel
+    let cloudSettings = CloudFaceEmbeddingSettings.load()
+    if cloudSettings.enabled, cloudSettings.hasUsableEndpoint {
+      let cloudModel = CloudFaceEmbeddingModel(settings: cloudSettings)
+      cloudEnrollmentEmbeddingModel = cloudModel
+      embeddingModel = cloudModel
+      cloudFaceEmbeddingEnabled = true
+    }
+  }
+
+  private static func localEmbeddingModelIfAvailable() -> FaceEmbeddingModel? {
+    let model = FaceEmbeddingModelFactory.makeLocalModelOnly()
+    return model is MissingFaceEmbeddingModel ? nil : model
+  }
+
+  // Swap the live embedding model to the AWS AdaFace worker while keeping
+  // MobileFaceNet as the local fallback if the bundled model is available.
+  func configureCloudFaceEmbedding(endpoint: String, apiKey: String) async {
+    let trimmedEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    let settings = CloudFaceEmbeddingSettings(
+      enabled: true,
+      endpoint: trimmedEndpoint,
+      apiKey: trimmedKey
+    )
+    let localFallback = Self.localEmbeddingModelIfAvailable()
+    localEnrollmentEmbeddingModel = localFallback
+    let cloudModel: FaceEmbeddingModel = CloudFaceEmbeddingModel(settings: settings)
+    do {
+      try await cloudModel.load()
+    } catch {
+      cloudFaceEmbeddingEnabled = false
+      cloudFaceEmbeddingDisabledReason = "loadFailed"
+      AppLogger.log(.faceEmbeddingModel, "warning...---- AWS AdaFace face embedding load failed: \(error.localizedDescription)")
+      return
+    }
+    cloudEnrollmentEmbeddingModel = cloudModel
+    embeddingModel = cloudModel
+    cloudFaceEmbeddingEnabled = true
+    cloudFaceEmbeddingDisabledReason = nil
+    AppLogger.log(.faceEmbeddingModel, "AWS AdaFace face embedding active endpoint=\(trimmedEndpoint)")
+  }
+
+  func disableCloudFaceEmbedding(reason: String) async {
+    guard cloudFaceEmbeddingEnabled || cloudFaceEmbeddingDisabledReason == "starting" else { return }
+    cloudFaceEmbeddingEnabled = false
+    cloudFaceEmbeddingDisabledReason = reason
+    cloudEnrollmentEmbeddingModel = nil
+    let localFallback = Self.localEmbeddingModelIfAvailable()
+    localEnrollmentEmbeddingModel = localFallback
+    embeddingModel = localFallback ?? MissingFaceEmbeddingModel(expectedNames: FaceEmbeddingModelFactory.expectedModelNames)
+    let fallbackStatus = localFallback == nil ? "local MobileFaceNet missing" : "using local \(embeddingModel.modelName)"
+    AppLogger.log(.faceEmbeddingModel, "AWS AdaFace face embedding disabled reason=\(reason); \(fallbackStatus)")
+  }
+
+  func markCloudFaceEmbeddingStarting() {
+    cloudFaceEmbeddingEnabled = false
+    cloudFaceEmbeddingDisabledReason = "starting"
+    localEnrollmentEmbeddingModel = Self.localEmbeddingModelIfAvailable()
+    if let localEnrollmentEmbeddingModel {
+      embeddingModel = localEnrollmentEmbeddingModel
+    }
+    AppLogger.log(.faceEmbeddingModel, "AWS AdaFace face embedding starting")
   }
 
   func embeddingModelStatusText() -> String {
+    if let reason = cloudFaceEmbeddingDisabledReason {
+      let hasLocalFallback = !(embeddingModel is MissingFaceEmbeddingModel)
+      switch reason {
+      case "starting":
+        return hasLocalFallback
+          ? "AWS AdaFace is starting; using local \(embeddingModel.modelName) until the worker is ready."
+          : "AWS AdaFace is starting; face recognition will resume when the worker is ready."
+      case "workerWarming":
+        return hasLocalFallback
+          ? "AWS AdaFace worker is warming; using local \(embeddingModel.modelName) fallback."
+          : "AWS AdaFace worker is warming; face recognition is paused."
+      case "settingsDisabled":
+        return hasLocalFallback
+          ? "AWS AdaFace disabled; using local \(embeddingModel.modelName)."
+          : "AWS AdaFace disabled; face recognition is disabled."
+      case "startFailed":
+        return hasLocalFallback
+          ? "AWS AdaFace failed to start; using local \(embeddingModel.modelName)."
+          : "AWS AdaFace failed to start; face recognition is disabled."
+      default:
+        if reason.hasPrefix("streamStop-") {
+          return hasLocalFallback
+            ? "AWS AdaFace stopped with the stream; using local \(embeddingModel.modelName)."
+            : "AWS AdaFace stopped with the stream; face recognition is disabled."
+        }
+      }
+    }
     if embeddingModel is MissingFaceEmbeddingModel {
       return "Face recognition model missing. Face labeling can save images, but live recognition is disabled."
     }
     if embeddingModel is MockFaceEmbeddingModel {
       return "Debug stub embeddings enabled"
     }
-    if embeddingModel is LazyCoreMLFaceNetEmbeddingModel {
-      return "Face recognition model found; loads on first embedding"
-    }
     return "Loaded \(embeddingModel.modelName) \(embeddingModel.modelVersion) dim \(embeddingModel.embeddingDimension)"
   }
 
   func embeddingModelDiagnosticsText() -> String {
     FaceEmbeddingModelFactory.diagnosticsText()
+  }
+
+  func isCloudFaceEmbeddingActive() -> Bool {
+    cloudFaceEmbeddingEnabled
+      && cloudEnrollmentEmbeddingModel != nil
+      && embeddingModel.modelName == "AdaFace"
+  }
+
+  static func enrollmentPhysicalSampleCount(in records: [FaceEmbeddingRecord]) -> Int {
+    Set(records.map { enrollmentPhysicalSampleKey(for: $0) }).count
+  }
+
+  static func trimPendingEnrollmentRecords(_ records: [FaceEmbeddingRecord], maxPhysicalSamples: Int) -> [FaceEmbeddingRecord] {
+    guard maxPhysicalSamples > 0 else { return [] }
+    var orderedKeys: [String] = []
+    for record in records {
+      let key = enrollmentPhysicalSampleKey(for: record)
+      if !orderedKeys.contains(key) {
+        orderedKeys.append(key)
+      }
+    }
+    let keysToKeep = Set(orderedKeys.suffix(maxPhysicalSamples))
+    return records.filter { keysToKeep.contains(enrollmentPhysicalSampleKey(for: $0)) }
+  }
+
+  static func enrollmentEmbeddingSpaceKey(for record: FaceEmbeddingRecord) -> String {
+    [
+      record.modelName,
+      record.modelVersion,
+      record.modelSource,
+      record.preprocessingVersion,
+      String(record.dimension)
+    ].joined(separator: "|")
+  }
+
+  private static func enrollmentEmbeddingSpaceKey(for embedding: FaceEmbedding) -> String {
+    [
+      embedding.modelName,
+      embedding.modelVersion,
+      embedding.modelSource,
+      embedding.preprocessingVersion,
+      String(embedding.dimension)
+    ].joined(separator: "|")
+  }
+
+  private static func enrollmentPhysicalSampleKey(for record: FaceEmbeddingRecord) -> String {
+    if let frameNumber = record.frameNumber {
+      return "frame:\(frameNumber)"
+    }
+    if let path = record.sampleImageLocalPath {
+      return "path:\(path)"
+    }
+    return "record:\(record.id.uuidString)"
+  }
+
+  private func enrollmentEmbeddingSources() -> [FaceEnrollmentEmbeddingSource] {
+    var sources: [FaceEnrollmentEmbeddingSource] = []
+    if cloudFaceEmbeddingEnabled,
+       let cloudEnrollmentEmbeddingModel,
+       !(cloudEnrollmentEmbeddingModel is MissingFaceEmbeddingModel) {
+      sources.append(FaceEnrollmentEmbeddingSource(label: "aws-AdaFace", model: cloudEnrollmentEmbeddingModel))
+    }
+    if let localEnrollmentEmbeddingModel,
+       !(localEnrollmentEmbeddingModel is MissingFaceEmbeddingModel) {
+      sources.append(FaceEnrollmentEmbeddingSource(label: "local-MobileFaceNet", model: localEnrollmentEmbeddingModel))
+    }
+    if sources.isEmpty, !(embeddingModel is MissingFaceEmbeddingModel) {
+      sources.append(FaceEnrollmentEmbeddingSource(label: "active-\(embeddingModel.modelName)", model: embeddingModel))
+    }
+    return sources
+  }
+
+  private func logEnrollmentWarning(_ message: String, context: PipelineContext?) {
+    AppLogger.log(.enrollment, "\(context.logPrefix) warning...---- \(message)")
+  }
+
+  private func makeEnrollmentEmbeddingRecords(
+    faceImage: CGImage,
+    cropImage: UIImage,
+    personId: UUID?,
+    context: PipelineContext?,
+    frameSequence: UInt64,
+    timestamp: Date,
+    qualityScore: Float?,
+    qualityTier: FaceQualityTier?,
+    cropSize: CGSize,
+    sourceImageSize: CGSize,
+    existingImagePath: String? = nil
+  ) async throws -> [FaceEmbeddingRecord] {
+    let sources = enrollmentEmbeddingSources()
+    guard !sources.isEmpty else {
+      logEnrollmentWarning("faceEnrollment failed reason=noEmbeddingModels", context: context)
+      throw FaceEmbeddingError.coreMLModelMissing(expectedNames: FaceEmbeddingModelFactory.expectedModelResourceNames())
+    }
+
+    var records: [FaceEmbeddingRecord] = []
+    var seenEmbeddingSpaces = Set<String>()
+    var sharedImagePath = existingImagePath
+    var failures: [String] = []
+
+    for source in sources {
+      do {
+        let embedding = try await source.model.embed(faceImage: faceImage)
+        let embeddingKey = Self.enrollmentEmbeddingSpaceKey(for: embedding)
+        guard !seenEmbeddingSpaces.contains(embeddingKey) else {
+          AppLogger.log(.enrollment, "\(context.logPrefix) faceEnrollment skippedDuplicateEmbeddingSpace source=\(source.label) key=\(embeddingKey)")
+          continue
+        }
+        seenEmbeddingSpaces.insert(embeddingKey)
+        let recordId = UUID()
+        if sharedImagePath == nil {
+          do {
+            sharedImagePath = try saveCropImage(cropImage, frameSequence: frameSequence, recordId: recordId)
+          } catch {
+            logEnrollmentWarning("faceEnrollment cropSaveFailed frame=\(frameSequence) error=\(error.localizedDescription)", context: context)
+          }
+        }
+        let record = FaceEmbeddingRecord(
+          id: recordId,
+          personId: personId,
+          vector: embedding.vector,
+          dimension: embedding.dimension,
+          qualityScore: qualityScore,
+          sourceFrameTimestamp: timestamp,
+          createdAt: Date(),
+          sampleImageLocalPath: sharedImagePath,
+          metadata: FaceEmbeddingMetadata(
+            boundingBoxNormalized: CodableCGRect(.zero),
+            cropSize: CodableCGSize(cropSize),
+            sourceImageSize: CodableCGSize(sourceImageSize)
+          ),
+          appRunId: context?.appRunId,
+          conversationSessionId: context?.conversationSessionId,
+          modelName: embedding.modelName,
+          modelVersion: embedding.modelVersion,
+          modelSource: embedding.modelSource,
+          preprocessingVersion: embedding.preprocessingVersion,
+          frameNumber: frameSequence,
+          qualityTier: qualityTier,
+          cropWidth: Int(cropSize.width),
+          cropHeight: Int(cropSize.height),
+          sourceFrameWidth: Int(sourceImageSize.width),
+          sourceFrameHeight: Int(sourceImageSize.height)
+        )
+        records.append(record)
+      } catch {
+        failures.append("\(source.label):\(error.localizedDescription)")
+        logEnrollmentWarning("faceEnrollment embeddingFailed source=\(source.label) frame=\(frameSequence) error=\(error.localizedDescription)", context: context)
+      }
+    }
+
+    guard !records.isEmpty else {
+      logEnrollmentWarning("faceEnrollment failed reason=allEmbeddingModelsFailed failures=\(failures.joined(separator: ";"))", context: context)
+      throw FaceEmbeddingError.invalidEmbeddingValues("all enrollment embedding models failed")
+    }
+    return records
+  }
+
+  private func backfillPendingEnrollmentVectors(context: PipelineContext?) async {
+    let sources = enrollmentEmbeddingSources()
+    guard sources.count > 1, !pendingUnknownEmbeddings.isEmpty else { return }
+
+    let grouped = Dictionary(grouping: pendingUnknownEmbeddings, by: { Self.enrollmentPhysicalSampleKey(for: $0) })
+    var additionalRecords: [FaceEmbeddingRecord] = []
+    for records in grouped.values {
+      guard let representative = records.first else { continue }
+      let existingSpaces = Set(records.map { Self.enrollmentEmbeddingSpaceKey(for: $0) })
+      guard existingSpaces.count < sources.count else { continue }
+      guard let path = representative.sampleImageLocalPath, !path.isEmpty else {
+        logEnrollmentWarning("pendingEnrollmentBackfill skipped reason=missingCropImage frame=\(representative.frameNumber.map(String.init) ?? "nil")", context: context)
+        continue
+      }
+      guard let image = UIImage(contentsOfFile: path), let cgImage = image.cgImage else {
+        logEnrollmentWarning("pendingEnrollmentBackfill skipped reason=cropImageUnreadable path=\(path)", context: context)
+        continue
+      }
+
+      let cropSize = representative.metadata?.cropSize.cgSize
+        ?? CGSize(width: CGFloat(representative.cropWidth ?? cgImage.width), height: CGFloat(representative.cropHeight ?? cgImage.height))
+      let sourceImageSize = representative.metadata?.sourceImageSize.cgSize
+        ?? CGSize(width: CGFloat(representative.sourceFrameWidth ?? Int(cropSize.width)), height: CGFloat(representative.sourceFrameHeight ?? Int(cropSize.height)))
+      do {
+        let backfilled = try await makeEnrollmentEmbeddingRecords(
+          faceImage: cgImage,
+          cropImage: image,
+          personId: nil,
+          context: context,
+          frameSequence: representative.frameNumber ?? 0,
+          timestamp: representative.sourceFrameTimestamp,
+          qualityScore: representative.qualityScore,
+          qualityTier: representative.qualityTier,
+          cropSize: cropSize,
+          sourceImageSize: sourceImageSize,
+          existingImagePath: path
+        )
+        let missingRecords = backfilled.filter { !existingSpaces.contains(Self.enrollmentEmbeddingSpaceKey(for: $0)) }
+        additionalRecords.append(contentsOf: missingRecords)
+      } catch {
+        logEnrollmentWarning("pendingEnrollmentBackfill failed frame=\(representative.frameNumber.map(String.init) ?? "nil") error=\(error.localizedDescription)", context: context)
+      }
+    }
+
+    if !additionalRecords.isEmpty {
+      pendingUnknownEmbeddings.append(contentsOf: additionalRecords)
+      pendingUnknownEmbeddings = Self.trimPendingEnrollmentRecords(pendingUnknownEmbeddings, maxPhysicalSamples: 12)
+      AppLogger.log(.enrollment, "\(context.logPrefix) pendingEnrollmentBackfill addedVectors=\(additionalRecords.count) totalSamples=\(Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)) totalVectors=\(pendingUnknownEmbeddings.count)")
+    }
   }
 
   @discardableResult
@@ -115,7 +431,9 @@ actor IdentityPipeline {
       activePartialTranscriptChunk = nil
       lastSavedFinalTranscript = ""
       lastMeaningfulPartialTranscript = ""
-      return try await store.runSessionSnapshot(appRunId: activeAppRun.id, conversationSessionId: session.id)
+      // Session start is on the DAT stream startup path. Avoid a synchronous
+      // aggregate fetch here; live processing will refresh counts as events arrive.
+      return snapshot(appRunId: activeAppRun.id, conversationSessionId: session.id)
     } catch {
       AppLogger.log(.database, "ConversationSession creation failed appRun=\(activeAppRun.id.uuidString): \(error.localizedDescription)")
       return snapshot(appRunId: activeAppRun.id, conversationSessionId: activeConversation?.id)
@@ -162,8 +480,16 @@ actor IdentityPipeline {
     for profile in profiles {
       let transcripts = (try? await store.transcriptChunksForPerson(profile.id)) ?? []
       let embeddings = (try? await store.embeddingsForPerson(profile.id)) ?? []
-      let thumbnail = store.thumbnailImage(forDisplayName: profile.displayName)
-      let interactionDays = Self.buildInteractionDays(transcripts: transcripts, embeddings: embeddings)
+      let thumbnail = Self.thumbnailImage(from: embeddings)
+        ?? Self.thumbnailImage(fromProfileNotes: profile.notes)
+        ?? store.thumbnailImage(forDisplayName: profile.displayName)
+      let glassesInteractions = (try? await store.glassesDisplayInteractionsForPerson(profile.id)) ?? []
+      let interactionDays = Self.buildInteractionDays(
+        transcripts: transcripts,
+        embeddings: embeddings,
+        glassesInteractions: glassesInteractions
+      )
+      let sceneContexts = (try? await store.sceneContextsForPerson(profile.id)) ?? []
       let conversationTranscripts = await conversationTranscripts(
         involving: profile.id,
         ownTranscripts: transcripts,
@@ -179,10 +505,61 @@ actor IdentityPipeline {
         transcripts: transcripts,
         interactionDays: interactionDays,
         embeddingImages: embeddingImages,
-        conversationTranscripts: conversationTranscripts
+        conversationTranscripts: conversationTranscripts,
+        sceneContexts: sceneContexts,
+        glassesDisplayInteractions: glassesInteractions
       ))
     }
     return entries.sorted { $0.profile.displayName.localizedCaseInsensitiveCompare($1.profile.displayName) == .orderedAscending }
+  }
+
+  func thumbnailImage(forPersonId personId: UUID) async -> UIImage? {
+    let embeddings = (try? await store.embeddingsForPerson(personId)) ?? []
+    if let thumbnail = Self.thumbnailImage(from: embeddings) {
+      return thumbnail
+    }
+    let profile = (try? await store.loadPeople())?
+      .first(where: { $0.id == personId })
+    if let thumbnail = Self.thumbnailImage(fromProfileNotes: profile?.notes) {
+      return thumbnail
+    }
+    return profile.flatMap { store.thumbnailImage(forDisplayName: $0.displayName) }
+  }
+
+  func saveSceneContext(_ record: SceneContextRecord) async {
+    try? await store.saveSceneContext(record, context: currentContext())
+  }
+
+  func savePresenceEpisode(_ record: PresenceEpisodeRecord) async {
+    try? await store.savePresenceEpisode(record, context: currentContext())
+  }
+
+  func saveActivityModeEpisode(_ record: ActivityModeEpisodeRecord) async {
+    try? await store.saveActivityModeEpisode(record, context: currentContext())
+  }
+
+  func saveGlassesDisplayInteraction(_ event: GlassesDisplayInteractionEvent) async {
+    try? await store.saveGlassesDisplayInteraction(event, context: currentContext())
+  }
+
+  func reconcileSceneContextsForConversation(sessionId: UUID) async {
+    let context = currentContext()
+    let chunks = ((try? await store.transcriptChunksForConversationSessions([sessionId])) ?? [])
+      .filter { $0.isFinal }
+    guard !chunks.isEmpty else { return }
+    let contexts = (try? await store.sceneContextsForConversationSessions([sessionId])) ?? []
+    var updatedCount = 0
+    for var record in contexts {
+      let candidateChunks = transcriptChunks(for: record, in: chunks)
+      let personIds = Set(candidateChunks.compactMap(\.personId))
+      guard personIds.count == 1, let personId = personIds.first, record.personId != personId else { continue }
+      record.personId = personId
+      try? await store.updateSceneContext(record, context: context)
+      updatedCount += 1
+    }
+    if updatedCount > 0 {
+      AppLogger.log(.sceneContext, "\(context.logPrefix) reconciled scene contexts session=\(sessionId.uuidString) updated=\(updatedCount)")
+    }
   }
 
   func findOrCreateVoiceOnlyPerson(named name: String) async -> PersonProfile? {
@@ -231,6 +608,9 @@ actor IdentityPipeline {
     let sessionIds = Array(Set(ownTranscripts.map(\.conversationSessionId)))
     let allChunks = ((try? await store.transcriptChunksForConversationSessions(sessionIds)) ?? [])
       .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    let sceneContexts = ((try? await store.sceneContextsForConversationSessions(sessionIds)) ?? [])
+      .filter { $0.personId == personId }
+    let sceneContextsBySession = Dictionary(grouping: sceneContexts) { $0.conversationSessionId }
     let grouped = Dictionary(grouping: allChunks, by: \.conversationSessionId)
     return grouped.map { sessionId, chunks in
       let sorted = chunks.sorted { ($0.startedAt ?? $0.createdAt) < ($1.startedAt ?? $1.createdAt) }
@@ -246,10 +626,33 @@ actor IdentityPipeline {
         conversationSessionId: sessionId,
         startedAt: sorted.first?.startedAt ?? sorted.first?.createdAt ?? Date(),
         endedAt: sorted.last?.endedAt ?? sorted.last?.createdAt,
-        lines: lines
+        lines: lines,
+        sceneContexts: sceneContextsBySession[sessionId]?.sorted { $0.startedAt > $1.startedAt } ?? []
       )
     }
     .sorted { $0.startedAt > $1.startedAt }
+  }
+
+  private func transcriptChunks(for record: SceneContextRecord, in chunks: [TranscriptChunk]) -> [TranscriptChunk] {
+    let ids = Self.decodeUUIDArray(record.transcriptChunkIdsJson)
+    if !ids.isEmpty {
+      let idSet = Set(ids)
+      let matches = chunks.filter { idSet.contains($0.id) }
+      if !matches.isEmpty { return matches }
+    }
+    return chunks.filter { chunk in
+      let start = chunk.startedAt ?? chunk.createdAt
+      let end = chunk.endedAt ?? start
+      return start <= record.endedAt && end >= record.startedAt
+    }
+  }
+
+  private static func decodeUUIDArray(_ json: String) -> [UUID] {
+    guard let data = json.data(using: .utf8),
+          let strings = try? JSONDecoder().decode([String].self, from: data) else {
+      return []
+    }
+    return strings.compactMap(UUID.init(uuidString:))
   }
 
   private static func speakerLabel(from source: String) -> String? {
@@ -263,12 +666,13 @@ actor IdentityPipeline {
     return nil
   }
 
-  private static func buildInteractionDays(
+  static func buildInteractionDays(
     transcripts: [TranscriptChunk],
-    embeddings: [FaceEmbeddingRecord]
+    embeddings: [FaceEmbeddingRecord],
+    glassesInteractions: [GlassesDisplayInteractionEvent] = []
   ) -> [PersonInteractionDay] {
     let calendar = Calendar.current
-    var data: [Date: [Date: (count: Int, chunks: [TranscriptChunk])]] = [:]
+    var data: [Date: [Date: (count: Int, chunks: [TranscriptChunk], glasses: [GlassesDisplayInteractionEvent])]] = [:]
 
     for emb in embeddings {
       let ts = emb.sourceFrameTimestamp
@@ -276,7 +680,7 @@ actor IdentityPipeline {
       let comps = calendar.dateComponents([.year, .month, .day, .hour], from: ts)
       let hour = calendar.date(from: comps) ?? day
       if data[day] == nil { data[day] = [:] }
-      if data[day]![hour] == nil { data[day]![hour] = (0, []) }
+      if data[day]![hour] == nil { data[day]![hour] = (0, [], []) }
       data[day]![hour]!.count += 1
     }
 
@@ -286,8 +690,18 @@ actor IdentityPipeline {
       let comps = calendar.dateComponents([.year, .month, .day, .hour], from: ts)
       let hour = calendar.date(from: comps) ?? day
       if data[day] == nil { data[day] = [:] }
-      if data[day]![hour] == nil { data[day]![hour] = (0, []) }
+      if data[day]![hour] == nil { data[day]![hour] = (0, [], []) }
       data[day]![hour]!.chunks.append(chunk)
+    }
+
+    for event in glassesInteractions {
+      let ts = event.createdAt
+      let day = calendar.startOfDay(for: ts)
+      let comps = calendar.dateComponents([.year, .month, .day, .hour], from: ts)
+      let hour = calendar.date(from: comps) ?? day
+      if data[day] == nil { data[day] = [:] }
+      if data[day]![hour] == nil { data[day]![hour] = (0, [], []) }
+      data[day]![hour]!.glasses.append(event)
     }
 
     return data.map { day, hourMap in
@@ -295,7 +709,8 @@ actor IdentityPipeline {
         PersonInteractionHour(
           hour: hour,
           faceDetectionCount: d.count,
-          transcripts: d.chunks.sorted { $0.createdAt < $1.createdAt }
+          transcripts: d.chunks.sorted { $0.createdAt < $1.createdAt },
+          glassesInteractions: d.glasses.sorted { $0.createdAt < $1.createdAt }
         )
       }.sorted { $0.hour < $1.hour }
       return PersonInteractionDay(day: day, hours: hours)
@@ -332,12 +747,18 @@ actor IdentityPipeline {
       try? await store.saveTranscriptChunk(chunks[i], context: ctx)
       updatedCount += 1
     }
+    await reconcileSceneContextsForConversation(sessionId: sessionId)
     AppLogger.log(.transcript, "[CloudDiarization] reattributeChunks tag=\(sourceTag) personId=\(personId.uuidString) updatedChunks=\(updatedCount)")
   }
 
   func currentConversationTranscriptChunks() async -> [TranscriptChunk] {
     guard let sessionId = activeConversation?.id else { return [] }
     return (try? await store.transcriptChunksForConversationSessions([sessionId])) ?? []
+  }
+
+  func currentConversationSceneContexts() async -> [SceneContextRecord] {
+    guard let sessionId = activeConversation?.id else { return [] }
+    return (try? await store.sceneContextsForConversationSessions([sessionId])) ?? []
   }
 
   @discardableResult
@@ -356,6 +777,7 @@ actor IdentityPipeline {
       try? await store.saveTranscriptChunk(chunk, context: context)
       updatedCount += 1
     }
+    await reconcileSceneContextsForConversation(sessionId: sessionId)
     AppLogger.log(.transcript, "\(context.logPrefix) postSessionAttribution updatedChunks=\(updatedCount)")
     return await currentRunSessionSnapshot()
   }
@@ -381,6 +803,7 @@ actor IdentityPipeline {
       try? await store.saveTranscriptChunk(chunk, context: context)
       updatedCount += 1
     }
+    await reconcileSceneContextsForConversation(sessionId: sessionId)
     AppLogger.log(.transcript, "\(context.logPrefix) manualSpeakerLabel speakerLabel=\(speakerLabel) displayName=\"\(displayName)\" personId=\(personId.uuidString) updatedChunks=\(updatedCount)")
     if let snapshot = try? await store.runSessionSnapshot(appRunId: context?.appRunId, conversationSessionId: sessionId) {
       return snapshot
@@ -397,7 +820,7 @@ actor IdentityPipeline {
     }
     guard !(embeddingModel is MissingFaceEmbeddingModel) else {
       logCalibrationLabelSkip(label: label, reason: "modelMissing", context: context)
-      calibrationStatusText = "Calibration skipped: MobileFaceNet model missing."
+      calibrationStatusText = "Calibration skipped: AWS AdaFace is not configured."
       return result(summary: calibrationStatusText)
     }
     guard let observation = lastCalibrationObservation else {
@@ -595,12 +1018,29 @@ actor IdentityPipeline {
       )
     }
 
-    let embedding: FaceEmbedding
+    let embeddingSources = enrollmentEmbeddingSources()
     let embeddingStartedAt = Date()
-    do {
-      embedding = try await embeddingModel.embed(faceImage: primary.crop.alignedCroppedImage)
-    } catch {
-      let isMissingModel = embeddingModel is MissingFaceEmbeddingModel
+    var embeddingOutputs: [(source: FaceEnrollmentEmbeddingSource, embedding: FaceEmbedding, latencyMS: Double)] = []
+    var embeddingFailures: [String] = []
+    for source in embeddingSources {
+      let sourceStartedAt = Date()
+      do {
+        let sourceEmbedding = try await source.model.embed(faceImage: primary.crop.alignedCroppedImage)
+        let sourceLatencyMS = Date().timeIntervalSince(sourceStartedAt) * 1_000
+        embeddingOutputs.append((source: source, embedding: sourceEmbedding, latencyMS: sourceLatencyMS))
+        statsEmbedded += 1
+        statsEmbedLatencyMS += sourceLatencyMS
+        AppLogger.log(
+          .faceEmbedding,
+          "\(context.logPrefix) frame=\(frame.sequence) face=0 source=\(source.label) model=\(sourceEmbedding.modelName) dim=\(sourceEmbedding.dimension) status=success elapsedMs=\(String(format: "%.1f", sourceLatencyMS)) normalized=true"
+        )
+      } catch {
+        embeddingFailures.append("\(source.label):\(error.localizedDescription)")
+        AppLogger.log(.faceEmbedding, "\(context.logPrefix) frame=\(frame.sequence) face=0 source=\(source.label) model=\(source.model.modelName) modelVersion=\(source.model.modelVersion) dim=0 status=failure elapsedMs=0.0 error=\(error.localizedDescription)")
+      }
+    }
+    guard let firstEmbeddingOutput = embeddingOutputs.first else {
+      let isMissingModel = embeddingSources.isEmpty || embeddingModel is MissingFaceEmbeddingModel
       pendingUnknownPreview = primary.crop.previewImage
       if primary.quality.acceptedForEnrollment {
         AppLogger.log(.enrollment, "\(context.logPrefix) unknownFaceAvailable=true quality=\(primary.quality.score.map { String(format: "%.2f", $0) } ?? "nil") cropPath=none action=blocked reason=modelMissing")
@@ -612,7 +1052,6 @@ actor IdentityPipeline {
         now: now
       )
       activeState = state
-      AppLogger.log(.faceEmbedding, "\(context.logPrefix) frame=\(frame.sequence) face=0 model=\(embeddingModel.modelName) modelVersion=\(embeddingModel.modelVersion) dim=0 status=failure elapsedMs=0.0 error=\(error.localizedDescription)")
       AppLogger.log(.faceEmbeddingSkip, "\(context.logPrefix) frame=\(frame.sequence) face=0 reason=\(isMissingModel ? "modelMissing" : "embeddingFailed") debugRequested=\(debugEmbeddingRequested)")
       autoCaptureFaceSample(candidate: primary, embedding: nil, context: context, embeddingStatus: isMissingModel ? "modelMissing" : "embeddingFailed")
       if debugEmbeddingRequested {
@@ -637,68 +1076,57 @@ actor IdentityPipeline {
         reasonOverride: isMissingModel ? "modelMissing" : "embeddingFailed"
       )
       return result(
-        summary: isMissingModel ? "Face recognition model missing. Detection-only mode." : "Embedding failed: \(error.localizedDescription)",
+        summary: isMissingModel ? "Face recognition model missing. Detection-only mode." : "Embedding failed: \(embeddingFailures.joined(separator: "; "))",
         faceCandidateCount: frame.identityCandidates.count,
         qualityPassCount: accepted.count,
         matchDecisionText: isMissingModel ? "modelMissing" : "embeddingFailed"
       )
     }
     let embedLatencyMS = Date().timeIntervalSince(embeddingStartedAt) * 1_000
-    let vector = embedding.vector
-    statsEmbedded += 1
-    statsEmbedLatencyMS += embedLatencyMS
-    autoCaptureFaceSample(candidate: primary, embedding: embedding, context: context, embeddingStatus: "embedded")
-    AppLogger.log(
-      .faceEmbedding,
-      "\(context.logPrefix) frame=\(frame.sequence) face=0 model=\(embedding.modelName) dim=\(embedding.dimension) status=success elapsedMs=\(String(format: "%.1f", embedLatencyMS)) normalized=true"
-    )
+    var embedding = firstEmbeddingOutput.embedding
     if debugEmbeddingRequested {
-      AppLogger.log(.faceEmbeddingDebug, "\(context.logPrefix) requested=true frame=\(frame.sequence) status=success dim=\(embedding.dimension)")
+      AppLogger.log(.faceEmbeddingDebug, "\(context.logPrefix) requested=true frame=\(frame.sequence) status=success embeddings=\(embeddingOutputs.map { "\($0.source.label):\($0.embedding.dimension)" }.joined(separator: ","))")
     }
     if !IdentityConfig.enableIdentityMatching {
+      let embeddingMetrics = embeddingOutputs.map { output in
+        FaceEmbeddingDebugMetric(
+          sourceLabel: output.source.label,
+          modelName: output.embedding.modelName,
+          modelSource: output.embedding.modelSource,
+          dimension: output.embedding.dimension,
+          latencyMS: output.latencyMS,
+          bestSimilarity: 0,
+          decisionText: "disabled",
+          compatibleSampleCount: 0,
+          compatibleAverageCount: 0,
+          selectedForRecognition: output.source.label == firstEmbeddingOutput.source.label
+        )
+      }
       pendingUnknownPreview = primary.crop.previewImage
-      var placeholder = FaceEmbeddingRecord(
-        id: UUID(),
+      let liveEmbeddingRecords = makeEmbeddingRecords(
         personId: nil,
-        vector: vector,
-        dimension: vector.count,
-        qualityScore: primary.quality.score,
-        sourceFrameTimestamp: primary.crop.frameTimestamp,
-        createdAt: now,
-        sampleImageLocalPath: nil,
-        metadata: FaceEmbeddingMetadata(
-          boundingBoxNormalized: CodableCGRect(primary.crop.faceBoundingBoxNormalized),
-          cropSize: CodableCGSize(primary.quality.cropSize),
-          sourceImageSize: CodableCGSize(primary.crop.sourceImageSize)
-        ),
-        appRunId: context?.appRunId,
-        conversationSessionId: context?.conversationSessionId,
-        modelName: embedding.modelName,
-        modelVersion: embedding.modelVersion,
-        modelSource: embedding.modelSource,
-        preprocessingVersion: embedding.preprocessingVersion,
-        frameNumber: frame.sequence,
-        rawFaceBoxPixels: CodableCGRect(primary.crop.rawFaceBoundingBoxPixels),
-        faceBoxPixels: CodableCGRect(primary.crop.faceBoundingBoxPixels),
-        qualityTier: primary.quality.tier,
-        faceCaptureQuality: primary.crop.faceCaptureQuality,
-        yaw: primary.crop.yaw,
-        pitch: primary.crop.pitch,
-        roll: primary.crop.roll,
-        cropWidth: primary.quality.cropWidth,
-        cropHeight: primary.quality.cropHeight,
-        sourceFrameWidth: Int(primary.crop.sourceImageSize.width),
-        sourceFrameHeight: Int(primary.crop.sourceImageSize.height),
-        orientationUsed: primary.crop.visionOrientation.debugName
+        embeddings: embeddingOutputs.map(\.embedding),
+        crop: primary.crop,
+        quality: primary.quality,
+        context: context
       )
-      placeholder.sampleImageLocalPath = try? saveCropImage(UIImage(cgImage: primary.crop.alignedCroppedImage), frameSequence: primary.crop.frameSequence, recordId: placeholder.id)
+      var placeholders = liveEmbeddingRecords
+      let sharedPath = placeholders.first.flatMap {
+        try? saveCropImage(UIImage(cgImage: primary.crop.alignedCroppedImage), frameSequence: primary.crop.frameSequence, recordId: $0.id)
+      }
+      if let sharedPath {
+        for index in placeholders.indices {
+          placeholders[index].sampleImageLocalPath = sharedPath
+        }
+      }
       if primary.quality.acceptedForEnrollment {
-        pendingUnknownEmbeddings.append(placeholder)
-        pendingUnknownEmbeddings = Array(pendingUnknownEmbeddings.suffix(8))
+        pendingUnknownEmbeddings.append(contentsOf: placeholders)
+        pendingUnknownEmbeddings = Self.trimPendingEnrollmentRecords(pendingUnknownEmbeddings, maxPhysicalSamples: 8)
         if enrollmentWaitingForNextSample {
           enrollmentWaitingForNextSample = false
-          enrollmentStatusText = "Sample \(pendingUnknownEmbeddings.count) captured."
-          AppLogger.log(.enrollmentSampleCaptured, "\(context.logPrefix) personDraft=pending sampleIndex=\(pendingUnknownEmbeddings.count) frame=\(frame.sequence) cropSize=\(primary.quality.cropWidth)x\(primary.quality.cropHeight) quality=\(primary.quality.score.map { String(format: "%.3f", $0) } ?? "nil")")
+          let sampleCount = Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)
+          enrollmentStatusText = "Sample \(sampleCount) captured."
+          AppLogger.log(.enrollmentSampleCaptured, "\(context.logPrefix) personDraft=pending sampleIndex=\(sampleCount) vectorCount=\(pendingUnknownEmbeddings.count) frame=\(frame.sequence) cropSize=\(primary.quality.cropWidth)x\(primary.quality.cropHeight) quality=\(primary.quality.score.map { String(format: "%.3f", $0) } ?? "nil")")
         }
       } else {
         if enrollmentWaitingForNextSample {
@@ -723,33 +1151,106 @@ actor IdentityPipeline {
         qualityPassCount: accepted.count,
         embeddingGenerated: true,
         matchDecisionText: "disabled",
-        embeddingLatencyMS: embedLatencyMS
+        embeddingLatencyMS: embedLatencyMS,
+        embeddingMetrics: embeddingMetrics
       )
     }
     let allStoredSamples = (try? await store.allEmbeddings()) ?? []
-    let compatibleSamples = allStoredSamples.filter {
-      $0.personId != nil
-        && $0.dimension == embedding.dimension
-        && $0.vector.count == embedding.dimension
-        && $0.modelName == embedding.modelName
-        && $0.modelVersion == embedding.modelVersion
-        && $0.modelSource == embedding.modelSource
-        && $0.preprocessingVersion == embedding.preprocessingVersion
+    let averages = (try? await store.averagedEmbeddings()) ?? []
+    func decisionRank(_ decision: IdentityMatchResult.Decision) -> Int {
+      switch decision {
+      case .known: return 3
+      case .ambiguous: return 2
+      case .unknown: return 1
+      }
     }
+    let matchEvaluations = embeddingOutputs.map { output in
+      let outputEmbedding = output.embedding
+      let outputCompatibleSamples = allStoredSamples.filter {
+        $0.personId != nil
+          && $0.dimension == outputEmbedding.dimension
+          && $0.vector.count == outputEmbedding.dimension
+          && $0.modelName == outputEmbedding.modelName
+          && $0.modelVersion == outputEmbedding.modelVersion
+          && $0.modelSource == outputEmbedding.modelSource
+          && $0.preprocessingVersion == outputEmbedding.preprocessingVersion
+      }
+      let outputCompatibleAverages = averages.filter {
+        $0.vectorDimension == outputEmbedding.dimension
+          && $0.averagedVector.count == outputEmbedding.dimension
+          && $0.modelName == outputEmbedding.modelName
+          && $0.modelVersion == outputEmbedding.modelVersion
+          && $0.modelSource == outputEmbedding.modelSource
+          && $0.preprocessingVersion == outputEmbedding.preprocessingVersion
+      }
+      let outputSampleMatch = matcher.match(vector: outputEmbedding.vector, against: outputCompatibleSamples)
+      let outputCentroidMatch = matcher.match(embedding: outputEmbedding, against: outputCompatibleAverages)
+      let outputMatch = outputSampleMatch.bestSimilarity >= outputCentroidMatch.bestSimilarity ? outputSampleMatch : outputCentroidMatch
+      return (
+        output: output,
+        compatibleSamples: outputCompatibleSamples,
+        compatibleAverages: outputCompatibleAverages,
+        sampleMatch: outputSampleMatch,
+        centroidMatch: outputCentroidMatch,
+        match: outputMatch
+      )
+    }
+    let selectedMatch = matchEvaluations.max {
+      let lhsRank = decisionRank($0.match.decision)
+      let rhsRank = decisionRank($1.match.decision)
+      if lhsRank != rhsRank { return lhsRank < rhsRank }
+      return $0.match.bestSimilarity < $1.match.bestSimilarity
+    }!
+    let selectedSourceLabel = selectedMatch.output.source.label
+    for evaluation in matchEvaluations {
+      let outputEmbedding = evaluation.output.embedding
+      let compatibleProfileIds = Set(evaluation.compatibleSamples.compactMap(\.personId))
+        .union(Set(evaluation.compatibleAverages.map(\.personId)))
+      let profile = cachedProfiles.first { $0.id == evaluation.match.bestPersonId }
+      AppLogger.log(
+        .faceMatch,
+        "\(context.logPrefix) frame=\(frame.sequence) face=0 [SOURCE_COMPARISON] selected=\(evaluation.output.source.label == selectedSourceLabel) sourceLabel=\(evaluation.output.source.label) embeddingDim=\(outputEmbedding.dimension) model=\(outputEmbedding.modelName) modelVersion=\(outputEmbedding.modelVersion) source=\(outputEmbedding.modelSource) preprocessing=\(outputEmbedding.preprocessingVersion) compatibleProfiles=\(compatibleProfileIds.count) compatibleSamples=\(evaluation.compatibleSamples.count) compatibleAverages=\(evaluation.compatibleAverages.count) top1=\(profile?.displayName ?? evaluation.match.bestPersonId?.uuidString ?? "nil") score=\(String(format: "%.3f", evaluation.match.bestSimilarity)) top2=\(evaluation.match.secondBestSimilarity.map { String(format: "%.3f", $0) } ?? "nil") margin=\(evaluation.match.margin.map { String(format: "%.3f", $0) } ?? "nil") threshold=\(String(format: "%.2f", IdentityConfig.strongMatchThreshold)) decision=\(evaluation.match.decision.rawValue) reason=\(matchRejectionReason(evaluation.match)) latencyMs=\(String(format: "%.1f", evaluation.output.latencyMS))"
+      )
+    }
+    let embeddingMetrics = matchEvaluations.map { evaluation in
+      FaceEmbeddingDebugMetric(
+        sourceLabel: evaluation.output.source.label,
+        modelName: evaluation.output.embedding.modelName,
+        modelSource: evaluation.output.embedding.modelSource,
+        dimension: evaluation.output.embedding.dimension,
+        latencyMS: evaluation.output.latencyMS,
+        bestSimilarity: evaluation.match.bestSimilarity,
+        decisionText: evaluation.match.decision.rawValue,
+        compatibleSampleCount: evaluation.compatibleSamples.count,
+        compatibleAverageCount: evaluation.compatibleAverages.count,
+        selectedForRecognition: evaluation.output.source.label == selectedSourceLabel
+      )
+    }
+    embedding = selectedMatch.output.embedding
+    let compatibleSamples = selectedMatch.compatibleSamples
+    let compatibleAverages = selectedMatch.compatibleAverages
+    let sampleMatch = selectedMatch.sampleMatch
+    let centroidMatch = selectedMatch.centroidMatch
+    let match = selectedMatch.match
+    let liveEmbeddingRecords = makeEmbeddingRecords(
+      personId: nil,
+      embeddings: embeddingOutputs.map(\.embedding),
+      crop: primary.crop,
+      quality: primary.quality,
+      context: context
+    )
+    autoCaptureFaceSample(
+      candidate: primary,
+      embedding: embedding,
+      embeddingRecords: liveEmbeddingRecords,
+      context: context,
+      embeddingStatus: "embedded"
+    )
     for incompatible in allStoredSamples.filter({ $0.personId != nil && !compatibleSamples.contains($0) }).prefix(3) {
       AppLogger.log(
         .faceMatchSkip,
         "\(context.logPrefix) reason=incompatibleVector storedModel=\(incompatible.modelName) liveModel=\(embedding.modelName) storedModelVersion=\(incompatible.modelVersion) liveModelVersion=\(embedding.modelVersion) storedSource=\(incompatible.modelSource) liveSource=\(embedding.modelSource) storedPreprocessing=\(incompatible.preprocessingVersion) livePreprocessing=\(embedding.preprocessingVersion) storedDim=\(incompatible.dimension) liveDim=\(embedding.dimension)"
       )
-    }
-    let averages = (try? await store.averagedEmbeddings()) ?? []
-    let compatibleAverages = averages.filter {
-      $0.vectorDimension == embedding.dimension
-        && $0.averagedVector.count == embedding.dimension
-        && $0.modelName == embedding.modelName
-        && $0.modelVersion == embedding.modelVersion
-        && $0.modelSource == embedding.modelSource
-        && $0.preprocessingVersion == embedding.preprocessingVersion
     }
     if !averages.isEmpty, compatibleAverages.isEmpty {
       for stored in averages.prefix(3) {
@@ -759,9 +1260,6 @@ actor IdentityPipeline {
         )
       }
     }
-    let sampleMatch = matcher.match(vector: embedding.vector, against: compatibleSamples)
-    let centroidMatch = matcher.match(embedding: embedding, against: averages)
-    let match = sampleMatch.bestSimilarity >= centroidMatch.bestSimilarity ? sampleMatch : centroidMatch
     if match.decision == .known {
       statsMatched += 1
     }
@@ -824,10 +1322,22 @@ actor IdentityPipeline {
       context: context
     )
     logRolling(frame: frame.sequence, match: match, state: state)
+    let currentRecognitionFacePreview: UIImage? = {
+      guard match.decision == .known,
+            let matchedPersonId = match.bestPersonId,
+            state.personId == matchedPersonId else { return nil }
+      return Self.makeThumbnail(from: UIImage(cgImage: primary.crop.alignedCroppedImage), maxPixelSize: 160)
+    }()
 
     if match.decision == .known, let personId = match.bestPersonId, primary.quality.acceptedForEnrollment {
       markCaptureGroupRecognized(frame: frame.sequence, personId: personId, personName: profile?.displayName)
-      try? await saveEnrollmentSample(personId: personId, vector: vector, embedding: embedding, crop: primary.crop, quality: primary.quality, context: context)
+      try? await saveEnrollmentSamples(
+        personId: personId,
+        embeddings: embeddingOutputs.map(\.embedding),
+        crop: primary.crop,
+        quality: primary.quality,
+        context: context
+      )
       if var profile {
         profile.lastSeenAt = now
         profile.updatedAt = now
@@ -836,21 +1346,22 @@ actor IdentityPipeline {
     } else if match.decision == .unknown {
       pendingUnknownPreview = primary.crop.previewImage
       if primary.quality.acceptedForEnrollment {
-        var placeholder = makeEmbeddingRecord(
-          personId: nil,
-          vector: vector,
-          embedding: embedding,
-          crop: primary.crop,
-          quality: primary.quality,
-          context: context
-        )
-        placeholder.sampleImageLocalPath = try? saveCropImage(UIImage(cgImage: primary.crop.alignedCroppedImage), frameSequence: primary.crop.frameSequence, recordId: placeholder.id)
-        pendingUnknownEmbeddings.append(placeholder)
-        pendingUnknownEmbeddings = Array(pendingUnknownEmbeddings.suffix(8))
+        var placeholders = liveEmbeddingRecords
+        let sharedPath = placeholders.first.flatMap {
+          try? saveCropImage(UIImage(cgImage: primary.crop.alignedCroppedImage), frameSequence: primary.crop.frameSequence, recordId: $0.id)
+        }
+        if let sharedPath {
+          for index in placeholders.indices {
+            placeholders[index].sampleImageLocalPath = sharedPath
+          }
+        }
+        pendingUnknownEmbeddings.append(contentsOf: placeholders)
+        pendingUnknownEmbeddings = Self.trimPendingEnrollmentRecords(pendingUnknownEmbeddings, maxPhysicalSamples: 8)
         if enrollmentWaitingForNextSample {
           enrollmentWaitingForNextSample = false
-          enrollmentStatusText = "Sample \(pendingUnknownEmbeddings.count) captured."
-          AppLogger.log(.enrollmentSampleCaptured, "\(context.logPrefix) personDraft=pending sampleIndex=\(pendingUnknownEmbeddings.count) frame=\(frame.sequence) cropSize=\(primary.quality.cropWidth)x\(primary.quality.cropHeight) quality=\(primary.quality.score.map { String(format: "%.3f", $0) } ?? "nil")")
+          let sampleCount = Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)
+          enrollmentStatusText = "Sample \(sampleCount) captured."
+          AppLogger.log(.enrollmentSampleCaptured, "\(context.logPrefix) personDraft=pending sampleIndex=\(sampleCount) vectorCount=\(pendingUnknownEmbeddings.count) frame=\(frame.sequence) cropSize=\(primary.quality.cropWidth)x\(primary.quality.cropHeight) quality=\(primary.quality.score.map { String(format: "%.3f", $0) } ?? "nil")")
         }
       } else {
         if enrollmentWaitingForNextSample {
@@ -860,7 +1371,7 @@ actor IdentityPipeline {
         }
       }
       if state.state == .unknown {
-        AppLogger.log(.enrollment, "\(context.logPrefix) unknownCandidate=\(frame.sequence) quality=\(primary.quality.score.map { String(format: "%.3f", $0) } ?? "nil") tier=\(primary.quality.tier.rawValue) action=shown personId=none acceptedSamples=\(pendingUnknownEmbeddings.count) rejectedSamples=\(pendingUnknownRejectedSamples)")
+        AppLogger.log(.enrollment, "\(context.logPrefix) unknownCandidate=\(frame.sequence) quality=\(primary.quality.score.map { String(format: "%.3f", $0) } ?? "nil") tier=\(primary.quality.tier.rawValue) action=shown personId=none acceptedSamples=\(Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)) acceptedVectors=\(pendingUnknownEmbeddings.count) rejectedSamples=\(pendingUnknownRejectedSamples)")
       }
     }
 
@@ -871,7 +1382,9 @@ actor IdentityPipeline {
       qualityPassCount: accepted.count,
       embeddingGenerated: true,
       matchDecisionText: match.decision.rawValue,
-      embeddingLatencyMS: embedLatencyMS
+      currentRecognitionFacePreview: currentRecognitionFacePreview,
+      embeddingLatencyMS: embedLatencyMS,
+      embeddingMetrics: embeddingMetrics
     )
   }
 
@@ -879,7 +1392,8 @@ actor IdentityPipeline {
     _ = await startAppRunIfNeeded()
     let context = currentContext()
     let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    AppLogger.log(.enrollmentFinishRequest, "\(context.logPrefix) name=\(trimmed.isEmpty ? "none" : trimmed) sampleCount=\(pendingUnknownEmbeddings.count)")
+    var pendingSampleCount = Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)
+    AppLogger.log(.enrollmentFinishRequest, "\(context.logPrefix) name=\(trimmed.isEmpty ? "none" : trimmed) sampleCount=\(pendingSampleCount) vectorCount=\(pendingUnknownEmbeddings.count)")
     enrollmentStatusText = "Creating profile vector..."
     guard !trimmed.isEmpty else {
       enrollmentStatusText = "Name is empty."
@@ -892,11 +1406,13 @@ actor IdentityPipeline {
       enrollmentStatusText = "\"\(trimmed)\" is already in the dictionary."
       return result(summary: "Duplicate name: \(trimmed)")
     }
-    guard pendingUnknownEmbeddings.count >= IdentityConfig.minimumEnrollmentSamples else {
-      AppLogger.log(.enrollment, "\(context.logPrefix) failed reason=notEnoughQualitySamples accepted=\(pendingUnknownEmbeddings.count) required=\(IdentityConfig.minimumEnrollmentSamples)")
+    guard pendingSampleCount >= IdentityConfig.minimumEnrollmentSamples else {
+      AppLogger.log(.enrollment, "\(context.logPrefix) failed reason=notEnoughQualitySamples accepted=\(pendingSampleCount) vectors=\(pendingUnknownEmbeddings.count) required=\(IdentityConfig.minimumEnrollmentSamples)")
       enrollmentStatusText = "Need at least \(IdentityConfig.minimumEnrollmentSamples) good samples before finishing."
       return result(summary: "Need \(IdentityConfig.minimumEnrollmentSamples) quality samples before enrollment")
     }
+    await backfillPendingEnrollmentVectors(context: context)
+    pendingSampleCount = Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)
     let now = Date()
     let profile = PersonProfile(
       id: UUID(),
@@ -911,7 +1427,12 @@ actor IdentityPipeline {
       embeddingIds: pendingUnknownEmbeddings.map(\.id),
       primaryEmbeddingId: pendingUnknownEmbeddings.first?.id
     )
-    try await store.savePersonProfile(profile, context: context)
+    do {
+      try await store.savePersonProfile(profile, context: context)
+    } catch {
+      logEnrollmentWarning("savePendingUnknown savePersonProfileFailed personId=\(profile.id.uuidString) error=\(error.localizedDescription)", context: context)
+      throw error
+    }
     let savedImagePath = try? await saveLastEnrollmentCandidateImageToDisk(nameHint: trimmed)
     if let savedImagePath {
       AppLogger.log(.enrollmentImageSave, "\(context.logPrefix) status=success path=\(savedImagePath)")
@@ -923,7 +1444,12 @@ actor IdentityPipeline {
       saved.appRunId = saved.appRunId ?? context?.appRunId
       saved.conversationSessionId = saved.conversationSessionId ?? context?.conversationSessionId
       saved.sampleImageLocalPath = saved.sampleImageLocalPath ?? savedImagePath
-      try await store.saveEmbedding(saved, context: context)
+      do {
+        try await store.saveEmbedding(saved, context: context)
+      } catch {
+        logEnrollmentWarning("savePendingUnknown saveEmbeddingFailed personId=\(profile.id.uuidString) sampleId=\(saved.id.uuidString) error=\(error.localizedDescription)", context: context)
+        throw error
+      }
     }
     pendingUnknownEmbeddings = []
     pendingUnknownRejectedSamples = 0
@@ -941,10 +1467,10 @@ actor IdentityPipeline {
     let embeddingsAfter = ((try? await store.allEmbeddings()) ?? []).count
     activeState = confirmor.setConfirmed(profile: profile)
     AppLogger.log(.enrollment, "\(context.logPrefix) unknownCandidate=pending quality=nil action=save personId=\(profile.id.uuidString)")
-    AppLogger.log(.enrollment, "\(context.logPrefix) createdPerson id=\(profile.id.uuidString) displayName=\"\(profile.displayName)\" embeddings=\(embeddingCount) cropSaved=\(savedImagePath != nil)")
-    AppLogger.log(.faceVectorStore, "\(context.logPrefix) savedProfile personId=\(profile.id.uuidString) embeddingCount=\(embeddingCount)")
+    AppLogger.log(.enrollment, "\(context.logPrefix) createdPerson id=\(profile.id.uuidString) displayName=\"\(profile.displayName)\" samples=\(pendingSampleCount) embeddings=\(embeddingCount) cropSaved=\(savedImagePath != nil)")
+    AppLogger.log(.faceVectorStore, "\(context.logPrefix) savedProfile personId=\(profile.id.uuidString) sampleCount=\(pendingSampleCount) embeddingCount=\(embeddingCount)")
     AppLogger.log(.enrollmentFinished, "\(context.logPrefix) personId=\(profile.id.uuidString) name=\(profile.displayName) saved=true loadedProfilesAfter=\(cachedProfiles.count) loadedEmbeddingsAfter=\(embeddingsAfter)")
-    enrollmentStatusText = "Enrollment finished for \(trimmed) with \(embeddingCount) samples."
+    enrollmentStatusText = "Enrollment finished for \(trimmed) with \(pendingSampleCount) samples and \(embeddingCount) vectors."
     return result(summary: "Saved \(trimmed)")
   }
 
@@ -953,7 +1479,7 @@ actor IdentityPipeline {
     enrollmentWaitingForNextSample = true
     let draft = name.trimmingCharacters(in: .whitespacesAndNewlines)
     enrollmentStatusText = "Waiting for another good face sample. Turn slightly or change expression."
-    AppLogger.log(.enrollmentAddSampleArmed, "\(context.logPrefix) personDraft=\(draft.isEmpty ? "pending" : draft) currentSampleCount=\(pendingUnknownEmbeddings.count)")
+    AppLogger.log(.enrollmentAddSampleArmed, "\(context.logPrefix) personDraft=\(draft.isEmpty ? "pending" : draft) currentSampleCount=\(Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)) currentVectorCount=\(pendingUnknownEmbeddings.count)")
     return result(summary: enrollmentStatusText)
   }
 
@@ -962,12 +1488,12 @@ actor IdentityPipeline {
     let context = currentContext()
     let draft = name.trimmingCharacters(in: .whitespacesAndNewlines)
     let candidate = lastEnrollmentCandidate
-    let modelLoaded = !(embeddingModel is MissingFaceEmbeddingModel)
-    AppLogger.log(.enrollmentSampleSaveRequest, "\(context.logPrefix) name=\(draft.isEmpty ? "pending" : draft) hasCrop=\(candidate != nil) modelLoaded=\(modelLoaded)")
+    let hasEmbeddingModel = !enrollmentEmbeddingSources().isEmpty
+    AppLogger.log(.enrollmentSampleSaveRequest, "\(context.logPrefix) name=\(draft.isEmpty ? "pending" : draft) hasCrop=\(candidate != nil) modelLoaded=\(hasEmbeddingModel)")
     enrollmentStatusText = "Saving sample..."
-    guard modelLoaded else {
-      enrollmentStatusText = "MobileFaceNet model missing. Add MobileFaceNet.mlmodel or MobileFaceNet.mlpackage to the CameraAccess target."
-      AppLogger.log(.enrollmentSampleSaveFailed, "\(context.logPrefix) reason=modelMissing")
+    guard hasEmbeddingModel else {
+      enrollmentStatusText = "AWS AdaFace is not configured. Start the AdaFace worker before enrolling a face."
+      logEnrollmentWarning("saveCurrentEnrollmentSample failed reason=modelMissing", context: context)
       return result(summary: enrollmentStatusText)
     }
     guard let candidate else {
@@ -986,52 +1512,38 @@ actor IdentityPipeline {
       AppLogger.log(.enrollmentSampleSaveFailed, "\(context.logPrefix) reason=candidateMissingCGImage")
       return result(summary: enrollmentStatusText)
     }
-    if pendingUnknownEmbeddings.contains(where: { $0.frameNumber == candidate.frameSequence }) {
-      enrollmentStatusText = "That frame is already saved. Use Add Another Sample for a new frame."
-      AppLogger.log(.enrollmentSampleSaveFailed, "\(context.logPrefix) reason=duplicateFrame frame=\(candidate.frameSequence)")
-      return result(summary: enrollmentStatusText)
-    }
     do {
-      let embedding = try await embeddingModel.embed(faceImage: cgImage)
-      let recordId = UUID()
-      let path = try? saveCropImage(candidate.alignedCropImage, frameSequence: candidate.frameSequence, recordId: recordId)
-      AppLogger.log(.enrollmentCropSaved, "\(context.logPrefix) sampleIndex=\(pendingUnknownEmbeddings.count + 1) path=\(path ?? "failed")")
-      let record = FaceEmbeddingRecord(
-        id: recordId,
+      let records = try await makeEnrollmentEmbeddingRecords(
+        faceImage: cgImage,
+        cropImage: candidate.alignedCropImage,
         personId: nil,
-        vector: embedding.vector,
-        dimension: embedding.dimension,
+        context: context,
+        frameSequence: candidate.frameSequence,
+        timestamp: candidate.timestamp,
         qualityScore: candidate.qualityScore,
-        sourceFrameTimestamp: candidate.timestamp,
-        createdAt: Date(),
-        sampleImageLocalPath: path,
-        metadata: FaceEmbeddingMetadata(
-          boundingBoxNormalized: CodableCGRect(.zero),
-          cropSize: CodableCGSize(candidate.cropSize),
-          sourceImageSize: CodableCGSize(candidate.sourceImageSize)
-        ),
-        appRunId: context?.appRunId,
-        conversationSessionId: context?.conversationSessionId,
-        modelName: embedding.modelName,
-        modelVersion: embedding.modelVersion,
-        modelSource: embedding.modelSource,
-        preprocessingVersion: embedding.preprocessingVersion,
-        frameNumber: candidate.frameSequence,
         qualityTier: candidate.qualityTier,
-        cropWidth: Int(candidate.cropSize.width),
-        cropHeight: Int(candidate.cropSize.height),
-        sourceFrameWidth: Int(candidate.sourceImageSize.width),
-        sourceFrameHeight: Int(candidate.sourceImageSize.height)
+        cropSize: candidate.cropSize,
+        sourceImageSize: candidate.sourceImageSize
       )
-      pendingUnknownEmbeddings.append(record)
-      pendingUnknownEmbeddings = Array(pendingUnknownEmbeddings.suffix(12))
-      let norm = sqrt(record.vector.reduce(Float(0)) { $0 + $1 * $1 })
-      enrollmentStatusText = "Saved sample \(pendingUnknownEmbeddings.count)."
-      AppLogger.log(.enrollmentSampleSaved, "\(context.logPrefix) personId=pending sampleIndex=\(pendingUnknownEmbeddings.count) embeddingDim=\(embedding.dimension) normAfter=\(String(format: "%.3f", norm)) totalSamples=\(pendingUnknownEmbeddings.count)")
+      let existingKeys = Set(pendingUnknownEmbeddings
+        .filter { Self.enrollmentPhysicalSampleKey(for: $0) == Self.enrollmentPhysicalSampleKey(for: records[0]) }
+        .map { Self.enrollmentEmbeddingSpaceKey(for: $0) })
+      let newRecords = records.filter { !existingKeys.contains(Self.enrollmentEmbeddingSpaceKey(for: $0)) }
+      guard !newRecords.isEmpty else {
+        enrollmentStatusText = "That frame is already saved. Use Add Another Sample for a new frame."
+        AppLogger.log(.enrollmentSampleSaveFailed, "\(context.logPrefix) reason=duplicateFrame frame=\(candidate.frameSequence)")
+        return result(summary: enrollmentStatusText)
+      }
+      pendingUnknownEmbeddings.append(contentsOf: newRecords)
+      pendingUnknownEmbeddings = Self.trimPendingEnrollmentRecords(pendingUnknownEmbeddings, maxPhysicalSamples: 12)
+      let sampleCount = Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)
+      enrollmentStatusText = "Saved sample \(sampleCount) with \(newRecords.count) face vectors."
+      AppLogger.log(.enrollmentCropSaved, "\(context.logPrefix) sampleIndex=\(sampleCount) path=\(newRecords.first?.sampleImageLocalPath ?? "failed")")
+      AppLogger.log(.enrollmentSampleSaved, "\(context.logPrefix) personId=pending sampleIndex=\(sampleCount) vectorsAdded=\(newRecords.count) totalVectors=\(pendingUnknownEmbeddings.count) modelSpaces=\(newRecords.map { $0.modelName }.joined(separator: ","))")
       return result(summary: enrollmentStatusText)
     } catch {
       enrollmentStatusText = "Embedding failed: \(error.localizedDescription)"
-      AppLogger.log(.enrollmentSampleSaveFailed, "\(context.logPrefix) reason=embeddingFailed error=\(error.localizedDescription)")
+      logEnrollmentWarning("saveCurrentEnrollmentSample failed reason=embeddingFailed error=\(error.localizedDescription)", context: context)
       return result(summary: enrollmentStatusText)
     }
   }
@@ -1072,7 +1584,7 @@ actor IdentityPipeline {
       AppLogger.log(.enrollmentImageSave, "\(context.logPrefix) status=success kind=\(candidate.kind) path=\(path)")
       return result(summary: trimmedName.isEmpty ? "Saved face image only" : "Saved image-only profile for \(trimmedName)")
     } catch {
-      AppLogger.log(.enrollmentImageSave, "\(context.logPrefix) status=failed reason=\(error.localizedDescription)")
+      AppLogger.log(.enrollmentImageSave, "\(context.logPrefix) warning...---- status=failed reason=\(error.localizedDescription)")
       return result(summary: "Face image save failed: \(error.localizedDescription)")
     }
   }
@@ -1088,7 +1600,7 @@ actor IdentityPipeline {
       AppLogger.log(.enrollment, "\(context.logPrefix) failed reason=noLastCandidate")
       return result(summary: "No detected face image to save")
     }
-    guard !(embeddingModel is MissingFaceEmbeddingModel) else {
+    guard !enrollmentEmbeddingSources().isEmpty else {
       return await saveLastEnrollmentCandidateImageOnly(name: trimmedName)
     }
     guard let cgImage = candidate.alignedCropImage.cgImage else {
@@ -1097,66 +1609,61 @@ actor IdentityPipeline {
     }
     do {
       let embeddingStartedAt = Date()
-      let embedding = try await embeddingModel.embed(faceImage: cgImage)
-      let path = try? await saveLastEnrollmentCandidateImageToDisk(nameHint: trimmedName)
       let now = Date()
-      let embeddingId = UUID()
+      let profileId = UUID()
+      let records = try await makeEnrollmentEmbeddingRecords(
+        faceImage: cgImage,
+        cropImage: candidate.alignedCropImage,
+        personId: profileId,
+        context: context,
+        frameSequence: candidate.frameSequence,
+        timestamp: candidate.timestamp,
+        qualityScore: candidate.qualityScore,
+        qualityTier: candidate.qualityTier,
+        cropSize: candidate.cropSize,
+        sourceImageSize: candidate.sourceImageSize
+      )
       let profile = PersonProfile(
-        id: UUID(),
+        id: profileId,
         displayName: trimmedName,
         createdAt: now,
         updatedAt: now,
-        notes: path.map { "enrollmentImagePath=\($0)" },
+        notes: records.first?.sampleImageLocalPath.map { "enrollmentImagePath=\($0)" },
         isUnknownPlaceholder: false,
         lastSeenAt: now,
         enrollmentStatus: .enrolled,
         consentStatus: .consented,
-        embeddingIds: [embeddingId],
-        primaryEmbeddingId: embeddingId
+        embeddingIds: records.map(\.id),
+        primaryEmbeddingId: records.first?.id
       )
-      try await store.savePersonProfile(profile, context: context)
-      let record = FaceEmbeddingRecord(
-        id: embeddingId,
-        personId: profile.id,
-        vector: embedding.vector,
-        dimension: embedding.dimension,
-        qualityScore: candidate.qualityScore,
-        sourceFrameTimestamp: candidate.timestamp,
-        createdAt: now,
-        sampleImageLocalPath: path,
-        metadata: FaceEmbeddingMetadata(
-          boundingBoxNormalized: CodableCGRect(.zero),
-          cropSize: CodableCGSize(candidate.cropSize),
-          sourceImageSize: CodableCGSize(candidate.sourceImageSize)
-        ),
-        appRunId: context?.appRunId,
-        conversationSessionId: context?.conversationSessionId,
-        modelName: embedding.modelName,
-        modelVersion: embedding.modelVersion,
-        modelSource: embedding.modelSource,
-        preprocessingVersion: embedding.preprocessingVersion,
-        frameNumber: candidate.frameSequence,
-        qualityTier: candidate.qualityTier,
-        cropWidth: Int(candidate.cropSize.width),
-        cropHeight: Int(candidate.cropSize.height),
-        sourceFrameWidth: Int(candidate.sourceImageSize.width),
-        sourceFrameHeight: Int(candidate.sourceImageSize.height)
-      )
-      try await store.saveEmbedding(record, context: context)
+      do {
+        try await store.savePersonProfile(profile, context: context)
+      } catch {
+        logEnrollmentWarning("saveLastEnrollmentCandidate savePersonProfileFailed personId=\(profile.id.uuidString) error=\(error.localizedDescription)", context: context)
+        throw error
+      }
+      for record in records {
+        do {
+          try await store.saveEmbedding(record, context: context)
+        } catch {
+          logEnrollmentWarning("saveLastEnrollmentCandidate saveEmbeddingFailed personId=\(profile.id.uuidString) sampleId=\(record.id.uuidString) error=\(error.localizedDescription)", context: context)
+          throw error
+        }
+      }
       cachedProfiles = (try? await store.loadPeople()) ?? cachedProfiles
       activeState = confirmor.setConfirmed(profile: profile)
       let elapsedMS = Date().timeIntervalSince(embeddingStartedAt) * 1_000
       AppLogger.log(
         .enrollment,
-        "\(context.logPrefix) name=\(trimmedName) status=success embeddingDim=\(embedding.dimension) totalEmbeddings=1 recognitionReady=true elapsedMs=\(String(format: "%.1f", elapsedMS))"
+        "\(context.logPrefix) name=\(trimmedName) status=success totalEmbeddings=\(records.count) recognitionReady=true elapsedMs=\(String(format: "%.1f", elapsedMS)) modelSpaces=\(records.map { $0.modelName }.joined(separator: ","))"
       )
       AppLogger.log(
         .faceVectorStore,
-        "\(context.logPrefix) person=\(trimmedName) embeddingsAdded=1 totalValid=1 dim=\(embedding.dimension) centroidUpdated=true"
+        "\(context.logPrefix) person=\(trimmedName) embeddingsAdded=\(records.count) totalValid=\(records.count) centroidUpdated=true"
       )
-      return result(summary: "Saved \(trimmedName) with 1 embedding")
+      return result(summary: "Saved \(trimmedName) with \(records.count) face embeddings")
     } catch {
-      AppLogger.log(.enrollment, "\(context.logPrefix) failed reason=embeddingFailed error=\(error.localizedDescription)")
+      logEnrollmentWarning("saveLastEnrollmentCandidate failed reason=embeddingFailed error=\(error.localizedDescription)", context: context)
       return result(summary: "Embedding failed; use Save Image Only. \(error.localizedDescription)")
     }
   }
@@ -1166,33 +1673,89 @@ actor IdentityPipeline {
     let context = currentContext()
     let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmedName.isEmpty else { return result(summary: "Name is empty") }
-    guard let groupIndex = captureGroups.firstIndex(where: { !$0.samples.isEmpty }) else {
+    guard let groupIndex = bestCapturedFaceGroupIndex() else {
       return result(summary: "No captured face group to save")
     }
     let group = captureGroups[groupIndex]
     let rankedSamples = group.samples
-      .compactMap { sample -> (sample: CapturedFaceSampleSnapshot, record: FaceEmbeddingRecord)? in
-        guard let record = sample.embeddingRecord else { return nil }
-        return (sample, record)
-      }
       .sorted { lhs, rhs in
-        let lhsEnrollmentBoost = lhs.sample.qualityTier == .usableForEnrollment || lhs.sample.qualityTier == .preferredEnrollment ? Float(1) : Float(0)
-        let rhsEnrollmentBoost = rhs.sample.qualityTier == .usableForEnrollment || rhs.sample.qualityTier == .preferredEnrollment ? Float(1) : Float(0)
-        let lhsScore = (lhs.sample.qualityScore ?? 0) + lhsEnrollmentBoost
-        let rhsScore = (rhs.sample.qualityScore ?? 0) + rhsEnrollmentBoost
+        let lhsEnrollmentBoost = lhs.qualityTier == .usableForEnrollment || lhs.qualityTier == .preferredEnrollment ? Float(1) : Float(0)
+        let rhsEnrollmentBoost = rhs.qualityTier == .usableForEnrollment || rhs.qualityTier == .preferredEnrollment ? Float(1) : Float(0)
+        let lhsScore = (lhs.qualityScore ?? 0) + lhsEnrollmentBoost
+        let rhsScore = (rhs.qualityScore ?? 0) + rhsEnrollmentBoost
         if lhsScore == rhsScore {
-          return lhs.sample.cropSize.width * lhs.sample.cropSize.height > rhs.sample.cropSize.width * rhs.sample.cropSize.height
+          return lhs.cropSize.width * lhs.cropSize.height > rhs.cropSize.width * rhs.cropSize.height
         }
         return lhsScore > rhsScore
       }
     let selectedSamples = Array(rankedSamples.prefix(3))
     guard selectedSamples.count >= 3 else {
-      AppLogger.log(.enrollment, "\(context.logPrefix) capturedGroupSaveBlocked reason=needThreeEmbeddings availableEmbeddings=\(rankedSamples.count)")
-      return result(summary: "Need 3 embedded face pictures before saving \(trimmedName)")
+      AppLogger.log(.enrollment, "\(context.logPrefix) capturedGroupSaveBlocked reason=needThreeSamples availableSamples=\(rankedSamples.count)")
+      return result(summary: "Need 3 captured face pictures before saving \(trimmedName)")
     }
     let now = Date()
+    let profileId = UUID()
+    var recordsToSave: [FaceEmbeddingRecord] = []
+    var embeddedPhysicalFrames = Set<UInt64>()
+    for selected in selectedSamples {
+      var retainedRecords = selected.embeddingRecords
+      var retainedKeys = Set(retainedRecords.map { Self.enrollmentEmbeddingSpaceKey(for: $0) })
+      var sharedImagePath = retainedRecords.compactMap(\.sampleImageLocalPath).first
+      if !retainedRecords.isEmpty {
+        if sharedImagePath == nil {
+          sharedImagePath = try? saveCropImage(
+            selected.cropImage,
+            frameSequence: selected.frameSequence,
+            recordId: retainedRecords.first?.id ?? UUID()
+          )
+        }
+        for index in retainedRecords.indices {
+          retainedRecords[index].personId = profileId
+          retainedRecords[index].appRunId = retainedRecords[index].appRunId ?? context?.appRunId
+          retainedRecords[index].conversationSessionId = retainedRecords[index].conversationSessionId ?? context?.conversationSessionId
+          retainedRecords[index].sampleImageLocalPath = retainedRecords[index].sampleImageLocalPath ?? sharedImagePath
+        }
+        recordsToSave.append(contentsOf: retainedRecords)
+        embeddedPhysicalFrames.insert(selected.frameSequence)
+      }
+      guard let cgImage = selected.cropImage.cgImage else {
+        logEnrollmentWarning("capturedGroup sampleMissingCGImage frame=\(selected.frameSequence)", context: context)
+        continue
+      }
+      do {
+        let records = try await makeEnrollmentEmbeddingRecords(
+          faceImage: cgImage,
+          cropImage: selected.cropImage,
+          personId: profileId,
+          context: context,
+          frameSequence: selected.frameSequence,
+          timestamp: selected.timestamp,
+          qualityScore: selected.qualityScore,
+          qualityTier: selected.qualityTier,
+          cropSize: selected.cropSize,
+          sourceImageSize: selected.sourceImageSize,
+          existingImagePath: sharedImagePath
+        )
+        let missingRecords = records.filter { !retainedKeys.contains(Self.enrollmentEmbeddingSpaceKey(for: $0)) }
+        retainedKeys.formUnion(missingRecords.map { Self.enrollmentEmbeddingSpaceKey(for: $0) })
+        recordsToSave.append(contentsOf: missingRecords)
+        if !missingRecords.isEmpty {
+          embeddedPhysicalFrames.insert(selected.frameSequence)
+        }
+      } catch {
+        if retainedRecords.isEmpty {
+          logEnrollmentWarning("capturedGroup embeddingFailed frame=\(selected.frameSequence) error=\(error.localizedDescription)", context: context)
+        } else {
+          logEnrollmentWarning("capturedGroup backfillEmbeddingFailed frame=\(selected.frameSequence) retainedVectors=\(retainedRecords.count) error=\(error.localizedDescription)", context: context)
+        }
+      }
+    }
+    guard embeddedPhysicalFrames.count >= IdentityConfig.minimumEnrollmentSamples else {
+      logEnrollmentWarning("capturedGroupSaveBlocked reason=notEnoughEmbeddedPhysicalSamples embedded=\(embeddedPhysicalFrames.count) required=\(IdentityConfig.minimumEnrollmentSamples)", context: context)
+      return result(summary: "Need \(IdentityConfig.minimumEnrollmentSamples) embedded face pictures before saving \(trimmedName)")
+    }
     let profile = PersonProfile(
-      id: UUID(),
+      id: profileId,
       displayName: trimmedName,
       createdAt: now,
       updatedAt: now,
@@ -1201,19 +1764,24 @@ actor IdentityPipeline {
       lastSeenAt: now,
       enrollmentStatus: .enrolled,
       consentStatus: .consented,
-      embeddingIds: selectedSamples.map(\.record.id),
-      primaryEmbeddingId: selectedSamples.first?.record.id
+      embeddingIds: recordsToSave.map(\.id),
+      primaryEmbeddingId: recordsToSave.first?.id
     )
     do {
-      try await store.savePersonProfile(profile, context: context)
+      do {
+        try await store.savePersonProfile(profile, context: context)
+      } catch {
+        logEnrollmentWarning("capturedGroup savePersonProfileFailed personId=\(profile.id.uuidString) error=\(error.localizedDescription)", context: context)
+        throw error
+      }
       var savedCount = 0
-      for selected in selectedSamples {
-        var saved = selected.record
-        saved.personId = profile.id
-        if saved.sampleImageLocalPath == nil {
-          saved.sampleImageLocalPath = try? saveCropImage(selected.sample.cropImage, frameSequence: selected.sample.frameSequence, recordId: saved.id)
+      for saved in recordsToSave {
+        do {
+          try await store.saveEmbedding(saved, context: context)
+        } catch {
+          logEnrollmentWarning("capturedGroup saveEmbeddingFailed personId=\(profile.id.uuidString) sampleId=\(saved.id.uuidString) error=\(error.localizedDescription)", context: context)
+          throw error
         }
-        try await store.saveEmbedding(saved, context: context)
         savedCount += 1
       }
       captureGroups.remove(at: groupIndex)
@@ -1228,25 +1796,27 @@ actor IdentityPipeline {
           "\(context.logPrefix) personId=\(profile.id.uuidString) sampleCount=\(centroid.sampleCount) dim=\(centroid.vectorDimension) normAfter=\(String(format: "%.3f", norm)) modelName=\(centroid.modelName) preprocessing=\(centroid.preprocessingVersion) source=capturedPictures"
         )
       }
-      let selectedFrames = selectedSamples.map { String($0.sample.frameSequence) }.joined(separator: ",")
-      AppLogger.log(.profileSave, "\(context.logPrefix) name=\(trimmedName) personId=\(profile.id.uuidString) samplesAvailable=\(group.samples.count) embeddingsAvailable=\(rankedSamples.count) bestThreeFrames=[\(selectedFrames)] embeddingsAdded=\(savedCount)")
-      return result(summary: "Saved \(trimmedName) from the best 3 captured face embeddings and averaged them")
+      let selectedFrames = selectedSamples.map { String($0.frameSequence) }.joined(separator: ",")
+      AppLogger.log(.profileSave, "\(context.logPrefix) name=\(trimmedName) personId=\(profile.id.uuidString) samplesAvailable=\(group.samples.count) embeddedPhysicalSamples=\(embeddedPhysicalFrames.count) bestThreeFrames=[\(selectedFrames)] embeddingsAdded=\(savedCount)")
+      return result(summary: "Saved \(trimmedName) from the best \(embeddedPhysicalFrames.count) captured face samples with \(savedCount) embeddings")
     } catch {
+      logEnrollmentWarning("capturedGroup saveFailed error=\(error.localizedDescription)", context: context)
       return result(summary: "Captured group save failed: \(error.localizedDescription)")
     }
   }
 
   func ignoreFirstCapturedFaceGroup() -> IdentityProcessingResult {
     let context = currentContext()
-    guard !captureGroups.isEmpty else { return result(summary: "No captured face group to ignore") }
-    let group = captureGroups.removeFirst()
+    guard let groupIndex = bestCapturedFaceGroupIndex() else { return result(summary: "No captured face group to ignore") }
+    let group = captureGroups.remove(at: groupIndex)
     AppLogger.log(.streamEndedReview, "\(context.logPrefix) action=ignore group=\(group.id.uuidString) samples=\(group.samples.count)")
     return result(summary: "Ignored captured face group")
   }
 
   func ignorePendingUnknown() -> IdentityProcessingResult {
     let context = currentContext()
-    let pending = pendingUnknownEmbeddings.count
+    let pendingSamples = Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings)
+    let pendingVectors = pendingUnknownEmbeddings.count
     pendingUnknownEmbeddings = []
     pendingUnknownRejectedSamples = 0
     pendingUnknownPreview = nil
@@ -1254,7 +1824,7 @@ actor IdentityPipeline {
     enrollmentStatusText = "Enrollment cancelled."
     lastPromptAt = Date()
     AppLogger.log(.enrollmentUI, "\(context.logPrefix) action=cancel tapped=true state=\(activeState.state.rawValue)")
-    AppLogger.log(.enrollmentCancel, "\(context.logPrefix) personDraft=pending pendingSamples=\(pending) cleared=true")
+    AppLogger.log(.enrollmentCancel, "\(context.logPrefix) personDraft=pending pendingSamples=\(pendingSamples) pendingVectors=\(pendingVectors) cleared=true")
     AppLogger.log(.enrollment, "\(context.logPrefix) unknownCandidate=pending quality=nil action=ignore personId=none")
     return result(summary: "Unknown enrollment ignored")
   }
@@ -1453,28 +2023,35 @@ actor IdentityPipeline {
     activeConversation = nil
   }
 
-  private func saveEnrollmentSample(
+  private func saveEnrollmentSamples(
     personId: UUID,
-    vector: [Float],
-    embedding: FaceEmbedding,
+    embeddings: [FaceEmbedding],
     crop: FaceCropResult,
     quality: FaceQualityDecision,
     context: PipelineContext?
   ) async throws {
-    let existing = (try? await store.embeddingsForPerson(personId)) ?? []
-    guard existing.count < 12 else { return }
-    var record = makeEmbeddingRecord(
+    let uniqueRecords = makeEmbeddingRecords(
       personId: personId,
-      vector: vector,
-      embedding: embedding,
+      embeddings: embeddings,
       crop: crop,
       quality: quality,
       context: context
     )
-    if IdentityConfig.saveDebugFaceCrops {
-      record.sampleImageLocalPath = try? saveCropImage(UIImage(cgImage: crop.alignedCroppedImage), frameSequence: crop.frameSequence, recordId: record.id)
+    guard !uniqueRecords.isEmpty else { return }
+    let existing = (try? await store.embeddingsForPerson(personId)) ?? []
+    var sharedImagePath: String?
+    for var record in uniqueRecords {
+      let key = Self.enrollmentEmbeddingSpaceKey(for: record)
+      let existingForSpace = existing.filter { Self.enrollmentEmbeddingSpaceKey(for: $0) == key }
+      guard existingForSpace.count < 12 else { continue }
+      if IdentityConfig.saveDebugFaceCrops {
+        if sharedImagePath == nil {
+          sharedImagePath = try? saveCropImage(UIImage(cgImage: crop.alignedCroppedImage), frameSequence: crop.frameSequence, recordId: record.id)
+        }
+        record.sampleImageLocalPath = sharedImagePath
+      }
+      try await store.saveEmbedding(record, context: context)
     }
-    try await store.saveEmbedding(record, context: context)
   }
 
   private func saveCropImage(_ image: UIImage, frameSequence: UInt64, recordId: UUID) throws -> String {
@@ -1495,6 +2072,7 @@ actor IdentityPipeline {
   private func autoCaptureFaceSample(
     candidate: IdentityCandidate,
     embedding: FaceEmbedding?,
+    embeddingRecords: [FaceEmbeddingRecord] = [],
     context: PipelineContext?,
     embeddingStatus: String
   ) {
@@ -1513,11 +2091,14 @@ actor IdentityPipeline {
     }
 
     let resolvedIndex: Int
-    if let index = captureGroupIndex(for: candidate, embedding: embedding) {
-      resolvedIndex = index
+    let groupMatch: CaptureGroupMatch?
+    if let match = captureGroupMatch(for: candidate, embedding: embedding) {
+      resolvedIndex = match.index
+      groupMatch = match
     } else {
       captureGroups.append(CapturedFaceGroup(id: UUID(), samples: [], firstSeenAt: Date(), lastSeenAt: Date(), bestQuality: 0, status: "unknown"))
       resolvedIndex = captureGroups.count - 1
+      groupMatch = nil
     }
 
     guard captureGroups[resolvedIndex].samples.count < maxSamplesPerCaptureGroup else {
@@ -1530,8 +2111,15 @@ actor IdentityPipeline {
     }
 
     let groupId = captureGroups[resolvedIndex].id
-    let record = embedding.map {
-      makeEmbeddingRecord(personId: nil, vector: $0.vector, embedding: $0, crop: candidate.crop, quality: candidate.quality, context: context)
+    let records: [FaceEmbeddingRecord]
+    if !embeddingRecords.isEmpty {
+      records = embeddingRecords
+    } else if let embedding {
+      records = [
+        makeEmbeddingRecord(personId: nil, vector: embedding.vector, embedding: embedding, crop: candidate.crop, quality: candidate.quality, context: context)
+      ]
+    } else {
+      records = []
     }
     let sample = CapturedFaceSampleSnapshot(
       id: UUID(),
@@ -1546,36 +2134,98 @@ actor IdentityPipeline {
       qualityTier: candidate.quality.tier,
       rawFaceWidth: candidate.quality.rawFaceWidth,
       rawFaceHeight: candidate.quality.rawFaceHeight,
-      embeddingRecord: record,
+      faceBoxPixels: candidate.crop.rawFaceBoundingBoxPixels,
+      embeddingRecords: records,
       embeddingStatus: embeddingStatus
     )
     captureGroups[resolvedIndex].samples.append(sample)
     captureGroups[resolvedIndex].lastSeenAt = Date()
     captureGroups[resolvedIndex].bestQuality = max(captureGroups[resolvedIndex].bestQuality, candidate.quality.score ?? 0)
     totalSessionCaptures += 1
-    AppLogger.log(.faceCaptureSave, "\(context.logPrefix) session=\(context?.conversationSessionId?.uuidString ?? "none") captureId=\(sample.id.uuidString) track=\(groupId.uuidString) frame=\(frame) cropSize=\(Int(sample.cropSize.width))x\(Int(sample.cropSize.height)) quality=\(sample.qualityScore.map { String(format: "%.3f", $0) } ?? "nil") embeddingStatus=\(embeddingStatus)")
-    AppLogger.log(.faceTrack, "\(context.logPrefix) frame=\(frame) captureId=\(sample.id.uuidString) assignedGroup=\(groupId.uuidString) method=\(embedding == nil ? "boxTemporal" : "embeddingOrBox") score=nil reason=autoCapture")
+    AppLogger.log(.faceCaptureSave, "\(context.logPrefix) session=\(context?.conversationSessionId?.uuidString ?? "none") captureId=\(sample.id.uuidString) track=\(groupId.uuidString) frame=\(frame) cropSize=\(Int(sample.cropSize.width))x\(Int(sample.cropSize.height)) quality=\(sample.qualityScore.map { String(format: "%.3f", $0) } ?? "nil") embeddingStatus=\(embeddingStatus) vectorCount=\(records.count) modelSpaces=\(records.map { $0.modelName }.joined(separator: ","))")
+    AppLogger.log(.faceTrack, "\(context.logPrefix) frame=\(frame) captureId=\(sample.id.uuidString) assignedGroup=\(groupId.uuidString) method=\(groupMatch?.method ?? "newGroup") score=\(groupMatch?.score.map { String(format: "%.3f", $0) } ?? "nil") reason=\(groupMatch?.reason ?? "firstSample")")
     AppLogger.log(.faceGroupUpdate, "\(context.logPrefix) group=\(groupId.uuidString) sampleCount=\(captureGroups[resolvedIndex].samples.count) bestQuality=\(String(format: "%.3f", captureGroups[resolvedIndex].bestQuality)) suggestedLabel=none status=\(captureGroups[resolvedIndex].status)")
   }
 
-  private func captureGroupIndex(for candidate: IdentityCandidate, embedding: FaceEmbedding?) -> Int? {
+  private func captureGroupMatch(for candidate: IdentityCandidate, embedding: FaceEmbedding?) -> CaptureGroupMatch? {
+    var bestMatch: CaptureGroupMatch?
+    var bestRank: Float = -.greatestFiniteMagnitude
+    let candidateBox = candidate.crop.rawFaceBoundingBoxPixels
+    let candidateTimestamp = candidate.crop.frameTimestamp
+
     for index in captureGroups.indices.reversed() {
-      guard let last = captureGroups[index].samples.last else { continue }
-      if let embedding, let lastVector = last.embeddingRecord?.vector, lastVector.count == embedding.vector.count {
-        if FaceMatcher.cosineSimilarity(embedding.vector, lastVector) >= 0.68 {
-          return index
+      let group = captureGroups[index]
+      guard let last = group.samples.last else { continue }
+      let timeGap = abs(candidateTimestamp.timeIntervalSince(last.timestamp))
+      let centerDistance = Self.normalizedFaceCenterDistance(candidateBox, last.faceBoxPixels, sourceSize: candidate.crop.sourceImageSize)
+      let sizeSimilarity = Self.faceBoxSizeSimilarity(candidateBox, last.faceBoxPixels)
+      let temporalScore = max(Float(0), Float(1 - centerDistance)) * 0.70
+        + max(Float(0), Float(sizeSimilarity)) * 0.30
+
+      if let embedding, let embeddingScore = bestEmbeddingSimilarity(for: embedding, in: group) {
+        if embeddingScore >= 0.50 {
+          let match = CaptureGroupMatch(
+            index: index,
+            method: "embedding",
+            score: embeddingScore,
+            reason: "sameEmbeddingSpace"
+          )
+          if embeddingScore + 2.0 > bestRank {
+            bestRank = embeddingScore + 2.0
+            bestMatch = match
+          }
+          continue
+        }
+
+        if timeGap <= 15.0, centerDistance <= 0.45, embeddingScore >= 0.35 {
+          let combined = (embeddingScore * 0.55) + (temporalScore * 0.45)
+          let match = CaptureGroupMatch(
+            index: index,
+            method: "embeddingTemporal",
+            score: combined,
+            reason: "sameRecentFace"
+          )
+          if combined + 1.0 > bestRank {
+            bestRank = combined + 1.0
+            bestMatch = match
+          }
+          continue
         }
       }
-      let candidateCenter = CGPoint(x: candidate.crop.faceBoundingBoxPixels.midX, y: candidate.crop.faceBoundingBoxPixels.midY)
-      let lastFrameSize = last.sourceImageSize
-      let lastCenter = CGPoint(x: lastFrameSize.width / 2, y: lastFrameSize.height / 2)
-      let frameDiagonal = max(hypot(candidate.crop.sourceImageSize.width, candidate.crop.sourceImageSize.height), 1)
-      let distance = hypot(candidateCenter.x - lastCenter.x, candidateCenter.y - lastCenter.y) / frameDiagonal
-      if Date().timeIntervalSince(last.timestamp) < 3.0 && distance < 0.25 {
-        return index
+
+      guard timeGap <= 8.0, centerDistance <= 0.30, sizeSimilarity >= 0.35 else { continue }
+      let match = CaptureGroupMatch(
+        index: index,
+        method: "boxTemporal",
+        score: temporalScore,
+        reason: "sameRecentBox"
+      )
+      if temporalScore > bestRank {
+        bestRank = temporalScore
+        bestMatch = match
       }
     }
-    return nil
+    return bestMatch
+  }
+
+  private func bestEmbeddingSimilarity(for embedding: FaceEmbedding, in group: CapturedFaceGroup) -> Float? {
+    let embeddingKey = Self.enrollmentEmbeddingSpaceKey(for: embedding)
+    return group.samples
+      .flatMap(\.embeddingRecords)
+      .filter { Self.enrollmentEmbeddingSpaceKey(for: $0) == embeddingKey && $0.vector.count == embedding.vector.count }
+      .map { FaceMatcher.cosineSimilarity(embedding.vector, $0.vector) }
+      .max()
+  }
+
+  private static func normalizedFaceCenterDistance(_ lhs: CGRect, _ rhs: CGRect, sourceSize: CGSize) -> CGFloat {
+    let frameDiagonal = max(hypot(sourceSize.width, sourceSize.height), 1)
+    return hypot(lhs.midX - rhs.midX, lhs.midY - rhs.midY) / frameDiagonal
+  }
+
+  private static func faceBoxSizeSimilarity(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+    let lhsArea = max(lhs.width * lhs.height, 1)
+    let rhsArea = max(rhs.width * rhs.height, 1)
+    return min(lhsArea, rhsArea) / max(lhsArea, rhsArea)
   }
 
   private func shouldSaveDiverseSample(candidate: IdentityCandidate, embedding: FaceEmbedding?, group: CapturedFaceGroup, context: PipelineContext?) -> Bool {
@@ -1602,6 +2252,31 @@ actor IdentityPipeline {
     }
     AppLogger.log(.faceSampleDiversity, "\(context.logPrefix) group=\(group.id.uuidString) candidateFrame=\(candidate.crop.frameSequence) saved=false reason=duplicateRecent score=0.000")
     return false
+  }
+
+  private func makeEmbeddingRecords(
+    personId: UUID?,
+    embeddings: [FaceEmbedding],
+    crop: FaceCropResult,
+    quality: FaceQualityDecision,
+    context: PipelineContext?
+  ) -> [FaceEmbeddingRecord] {
+    var seenSpaces = Set<String>()
+    var records: [FaceEmbeddingRecord] = []
+    for embedding in embeddings {
+      let key = Self.enrollmentEmbeddingSpaceKey(for: embedding)
+      guard !seenSpaces.contains(key) else { continue }
+      seenSpaces.insert(key)
+      records.append(makeEmbeddingRecord(
+        personId: personId,
+        vector: embedding.vector,
+        embedding: embedding,
+        crop: crop,
+        quality: quality,
+        context: context
+      ))
+    }
+    return records
   }
 
   private func makeEmbeddingRecord(
@@ -1754,8 +2429,37 @@ actor IdentityPipeline {
     captureGroups[index].recognizedPersonName = personName
   }
 
+  private func bestCapturedFaceGroupIndex() -> Int? {
+    captureGroups.indices
+      .filter { !captureGroups[$0].samples.isEmpty }
+      .max { lhs, rhs in
+        isCaptureGroupRankedBefore(captureGroups[lhs], captureGroups[rhs])
+      }
+  }
+
+  private func captureGroupDisplayIndices() -> [Int] {
+    captureGroups.indices.sorted {
+      isCaptureGroupRankedBefore(captureGroups[$1], captureGroups[$0])
+    }
+  }
+
+  private func isCaptureGroupRankedBefore(_ lhs: CapturedFaceGroup, _ rhs: CapturedFaceGroup) -> Bool {
+    let lhsNeedsReview = lhs.recognizedPersonId == nil
+    let rhsNeedsReview = rhs.recognizedPersonId == nil
+    if lhsNeedsReview != rhsNeedsReview { return !lhsNeedsReview && rhsNeedsReview }
+
+    let lhsEmbedded = lhs.samples.filter { !$0.embeddingRecords.isEmpty }.count
+    let rhsEmbedded = rhs.samples.filter { !$0.embeddingRecords.isEmpty }.count
+    if lhsEmbedded != rhsEmbedded { return lhsEmbedded < rhsEmbedded }
+
+    if lhs.samples.count != rhs.samples.count { return lhs.samples.count < rhs.samples.count }
+    if lhs.bestQuality != rhs.bestQuality { return lhs.bestQuality < rhs.bestQuality }
+    return lhs.lastSeenAt < rhs.lastSeenAt
+  }
+
   private func captureGroupSnapshots() -> [CapturedFaceGroupSnapshot] {
-    captureGroups.map { group in
+    captureGroupDisplayIndices().map { index in
+      let group = captureGroups[index]
       let qualities = group.samples.compactMap(\.qualityScore)
       let minQ = qualities.min().map { String(format: "%.2f", $0) } ?? "nil"
       let maxQ = qualities.max().map { String(format: "%.2f", $0) } ?? "nil"
@@ -1862,6 +2566,54 @@ actor IdentityPipeline {
     }
   }
 
+  private static func thumbnailImage(from embeddings: [FaceEmbeddingRecord]) -> UIImage? {
+    let ordered = embeddings.sorted { left, right in
+      let leftQuality = left.qualityScore ?? -1
+      let rightQuality = right.qualityScore ?? -1
+      if leftQuality != rightQuality {
+        return leftQuality > rightQuality
+      }
+      return left.createdAt > right.createdAt
+    }
+    for record in ordered {
+      guard let path = record.sampleImageLocalPath,
+            let thumbnail = thumbnailImage(atLocalPath: path) else { continue }
+      return thumbnail
+    }
+    return nil
+  }
+
+  private static func thumbnailImage(fromProfileNotes notes: String?) -> UIImage? {
+    for path in thumbnailPaths(fromProfileNotes: notes) {
+      if let thumbnail = thumbnailImage(atLocalPath: path) {
+        return thumbnail
+      }
+    }
+    return nil
+  }
+
+  private static func thumbnailPaths(fromProfileNotes notes: String?) -> [String] {
+    guard let notes else { return [] }
+    return notes.components(separatedBy: CharacterSet(charactersIn: ";\n"))
+      .compactMap { component -> String? in
+        let parts = component.split(separator: "=", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        let key = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard key == "enrollmentImagePath" || key == "imageOnlyEnrollmentPath" else { return nil }
+        let path = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
+      }
+  }
+
+  private static func thumbnailImage(atLocalPath path: String) -> UIImage? {
+    let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty,
+          let image = UIImage(contentsOfFile: trimmed) else {
+      return nil
+    }
+    return makeThumbnail(from: image, maxPixelSize: 160)
+  }
+
   private static func safeFileComponent(_ value: String) -> String {
     let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
     let scalars = value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
@@ -1913,7 +2665,9 @@ actor IdentityPipeline {
     qualityPassCount: Int = 0,
     embeddingGenerated: Bool = false,
     matchDecisionText: String = "none",
+    currentRecognitionFacePreview: UIImage? = nil,
     embeddingLatencyMS: Double = 0,
+    embeddingMetrics: [FaceEmbeddingDebugMetric] = [],
     alignmentRejectedCount: Int = 0
   ) -> IdentityProcessingResult {
     let suppressPrompt: Bool
@@ -1928,6 +2682,7 @@ actor IdentityPipeline {
       activeIdentity: activeState,
       pendingEnrollmentFacePreview: suppressPrompt ? nil : pendingUnknownPreview,
       lastEnrollmentCandidatePreview: retainedCandidate?.thumbnailImage,
+      currentRecognitionFacePreview: currentRecognitionFacePreview,
       hasLastEnrollmentCandidate: retainedCandidate != nil,
       lastEnrollmentCandidateSummary: retainedCandidate?.summaryText ?? "No saved face candidate",
       modelStatusText: embeddingModelStatusText(),
@@ -1939,8 +2694,9 @@ actor IdentityPipeline {
       embeddingGenerated: embeddingGenerated,
       matchDecisionText: matchDecisionText,
       embeddingLatencyMS: embeddingLatencyMS,
+      embeddingMetrics: embeddingMetrics,
       alignmentRejectedCount: alignmentRejectedCount,
-      pendingEnrollmentAcceptedSamples: pendingUnknownEmbeddings.count,
+      pendingEnrollmentAcceptedSamples: Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings),
       pendingEnrollmentRequiredSamples: IdentityConfig.minimumEnrollmentSamples,
       pendingEnrollmentRejectedSamples: pendingUnknownRejectedSamples,
       enrollmentStatusText: enrollmentStatusText,
@@ -2019,7 +2775,7 @@ actor IdentityPipeline {
       appRunId: appRunId,
       conversationSessionId: conversationSessionId,
       detectedFacesThisSession: 0,
-      acceptedFaceCropsThisSession: pendingUnknownEmbeddings.count,
+      acceptedFaceCropsThisSession: Self.enrollmentPhysicalSampleCount(in: pendingUnknownEmbeddings),
       embeddingsSavedThisSession: pendingUnknownEmbeddings.count,
       transcriptChunksSavedThisSession: 0
     )

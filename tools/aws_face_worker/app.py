@@ -1,8 +1,12 @@
 import base64
+import hashlib
+import hmac
 import io
+import json
 import os
 import shutil
 import sys
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -60,7 +64,8 @@ def load_model() -> None:
 
 
 @app.get("/health")
-def health() -> dict:
+def health(authorization: Optional[str] = Header(default=None)) -> dict:
+    require_authorization(authorization)
     return {
         "status": "ok",
         "device": str(device),
@@ -74,10 +79,7 @@ def health() -> dict:
 
 @app.post("/face/embed", response_model=FaceEmbedResponse)
 def embed_face(payload: FaceEmbedRequest, authorization: Optional[str] = Header(default=None)) -> FaceEmbedResponse:
-    expected_key = os.environ.get("FACE_WORKER_API_KEY", "").strip()
-    if expected_key:
-        if authorization != f"Bearer {expected_key}":
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    require_authorization(authorization)
 
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -103,6 +105,48 @@ def embed_face(payload: FaceEmbedRequest, authorization: Optional[str] = Header(
         model_source=MODEL_SOURCE,
         preprocessing_version=PREPROCESSING_VERSION,
     )
+
+
+def require_authorization(authorization: Optional[str]) -> None:
+    if validate_worker_session_token(authorization, expected_worker="face"):
+        return
+    expected_key = os.environ.get("FACE_WORKER_API_KEY", "").strip()
+    if expected_key and authorization != f"Bearer {expected_key}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def validate_worker_session_token(authorization: Optional[str], expected_worker: str) -> bool:
+    secret = os.environ.get("WORKER_TOKEN_SIGNING_SECRET", "").strip()
+    if not secret or not authorization or not authorization.startswith("Bearer "):
+        return False
+    token = authorization.removeprefix("Bearer ").strip()
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    signing_input = f"{parts[0]}.{parts[1]}".encode("utf-8")
+    expected_signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    if not hmac.compare_digest(base64url_encode(expected_signature), parts[2]):
+        return False
+    try:
+        payload = json.loads(base64url_decode(parts[1]).decode("utf-8"))
+    except Exception:
+        return False
+    now = int(time.time())
+    return (
+        payload.get("aud") == "memento-worker"
+        and payload.get("worker") == expected_worker
+        and isinstance(payload.get("exp"), int)
+        and payload["exp"] >= now
+    )
+
+
+def base64url_decode(value: str) -> bytes:
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+
+def base64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")
 
 
 def preprocess(image: Image.Image) -> torch.Tensor:

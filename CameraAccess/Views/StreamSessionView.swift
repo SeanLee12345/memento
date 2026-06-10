@@ -21,5 +21,8 @@ struct StreamSessionView: View {
     .sheet(isPresented: $viewModel.showPeopleDictionary) {
       PeopleDictionaryView(viewModel: viewModel)
     }
+    .sheet(isPresented: $viewModel.showStreamSummaryHistory) {
+      StreamSummaryHistoryView(viewModel: viewModel)
+    }
   }
 }

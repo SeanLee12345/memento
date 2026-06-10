@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Meta Face Simulation</string>
+	<string>Memento</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>CameraAccess</string>
+	<string>Memento</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
@@ -42,6 +42,12 @@
 	<array>
 		<string>fb-viewapp</string>
 	</array>
+	<key>MementoSupabaseAnonKey</key>
+	<string>$(SUPABASE_ANON_KEY)</string>
+	<key>MementoSupabaseProjectRef</key>
+	<string>$(SUPABASE_PROJECT_REF)</string>
+	<key>MementoSupabaseURL</key>
+	<string>$(SUPABASE_URL)</string>
 	<key>MWDAT</key>
 	<dict>
 		<key>AppLinkURLScheme</key>
@@ -52,6 +58,8 @@
 		<string>0</string>
 		<key>TeamID</key>
 		<string>$(DEVELOPMENT_TEAM)</string>
+		<key>DAMEnabled</key>
+		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>This app uses camera-compatible video access for Meta glasses streaming and local simulation.</string>
@@ -66,12 +74,16 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>This app uses the local network when Meta glasses streaming requires a Wi-Fi device link.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>This app can use iPhone location during live streams to add place context to saved scene memories.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_bonjour._tcp</string>
 	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app uses the iPhone microphone for speaker identification and cloud transcription while streaming from Meta glasses.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>This app uses speech recognition to transcribe conversations for memory recall and speaker attribution.</string>
 	<key>UISupportedExternalAccessoryProtocols</key>
 	<array>
 		<string>com.meta.ar.wearable</string>
