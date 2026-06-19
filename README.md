@@ -62,10 +62,30 @@ Alibaba/Qwen, DeepSeek, and worker signing secrets now belong in Supabase Edge F
 ```sh
 supabase secrets set DASHSCOPE_API_KEY=...
 supabase secrets set DEEPSEEK_API_KEY=...
+supabase secrets set NVIDIA_API_KEY=...
 supabase secrets set WORKER_TOKEN_SIGNING_SECRET=...
 supabase functions deploy memento-ai
 supabase functions deploy worker-session
 ```
+
+Selective memory recall uses `memory_chunks` plus the `hybrid_memory_search`
+RPC. Apply migrations, deploy `memento-ai`, then backfill existing remote
+transcripts and scene contexts from the laptop:
+
+```sh
+supabase db push
+supabase functions deploy memento-ai
+python tools/backfill_memory_chunks.py --dry-run
+python tools/backfill_memory_chunks.py
+```
+
+The backfill requires `SUPABASE_SERVICE_KEY`, `NVIDIA_API_KEY`, and optionally
+`DASHSCOPE_API_KEY` in the laptop-only `.env.local`. None of these private keys
+belong in the iOS target.
+
+For pre-RLS rows whose `owner_uid` is null, pass the intended authenticated
+owner explicitly with `--legacy-owner <user-uuid>`. Use `--skip-qwen` for a
+faster deterministic metadata pass while retaining NVIDIA embeddings.
 
 The AWS face and speaker workers should receive the same `WORKER_TOKEN_SIGNING_SECRET` in their worker environment. During migration, the workers still accept `FACE_WORKER_API_KEY` and `SPEAKER_WORKER_API_KEY`, but new iOS sessions request short-lived worker tokens from `worker-session`.
 
