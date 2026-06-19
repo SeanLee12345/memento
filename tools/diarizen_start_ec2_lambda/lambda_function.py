@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 INSTANCE_ID = "i-0c400af918e775f20"
 REGION = "us-west-1"
@@ -57,6 +58,32 @@ def s3_client():
             retries={"max_attempts": 1},
         ),
     )
+
+
+def stop_instance(ec2, reason):
+    try:
+        ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+        return "ec2Api"
+    except ClientError as error:
+        code = error.response.get("Error", {}).get("Code")
+        message = error.response.get("Error", {}).get("Message", "")
+        if code != "OperationNotPermitted" or "disableApiStop" not in message:
+            raise
+
+    # EC2 stop protection does not block an OS-initiated shutdown. The instance
+    # is configured with InstanceInitiatedShutdownBehavior=stop.
+    response = boto3.client("ssm", region_name=REGION).send_command(
+        InstanceIds=[INSTANCE_ID],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": ["sudo shutdown -h now"]},
+        Comment=f"Meta glasses worker shutdown: {reason}"[:100],
+    )
+    command_id = response.get("Command", {}).get("CommandId")
+    print(
+        f"EC2 API stop blocked by stop protection; sent in-instance shutdown "
+        f"instance={INSTANCE_ID} commandId={command_id} reason={reason}"
+    )
+    return "ssmShutdown"
 
 
 def now_iso():
@@ -257,11 +284,39 @@ def lambda_handler(event, context):
     )
 
     if isinstance(event, dict) and event.get("action") == "stopNow":
-        ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+        stop_instance(ec2, "explicit stopNow")
         clear_live_tags(ec2, LIVE_SESSION_TAG, LIVE_EXPIRES_TAG)
         clear_live_tags(ec2, LIVE_FACE_SESSION_TAG, LIVE_FACE_EXPIRES_TAG)
         print(f"Stopped {INSTANCE_ID} from explicit stopNow action")
         return {"statusCode": 200, "action": "stopped"}
+
+    if isinstance(event, dict) and event.get("action") == "stopAfterDiarizationComplete":
+        current = describe_instance(ec2)
+        if other_lease_active(current, "diarization"):
+            print(
+                f"Deferred EC2 stop after diarization jobId={event.get('jobId')} because a live lease is active "
+                f"speaker={current.get('liveSessionId')} face={current.get('liveFaceSessionId')}"
+            )
+            return {
+                "statusCode": 200,
+                "action": "deferredAfterDiarization",
+                "jobId": event.get("jobId"),
+                **current,
+            }
+        shutdown_method = stop_instance(
+            ec2,
+            f"diarization complete jobId={event.get('jobId')}",
+        )
+        clear_live_tags(ec2, LIVE_SESSION_TAG, LIVE_EXPIRES_TAG)
+        clear_live_tags(ec2, LIVE_FACE_SESSION_TAG, LIVE_FACE_EXPIRES_TAG)
+        print(f"Stopped {INSTANCE_ID} immediately after diarization jobId={event.get('jobId')}")
+        return {
+            "statusCode": 200,
+            "action": "stoppedAfterDiarization",
+            "jobId": event.get("jobId"),
+            "shutdownMethod": shutdown_method,
+            **describe_instance(ec2),
+        }
 
     if isinstance(event, dict) and event.get("action") == "releaseLive":
         clear_live_tags(ec2, LIVE_SESSION_TAG, LIVE_EXPIRES_TAG)
@@ -290,7 +345,7 @@ def lambda_handler(event, context):
                 f"speaker={current.get('liveSessionId')} face={current.get('liveFaceSessionId')}"
             )
             return {"statusCode": 200, "action": "releasedKeepRunning", "service": service, **current}
-        ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+        stop_instance(ec2, f"live {service} lease released")
         # Clear residual tags so the post-stop state is clean.
         clear_live_tags(ec2, LIVE_SESSION_TAG, LIVE_EXPIRES_TAG)
         clear_live_tags(ec2, LIVE_FACE_SESSION_TAG, LIVE_FACE_EXPIRES_TAG)
@@ -399,7 +454,7 @@ def lambda_handler(event, context):
         if other_lease_active(current, "speaker"):
             print(f"Speaker lease expired for {session_id} but face lease still active; leaving EC2 running")
             return {"statusCode": 200, "action": "releasedKeepRunning", "service": "speaker", **current}
-        ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+        stop_instance(ec2, f"live speaker session expired sessionId={session_id}")
         print(f"Stopped {INSTANCE_ID} after live speaker session {session_id} expired")
         return {"statusCode": 200, "action": "stoppedLive", "service": "speaker"}
 
@@ -416,7 +471,7 @@ def lambda_handler(event, context):
         if other_lease_active(current, "face"):
             print(f"Face lease expired for {session_id} but speaker lease still active; leaving EC2 running")
             return {"statusCode": 200, "action": "releasedKeepRunning", "service": "face", **current}
-        ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+        stop_instance(ec2, f"live face session expired sessionId={session_id}")
         print(f"Stopped {INSTANCE_ID} after live face session {session_id} expired")
         return {"statusCode": 200, "action": "stoppedLive", "service": "face"}
 
@@ -428,7 +483,19 @@ def lambda_handler(event, context):
         current = describe_instance(ec2)
         if spec and result_exists(s3, spec.get("bucket"), spec.get("resultKey")):
             put_job_status(s3, spec, "done", context, finishedAt=now_iso(), current=current)
-            ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+            if other_lease_active(current, "diarization"):
+                print(
+                    f"Deferred diarization result watchdog stop jobId={spec.get('jobId')} because a live lease is active "
+                    f"speaker={current.get('liveSessionId')} face={current.get('liveFaceSessionId')}"
+                )
+                return {
+                    "statusCode": 200,
+                    "action": "deferredAfterDiarization",
+                    "jobId": spec.get("jobId"),
+                    "cycle": cycle,
+                    **current,
+                }
+            stop_instance(ec2, f"diarization result watchdog jobId={spec.get('jobId')}")
             print(f"Stopped {INSTANCE_ID} after diarization result appeared jobId={spec.get('jobId')} cycle={cycle}")
             return {"statusCode": 200, "action": "stoppedDone", "jobId": spec.get("jobId"), "cycle": cycle}
         if spec and cycle < MAX_DIARIZATION_WATCHDOG_CYCLES:
@@ -464,7 +531,19 @@ def lambda_handler(event, context):
                 watchdogCycle=cycle,
                 maxWatchdogCycles=MAX_DIARIZATION_WATCHDOG_CYCLES,
             )
-        ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+        if other_lease_active(current, "diarization"):
+            print(
+                f"Deferred exhausted diarization watchdog stop jobId={(spec or {}).get('jobId')} because a live lease is active "
+                f"speaker={current.get('liveSessionId')} face={current.get('liveFaceSessionId')}"
+            )
+            return {
+                "statusCode": 200,
+                "action": "deferredAfterDiarization",
+                "jobId": (spec or {}).get("jobId"),
+                "cycle": cycle,
+                **current,
+            }
+        stop_instance(ec2, f"diarization watchdog exhausted jobId={(spec or {}).get('jobId')}")
         print(f"Stopped {INSTANCE_ID} after {MAX_RUNTIME_SECONDS} seconds jobId={(spec or {}).get('jobId')} cycle={cycle}")
         return {"statusCode": 200, "action": "stopped", "jobId": (spec or {}).get("jobId"), "cycle": cycle}
 

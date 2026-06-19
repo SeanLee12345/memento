@@ -22,6 +22,15 @@ polling until 15 minutes.
 It also accepts `{"action":"stopNow"}` so EventBridge can stop the same instance
 on a fixed schedule as a cost guard.
 
+After the app downloads a completed diarization result, it invokes
+`{"action":"stopAfterDiarizationComplete","jobId":"..."}`. The Lambda stops
+EC2 immediately when neither live face nor live speaker lease is active. If a
+lease is still active, shutdown is deferred to that lease's existing expiry;
+the 840-second diarization watchdog remains a crash/network fallback. All stop
+paths first use the EC2 API. If instance stop protection blocks that API, the
+Lambda sends `sudo shutdown -h now` through SSM; the instance's
+`InstanceInitiatedShutdownBehavior` must remain `stop`.
+
 For live stream-time embedding workers, the Lambda accepts independent
 speaker and face actions that share the same EC2 instance:
 
@@ -44,6 +53,9 @@ speaker and face actions that share the same EC2 instance:
   holds an active lease.
 - `{"action":"stopNow"}` — emergency cut-off; stops EC2 and clears both tag
   sets unconditionally. Used by the EventBridge nightly cost guard.
+- `{"action":"stopAfterDiarizationComplete","jobId":"..."}` — normal
+  post-stream completion path. Stops immediately unless a live embedding lease
+  is still active.
 
 If the app crashes or loses network, each live-session expiry triggers a
 delayed stop after 600 seconds — but `stopLiveAfterDelay` and
@@ -57,6 +69,8 @@ The deployed Lambda needs:
   `ec2:DeleteTags` on `i-0c400af918e775f20`
 - `ec2:DescribeInstances` on `*`
 - `lambda:InvokeFunction` on `DiarizenStartEC2`
+- `ssm:SendCommand` on `i-0c400af918e775f20` and the AWS-managed
+  `AWS-RunShellScript` document, for the stop-protection fallback
 - `s3:GetObject`, `s3:PutObject`, and `s3:HeadObject` on
   `arn:aws:s3:::meta-glasses-transcribe-620969609288/diarizen/*`
 
