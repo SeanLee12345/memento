@@ -818,17 +818,19 @@ struct SceneContextClient {
     Classify the wearer's current stream activity mode.
 
     Return exactly this JSON object:
-    {"mode":"entertainment|sport|study|social|commute|shopping|work|general|unknown|custom label","specific_activity":"brief action phrase","confidence":0.0,"reason":"short evidence-based reason"}
+    {"mode":"entertainment|sport|study|social|commute|shopping|work|general|unknown","specific_activity":"optional brief action phrase","confidence":0.0,"reason":"short evidence-based reason"}
 
     Mode taxonomy:
     \(allowedModes)
 
     Rules:
-    - Prefer one taxonomy label. Use a custom label only when no taxonomy label fits.
-    - specific_activity must be more specific than mode, such as "watching movie", "jogging", "studying laptop", "talking with Gary", "riding train", or "shopping in store".
+    - mode must be one taxonomy label. Never invent a custom primary mode.
+    - Prefer a broad accurate mode over a specific uncertain claim. For example, laptop use is usually "work" unless study evidence is explicit.
+    - specific_activity is optional. Leave it empty unless confidence is at least 0.88 and multiple independent evidence items support the detail.
+    - Do not include incidental location, furniture, device, or time-of-day details in specific_activity.
     - Use "general" when the wearer is just looking around and the evidence is sparse.
     - Use "unknown" only when the evidence is too weak to classify.
-    - Do not rapidly overfit to a single word; use scene context plus transcript together.
+    - Do not overfit to a single frame or transcript word; use repeated scene context plus transcript together.
     - Role boundary: the app user/wearer is "you"; recognized people and activePeople are people with you, not you.
     - Do not infer sensitive attributes.
     - Confidence is 0 to 1.

@@ -20,6 +20,97 @@ import XCTest
 final class VisionInputSafetyTests: XCTestCase {
   private let resolver = ConversationPartnerResolver()
 
+  func testRecentMemoryContextUsesOnlyLatestThreeStreamSummaries() {
+    let base = Date(timeIntervalSince1970: 1_700_000_000)
+    let entries = (0..<5).map { index in
+      StreamSummaryHistoryEntry(
+        conversationSessionId: UUID(),
+        startedAt: base.addingTimeInterval(Double(index) * 60),
+        endedAt: base.addingTimeInterval(Double(index) * 60 + 30),
+        analysis: StreamSummaryAnalysis(
+          summary: "Stream summary \(index)",
+          who: "Sean and Gary",
+          whereText: "office",
+          what: "planning",
+          whenText: "today",
+          why: "prepare",
+          how: "conversation",
+          people: ["Gary"],
+          keyMoments: [],
+          outline: [],
+          confidence: 0.8
+        ),
+        modelName: "test",
+        statusText: "ready"
+      )
+    }
+
+    let summaries = RecentMemoryContextBuilder.summaries(from: entries)
+
+    XCTAssertEqual(summaries.count, 3)
+    XCTAssertTrue(summaries[0].contains("Stream summary 4"))
+    XCTAssertTrue(summaries[1].contains("Stream summary 3"))
+    XCTAssertTrue(summaries[2].contains("Stream summary 2"))
+    XCTAssertFalse(summaries.joined().contains("Stream summary 1"))
+  }
+
+  func testRemoteMemoryChunkDecodesKeywordCategoryAndSemanticScore() throws {
+    let id = UUID()
+    let conversationId = UUID()
+    let json = """
+    {
+      "memory_chunk_id":"\(id.uuidString)",
+      "conversation_id":"\(conversationId.uuidString)",
+      "stream_id":"\(conversationId.uuidString)",
+      "person_id":null,
+      "chunk_text":"We discussed a family vacation in Korea.",
+      "summary_text":"Trip to Korea with family.",
+      "keywords":["korea","trip"],
+      "categories":["travel","family"],
+      "similarity":0.84,
+      "final_score":0.91,
+      "source_type":"stream_summary",
+      "start_time":"2026-01-01T10:00:00Z",
+      "end_time":"2026-01-01T10:05:00Z",
+      "created_at":"2026-01-01T10:06:00Z",
+      "importance_score":0.8,
+      "sensitivity_level":1,
+      "metadata":{"model":"test","segment_index":2}
+    }
+    """
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+
+    let chunk = try decoder.decode(RemoteMemoryChunk.self, from: Data(json.utf8))
+
+    XCTAssertEqual(chunk.id, id)
+    XCTAssertEqual(chunk.keywords, ["korea", "trip"])
+    XCTAssertEqual(chunk.categories, ["travel", "family"])
+    XCTAssertEqual(chunk.sourceType, .streamSummary)
+    XCTAssertEqual(chunk.evidenceText, "Trip to Korea with family.")
+    XCTAssertEqual(chunk.finalScore, 0.91, accuracy: 0.001)
+    XCTAssertEqual(chunk.metadata?["segment_index"]?.value as? Int, 2)
+  }
+
+  func testMemoryIndexParentRetryUsesBoundedBackoff() {
+    XCTAssertEqual(RemoteMemoryRetrievalService.parentRetryDelaySeconds(attempt: 1), 0)
+    XCTAssertEqual(RemoteMemoryRetrievalService.parentRetryDelaySeconds(attempt: 2), 2)
+    XCTAssertEqual(RemoteMemoryRetrievalService.parentRetryDelaySeconds(attempt: 3), 4)
+    XCTAssertEqual(RemoteMemoryRetrievalService.parentRetryDelaySeconds(attempt: 4), 8)
+    XCTAssertEqual(RemoteMemoryRetrievalService.parentRetryDelaySeconds(attempt: 5), 16)
+    XCTAssertEqual(RemoteMemoryRetrievalService.parentRetryDelaySeconds(attempt: 20), 30)
+  }
+
+  func testMemoryIndexParentDeferredLogsOnlyBoundaryAttempts() {
+    XCTAssertTrue(RemoteMemoryRetrievalService.shouldLogParentDeferredAttempt(attempt: 1, maxAttempts: 6))
+    XCTAssertFalse(RemoteMemoryRetrievalService.shouldLogParentDeferredAttempt(attempt: 2, maxAttempts: 6))
+    XCTAssertFalse(RemoteMemoryRetrievalService.shouldLogParentDeferredAttempt(attempt: 5, maxAttempts: 6))
+    XCTAssertTrue(RemoteMemoryRetrievalService.shouldLogParentDeferredAttempt(attempt: 6, maxAttempts: 6))
+    XCTAssertTrue(IdentitySyncQueue.shouldLogRecoverableDependencyDeferral(attempts: 1, maxAttempts: 8))
+    XCTAssertFalse(IdentitySyncQueue.shouldLogRecoverableDependencyDeferral(attempts: 4, maxAttempts: 8))
+    XCTAssertTrue(IdentitySyncQueue.shouldLogRecoverableDependencyDeferral(attempts: 7, maxAttempts: 8))
+  }
+
   func testConversationPartnerConfirmsWhenVoiceAndFaceAgree() {
     let personId = UUID()
     let now = Date()
@@ -347,6 +438,22 @@ final class VisionInputSafetyTests: XCTestCase {
     XCTAssertEqual(people, "Gary")
   }
 
+  func testLiveTranscriptMeaningfulFilterRejectsFillerFragments() {
+    XCTAssertFalse(StreamSessionViewModel.hasMeaningfulLiveTranscriptForTesting("Hmm."))
+    XCTAssertFalse(StreamSessionViewModel.hasMeaningfulLiveTranscriptForTesting("Okay"))
+    XCTAssertFalse(StreamSessionViewModel.hasMeaningfulLiveTranscriptForTesting("嗯"))
+    XCTAssertTrue(StreamSessionViewModel.hasMeaningfulLiveTranscriptForTesting("Gary, what did we talk about last time?"))
+    XCTAssertTrue(StreamSessionViewModel.hasMeaningfulLiveTranscriptForTesting("Where are we going?"))
+  }
+
+  func testLiveTranscriptLLMTriggerPrefilterRejectsNoiseAndTestFragments() {
+    XCTAssertFalse(LiveTranscriptQuestionRouter.shouldSendToLLMTriggerClassifier("Test test"))
+    XCTAssertFalse(LiveTranscriptQuestionRouter.shouldSendToLLMTriggerClassifier("Hopefully this is"))
+    XCTAssertFalse(LiveTranscriptQuestionRouter.shouldSendToLLMTriggerClassifier("Um Diarrze"))
+    XCTAssertTrue(LiveTranscriptQuestionRouter.shouldSendToLLMTriggerClassifier("What about five plus five?"))
+    XCTAssertTrue(LiveTranscriptQuestionRouter.shouldSendToLLMTriggerClassifier("What's ten plus ten?"))
+  }
+
   func testStreamingGlassesLiveSectionUsesStableMainStreamFormat() {
     let sections = MementoGlassesDisplayRenderer.liveViewSections(
       assistanceCard: AssistanceDisplayCard(
@@ -358,13 +465,19 @@ final class VisionInputSafetyTests: XCTestCase {
       identityPromptSection: nil,
       statusLine: "Status: Streaming. Identity analysis active.",
       isStreaming: true,
+      streamTitle: "Transport streaming",
       streamModeLine: "Mode: Social - talking with Gary",
-      recognizedPeopleLine: "Recognized people: Gary"
+      recognizedPeopleLine: "Recognized people: Gary",
+      readinessLine: "Context: visual ready, speech ready, face ready"
     )
 
     let streamSection = sections.last
-    XCTAssertEqual(streamSection?.title, "Stream running successfully")
-    XCTAssertEqual(streamSection?.lines, ["Mode: Social - talking with Gary", "Recognized people: Gary"])
+    XCTAssertEqual(streamSection?.title, "Transport streaming")
+    XCTAssertEqual(streamSection?.lines, [
+      "Mode: Social - talking with Gary",
+      "Recognized people: Gary",
+      "Context: visual ready, speech ready, face ready"
+    ])
     let rendered = sections.flatMap { [$0.title] + $0.lines }.joined(separator: "\n")
     XCTAssertFalse(rendered.contains("Unknown person"))
     XCTAssertFalse(rendered.localizedCaseInsensitiveContains("identity analysis"))
@@ -465,6 +578,91 @@ final class VisionInputSafetyTests: XCTestCase {
     }
 
     XCTAssertFalse(FileManager.default.fileExists(atPath: deadLetterURL.path))
+  }
+
+  func testSupabaseFaceEmbeddingRetriesDelayedParentThenCompletes() async throws {
+    let remote = RecordingIdentitySyncRemote()
+    await remote.setFaceEmbeddingDependencyFailures(2)
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("IdentitySyncQueueParentDelayTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    var embedding = faceEmbeddingRecord(
+      frame: 501,
+      modelName: "AdaFace",
+      modelVersion: "aws-v1",
+      modelSource: "aws",
+      preprocessingVersion: "adaface-v1"
+    )
+    embedding.personId = UUID()
+    let queue = IdentitySyncQueue(
+      remote: remote,
+      persistenceDirectory: directory,
+      maxAttempts: 4,
+      baseBackoff: 0.01,
+      maxBackoff: 0.02
+    )
+
+    await queue.enqueue(.faceEmbedding(embedding, localImagePath: nil))
+
+    try await waitUntil {
+      await queue.pendingCount() == 0
+    }
+
+    let attempts = await remote.faceEmbeddingAttempts()
+    let labels = await remote.appliedLabels()
+    XCTAssertEqual(attempts, 3)
+    XCTAssertTrue(labels.contains("faceEmbedding:\(embedding.id.uuidString)"))
+  }
+
+  func testSupabaseFaceEmbeddingMissingParentReachesClearTerminalState() async throws {
+    let remote = RecordingIdentitySyncRemote()
+    await remote.setFaceEmbeddingDependencyFailures(10)
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("IdentitySyncQueueMissingParentTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    var embedding = faceEmbeddingRecord(
+      frame: 502,
+      modelName: "AdaFace",
+      modelVersion: "aws-v1",
+      modelSource: "aws",
+      preprocessingVersion: "adaface-v1"
+    )
+    embedding.personId = UUID()
+    let deadLetterURL = directory.appendingPathComponent("supabase-sync-dead-letter.jsonl")
+    let queue = IdentitySyncQueue(
+      remote: remote,
+      persistenceDirectory: directory,
+      maxAttempts: 2,
+      baseBackoff: 0.01,
+      maxBackoff: 0.01
+    )
+
+    await queue.enqueue(.faceEmbedding(embedding, localImagePath: nil))
+
+    try await waitUntil {
+      await queue.pendingCount() == 0
+        && FileManager.default.fileExists(atPath: deadLetterURL.path)
+    }
+
+    let attempts = await remote.faceEmbeddingAttempts()
+    let deadLetterText = try String(contentsOf: deadLetterURL, encoding: .utf8)
+    XCTAssertEqual(attempts, 2)
+    XCTAssertTrue(deadLetterText.contains("Terminal parent dependency unresolved"))
+
+    _ = IdentitySyncQueue(
+      remote: remote,
+      persistenceDirectory: directory,
+      maxAttempts: 2,
+      baseBackoff: 0.01,
+      maxBackoff: 0.01
+    )
+    try await Task.sleep(nanoseconds: 100_000_000)
+    let attemptsAfterRestore = await remote.faceEmbeddingAttempts()
+    XCTAssertEqual(attemptsAfterRestore, attempts)
   }
 
   func testSupabaseSyncQueueDeadLettersFaceVectorSchemaMismatch() async throws {
@@ -627,6 +825,66 @@ final class VisionInputSafetyTests: XCTestCase {
 
     XCTAssertFalse(ActivityModeClassifier.shouldApply(current: current, candidate: weakCandidate))
     XCTAssertTrue(ActivityModeClassifier.shouldApply(current: current, candidate: strongCandidate))
+  }
+
+  func testActivityModeMapsSpecificGuessToSafeBroadMode() {
+    let classification = ActivityModeClassifier.conservativeClassification(
+      ActivityModeClassification(
+        mode: "coding on laptop at desk late at night",
+        specificActivity: "coding on laptop at desk late at night",
+        confidence: 0.72,
+        reason: "One scene showed a laptop."
+      )
+    )
+
+    XCTAssertEqual(classification.mode, "work")
+    XCTAssertEqual(classification.specificActivity, "")
+    XCTAssertEqual(classification.displayText, "Work")
+  }
+
+  func testActivityModeRequiresRepeatedEvidenceBeforeBroadModeSwitch() {
+    var stabilizer = ActivityModeStabilizer()
+    let current = ActivityModeClassification(
+      mode: "work",
+      specificActivity: "",
+      confidence: 0.81,
+      reason: "Stable work mode."
+    )
+    let candidate = ActivityModeClassification(
+      mode: "entertainment",
+      specificActivity: "watching baseball",
+      confidence: 0.84,
+      reason: "A screen may show baseball."
+    )
+
+    let first = stabilizer.evaluate(current: current, candidate: candidate)
+    let second = stabilizer.evaluate(current: current, candidate: candidate)
+
+    XCTAssertFalse(first.shouldApply)
+    XCTAssertTrue(second.shouldApply)
+    XCTAssertTrue(second.shouldSendDisplay)
+  }
+
+  func testActivityModeSameBroadModeDoesNotResendDisplayForWeakSpecificDetail() {
+    var stabilizer = ActivityModeStabilizer()
+    let current = ActivityModeClassification(
+      mode: "work",
+      specificActivity: "",
+      confidence: 0.82,
+      reason: "Stable work mode."
+    )
+    let candidate = ActivityModeClassification(
+      mode: "work",
+      specificActivity: "coding on laptop at desk late at night",
+      confidence: 0.76,
+      reason: "A laptop was visible once."
+    )
+
+    let result = stabilizer.evaluate(current: current, candidate: candidate)
+
+    XCTAssertFalse(result.shouldApply)
+    XCTAssertFalse(result.shouldSendDisplay)
+    XCTAssertEqual(result.classification.displayText, "Work")
   }
 
   func testActivityModePromptStatesWearerAndRecognizedPeopleBoundary() {
@@ -1112,6 +1370,65 @@ final class VisionInputSafetyTests: XCTestCase {
 
     XCTAssertEqual(trigger?.answerMode, .general)
     XCTAssertNil(trigger?.memoryTrigger)
+  }
+
+  func testDistinctLiveQuestionsBypassRecentQuestionThrottle() {
+    let start = Date(timeIntervalSince1970: 50_000)
+    let questions = [
+      "what's two plus two?",
+      "what's ten plus ten?",
+      "what is five plus five?"
+    ].map(LiveTranscriptQuestionRouter.normalizedSearchText)
+
+    let second = LiveQuestionThrottlePolicy.evaluate(
+      currentQuestion: questions[1],
+      previousQuestion: questions[0],
+      currentAt: start.addingTimeInterval(6),
+      previousAt: start
+    )
+    let third = LiveQuestionThrottlePolicy.evaluate(
+      currentQuestion: questions[2],
+      previousQuestion: questions[1],
+      currentAt: start.addingTimeInterval(12),
+      previousAt: start.addingTimeInterval(6)
+    )
+
+    XCTAssertFalse(second.shouldThrottle)
+    XCTAssertFalse(third.shouldThrottle)
+    XCTAssertLessThan(second.textSimilarity, LiveQuestionThrottlePolicy.nearDuplicateSimilarityThreshold)
+    XCTAssertLessThan(third.textSimilarity, LiveQuestionThrottlePolicy.nearDuplicateSimilarityThreshold)
+  }
+
+  func testDuplicateLiveQuestionRemainsThrottled() {
+    let start = Date(timeIntervalSince1970: 60_000)
+    let question = LiveTranscriptQuestionRouter.normalizedSearchText("What's two plus two?")
+
+    let repeatEvaluation = LiveQuestionThrottlePolicy.evaluate(
+      currentQuestion: question,
+      previousQuestion: question,
+      currentAt: start.addingTimeInterval(6),
+      previousAt: start
+    )
+
+    XCTAssertTrue(repeatEvaluation.shouldThrottle)
+    XCTAssertEqual(repeatEvaluation.reason, .duplicateQuestion)
+    XCTAssertEqual(repeatEvaluation.textSimilarity, 1)
+  }
+
+  func testNearDuplicateLiveQuestionRemainsThrottledAcrossASRFormatting() {
+    let start = Date(timeIntervalSince1970: 70_000)
+    let evaluation = LiveQuestionThrottlePolicy.evaluate(
+      currentQuestion: "what is 5 plus 5",
+      previousQuestion: "What's five + five?",
+      currentAt: start.addingTimeInterval(8),
+      previousAt: start
+    )
+
+    XCTAssertTrue(evaluation.shouldThrottle)
+    XCTAssertGreaterThanOrEqual(
+      evaluation.textSimilarity,
+      LiveQuestionThrottlePolicy.nearDuplicateSimilarityThreshold
+    )
   }
 
   func testCurrentQuestionRoutesToAlibabaWebSearchMode() {
@@ -1727,10 +2044,56 @@ final class VisionInputSafetyTests: XCTestCase {
       useEC2Lifecycle: true,
       inputMode: .realGlasses
     ))
-    XCTAssertFalse(StreamSessionViewModel.shouldContinueCloudFaceWarmupAfterInitialHealthMiss(
+    XCTAssertTrue(StreamSessionViewModel.shouldContinueCloudFaceWarmupAfterInitialHealthMiss(
       useEC2Lifecycle: false,
       inputMode: .realGlasses
     ))
+  }
+
+  func testCloudFaceWarmupRetryCadenceIsCappedAndSparse() {
+    XCTAssertEqual(StreamSessionViewModel.cloudFaceWarmupRetryDelaySeconds(attempt: 2), 5)
+    XCTAssertEqual(StreamSessionViewModel.cloudFaceWarmupRetryDelaySeconds(attempt: 3), 7)
+    XCTAssertEqual(StreamSessionViewModel.cloudFaceWarmupRetryDelaySeconds(attempt: 8), 15)
+    XCTAssertEqual(StreamSessionViewModel.cloudFaceWarmupRetryDelaySeconds(attempt: 30), 15)
+    XCTAssertEqual(StreamSessionViewModel.cloudFaceWarmupRetryLimit(inputMode: .realGlasses), 6)
+  }
+
+  func testCloudFaceHealthTimeoutFallsBackWithoutBackgroundWarmupSpam() {
+    let timeout = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+
+    XCTAssertTrue(StreamSessionViewModel.isCloudFaceHealthTimeout(timeout))
+    XCTAssertFalse(StreamSessionViewModel.shouldContinueCloudFaceWarmupAfterInitialHealthMiss(
+      useEC2Lifecycle: true,
+      inputMode: .realGlasses,
+      error: timeout
+    ))
+  }
+
+  func testCloudFaceNonTimeoutCanContinueCappedBackgroundWarmup() {
+    let notReady = CloudFaceEmbeddingLifecycleError.workerNotReady("HTTP 503")
+
+    XCTAssertFalse(StreamSessionViewModel.isCloudFaceHealthTimeout(notReady))
+    XCTAssertTrue(StreamSessionViewModel.shouldContinueCloudFaceWarmupAfterInitialHealthMiss(
+      useEC2Lifecycle: true,
+      inputMode: .realGlasses,
+      error: notReady
+    ))
+  }
+
+  func testCloudSpeakerHealthRetryCadenceIsCappedAndSparse() {
+    XCTAssertEqual(CloudSpeakerEmbeddingLifecycleService.workerHealthRetryDelaySeconds(attempt: 1), 0)
+    XCTAssertEqual(CloudSpeakerEmbeddingLifecycleService.workerHealthRetryDelaySeconds(attempt: 2), 5)
+    XCTAssertEqual(CloudSpeakerEmbeddingLifecycleService.workerHealthRetryDelaySeconds(attempt: 3), 10)
+    XCTAssertEqual(CloudSpeakerEmbeddingLifecycleService.workerHealthRetryDelaySeconds(attempt: 4), 20)
+    XCTAssertEqual(CloudSpeakerEmbeddingLifecycleService.workerHealthRetryDelaySeconds(attempt: 30), 20)
+    XCTAssertTrue(CloudSpeakerEmbeddingLifecycleService.workerHealthRetryCadenceText(maxAttempts: 60).contains("60"))
+  }
+
+  func testPendingSpeakerEmbeddingRetryCadenceIsCappedAndSparse() {
+    XCTAssertEqual(StreamSessionViewModel.pendingSpeakerEmbeddingRetryDelaySeconds(attempt: 1), 5)
+    XCTAssertEqual(StreamSessionViewModel.pendingSpeakerEmbeddingRetryDelaySeconds(attempt: 2), 10)
+    XCTAssertEqual(StreamSessionViewModel.pendingSpeakerEmbeddingRetryDelaySeconds(attempt: 3), 20)
+    XCTAssertEqual(StreamSessionViewModel.pendingSpeakerEmbeddingRetryDelaySeconds(attempt: 12), 20)
   }
 
   func testCloudFaceEmbeddingStartingStatusIsNotReportedAsMissing() async {
@@ -1887,6 +2250,33 @@ final class VisionInputSafetyTests: XCTestCase {
     XCTAssertTrue(GlassesDisplayAction.confirmRecognizedPerson.isIdentityPromptAction)
     XCTAssertTrue(GlassesDisplayAction.rejectRecognizedPerson.isIdentityPromptAction)
     XCTAssertFalse(GlassesDisplayAction.openContext.isIdentityPromptAction)
+  }
+
+  func testIdentityPromptActionsSuppressPinnedStreamControls() {
+    XCTAssertFalse(DATGlassesManager.shouldPinStreamControlsForTesting(
+      primaryAction: .confirmRecognizedPerson,
+      secondaryAction: .rejectRecognizedPerson,
+      tertiaryAction: nil,
+      isStreamRunning: true
+    ))
+    XCTAssertFalse(DATGlassesManager.shouldPinStreamControlsForTesting(
+      primaryAction: .confirmUnknownPerson,
+      secondaryAction: .rejectUnknownPerson,
+      tertiaryAction: nil,
+      isStreamRunning: true
+    ))
+    XCTAssertTrue(DATGlassesManager.shouldPinStreamControlsForTesting(
+      primaryAction: .openTranscripts,
+      secondaryAction: .openContext,
+      tertiaryAction: nil,
+      isStreamRunning: true
+    ))
+    XCTAssertTrue(DATGlassesManager.shouldPinStreamControlsForTesting(
+      primaryAction: .stopStream,
+      secondaryAction: nil,
+      tertiaryAction: nil,
+      isStreamRunning: false
+    ))
   }
 
   func testGlassesDisplayRendererKeepsStreamControlsVisible() {
@@ -2220,9 +2610,13 @@ final class VisionInputSafetyTests: XCTestCase {
       isStreaming: true
     )
 
-    XCTAssertEqual(sections.map(\.title), ["Relevant memory", "Stream running successfully"])
+    XCTAssertEqual(sections.map(\.title), ["Relevant memory", "Transport streaming"])
     XCTAssertTrue(sections.first?.lines.first?.contains("Gary and Sean already discussed") == true)
-    XCTAssertEqual(sections.last?.lines, ["Mode: General - looking around", "Recognized people: None"])
+    XCTAssertEqual(sections.last?.lines, [
+      "Mode: General - looking around",
+      "Recognized people: None",
+      "Context: visual waiting, speech waiting, face on demand"
+    ])
   }
 
   func testLiveHomeSectionsStackMostRecentRecallBeforeOlderRecall() {
@@ -2243,10 +2637,14 @@ final class VisionInputSafetyTests: XCTestCase {
       isStreaming: true
     )
 
-    XCTAssertEqual(sections.map(\.title), ["Answer", "Relevant memory", "Stream running successfully"])
+    XCTAssertEqual(sections.map(\.title), ["Answer", "Relevant memory", "Transport streaming"])
     XCTAssertEqual(sections.first?.lines.first, "A: Washington, DC.")
     XCTAssertEqual(sections.dropFirst().first?.lines.first, "Answer: Gary and Sean discussed the demo plan.")
-    XCTAssertEqual(sections.last?.lines, ["Mode: General - looking around", "Recognized people: None"])
+    XCTAssertEqual(sections.last?.lines, [
+      "Mode: General - looking around",
+      "Recognized people: None",
+      "Context: visual waiting, speech waiting, face on demand"
+    ])
   }
 
   func testLiveHomeSectionsPutRecognizedPersonPromptOnFirstPage() {
@@ -2271,8 +2669,12 @@ final class VisionInputSafetyTests: XCTestCase {
 
     XCTAssertEqual(sections.first?.title, "Confirm person")
     XCTAssertTrue(sections.first?.lines.contains("Is this Gary?") == true)
-    XCTAssertEqual(sections.dropFirst().first?.title, "Stream running successfully")
-    XCTAssertEqual(sections.dropFirst().first?.lines, ["Mode: General - looking around", "Recognized people: None"])
+    XCTAssertEqual(sections.dropFirst().first?.title, "Transport streaming")
+    XCTAssertEqual(sections.dropFirst().first?.lines, [
+      "Mode: General - looking around",
+      "Recognized people: None",
+      "Context: visual waiting, speech waiting, face on demand"
+    ])
   }
 
   func testLiveHomeSectionsPutIdentityPhotoOnPromptPage() {
@@ -2300,7 +2702,7 @@ final class VisionInputSafetyTests: XCTestCase {
     XCTAssertEqual(sections.map(\.title), [
       "Is this Gary?",
       "Relevant memory",
-      "Stream running successfully"
+      "Transport streaming"
     ])
     XCTAssertEqual(sections[0].thumbnailImageURI, "https://example.com/gary.jpg")
     XCTAssertEqual(sections[0].thumbnailImageSize, .fill)
@@ -2381,7 +2783,7 @@ final class VisionInputSafetyTests: XCTestCase {
       isStreaming: true
     )
 
-    XCTAssertEqual(sections.map(\.title), ["Last with Sean", "Answer", "Stream running successfully"])
+    XCTAssertEqual(sections.map(\.title), ["Last with Sean", "Answer", "Transport streaming"])
     XCTAssertEqual(sections.first?.lines.first, "Present with you: Gary, Sean")
     XCTAssertEqual(sections.first?.lines.dropFirst().first, "Summary: You discussed the glasses display image issue and agreed the recognition photo should be smaller.")
   }
@@ -2515,6 +2917,158 @@ final class VisionInputSafetyTests: XCTestCase {
     )
 
     XCTAssertEqual(deduped, "are to test the glasses display")
+  }
+
+  func testParakeetDedupPreservesFullerQuestionCorrection() {
+    let deduped = AlibabaLiveAudioChunkTranscriber.removingOverlappingPrefix(
+      previousTranscript: "What is five plus?",
+      currentTranscript: "What is five plus five?"
+    )
+
+    XCTAssertEqual(deduped, "What is five plus five?")
+  }
+
+  func testLocalParakeetUsesLowerLatencyChunkingThanCloudASR() {
+    let local = AlibabaLiveAudioChunkTranscriber.chunkingProfile(for: .localParakeet)
+    let cloud = AlibabaLiveAudioChunkTranscriber.chunkingProfile(for: .dashScope)
+
+    XCTAssertEqual(local, .init(chunkSeconds: 3, overlapSeconds: 1))
+    XCTAssertEqual(cloud, .init(chunkSeconds: 5, overlapSeconds: 2))
+    XCTAssertLessThan(local.chunkSeconds, cloud.chunkSeconds)
+    XCTAssertLessThan(local.chunkSeconds - local.overlapSeconds, cloud.chunkSeconds - cloud.overlapSeconds)
+  }
+
+  func testLiveQuestionAssemblerReplacesPartialWithFullQuestion() {
+    var assembler = LiveTranscriptQuestionAssembler()
+    let start = Date()
+    _ = assembler.appendObservation(
+      text: "What is five plus?",
+      startedAt: start,
+      endedAt: start.addingTimeInterval(3)
+    )
+
+    let observation = assembler.appendObservation(
+      text: "What is five plus five?",
+      startedAt: start.addingTimeInterval(3),
+      endedAt: start.addingTimeInterval(6)
+    )
+
+    XCTAssertEqual(observation?.currentTranscript, "What is five plus five?")
+    XCTAssertEqual(observation?.rollingTranscript, "What is five plus five?")
+    XCTAssertEqual(observation?.localTrigger?.fullText, "What is five plus five?")
+  }
+
+  func testAlibabaLiveASRVADRejectsLowAmbientNoise() {
+    let pcm = int16PCMData(sampleRate: 16_000, seconds: 5.0) { index in
+      index.isMultiple(of: 2) ? 20 : -20
+    }
+
+    let vad = AlibabaLiveAudioChunkTranscriber.detectSpeech(int16PCM: pcm, sampleRate: 16_000)
+
+    XCTAssertFalse(vad.isSpeech)
+    XCTAssertEqual(vad.speechWindowCount, 0)
+  }
+
+  func testAlibabaLiveASRVADRejectsSteadyRoomNoiseAboveOldThreshold() {
+    let pcm = int16PCMData(sampleRate: 16_000, seconds: 5.0) { index in
+      index.isMultiple(of: 2) ? 150 : -150
+    }
+
+    let vad = AlibabaLiveAudioChunkTranscriber.detectSpeech(
+      int16PCM: pcm,
+      sampleRate: 16_000,
+      noiseFloorRMS: 0.0046
+    )
+
+    XCTAssertFalse(vad.isSpeech)
+    XCTAssertGreaterThan(vad.thresholdRMS, 0.0035)
+  }
+
+  func testParakeetVADCalibratesAgainstCurrentSteadyRoomNoise() {
+    let pcm = int16PCMData(sampleRate: 16_000, seconds: 5.0) { index in
+      index.isMultiple(of: 2) ? 500 : -500
+    }
+
+    let vad = AlibabaLiveAudioChunkTranscriber.detectSpeech(
+      int16PCM: pcm,
+      sampleRate: 16_000,
+      noiseFloorRMS: 0.0015
+    )
+
+    XCTAssertFalse(vad.isSpeech)
+    XCTAssertGreaterThan(vad.thresholdRMS, vad.peakRMS)
+  }
+
+  func testParakeetDropsChunkThatWaitedTooLongBeforeInference() {
+    let capturedThrough = Date(timeIntervalSince1970: 100)
+
+    XCTAssertFalse(AlibabaLiveAudioChunkTranscriber.shouldDropStaleChunk(
+      capturedThrough: capturedThrough,
+      now: capturedThrough.addingTimeInterval(0.8),
+      maximumAgeSeconds: 1.5
+    ))
+    XCTAssertTrue(AlibabaLiveAudioChunkTranscriber.shouldDropStaleChunk(
+      capturedThrough: capturedThrough,
+      now: capturedThrough.addingTimeInterval(9.5),
+      maximumAgeSeconds: 1.5
+    ))
+    XCTAssertTrue(AlibabaLiveAudioChunkTranscriber.isStaleChunkError(
+      LocalParakeetTranscriptionError.staleChunk(9_500)
+    ))
+  }
+
+  func testAlibabaLiveASRVADAcceptsSustainedSpeechEnergy() {
+    let pcm = int16PCMData(sampleRate: 16_000, seconds: 5.0) { index in
+      index < 16_000
+        ? (index.isMultiple(of: 2) ? 2_400 : -2_400)
+        : 0
+    }
+
+    let vad = AlibabaLiveAudioChunkTranscriber.detectSpeech(int16PCM: pcm, sampleRate: 16_000)
+
+    XCTAssertTrue(vad.isSpeech)
+    XCTAssertGreaterThanOrEqual(vad.speechWindowCount, 2)
+  }
+
+  func testAlibabaLiveASRVADRejectsSingleNoiseSpike() {
+    let pcm = int16PCMData(sampleRate: 16_000, seconds: 5.0) { index in
+      index < 200
+        ? (index.isMultiple(of: 2) ? 8_000 : -8_000)
+        : 0
+    }
+
+    let vad = AlibabaLiveAudioChunkTranscriber.detectSpeech(int16PCM: pcm, sampleRate: 16_000)
+
+    XCTAssertFalse(vad.isSpeech)
+    XCTAssertEqual(vad.speechWindowCount, 1)
+  }
+
+  func testAlibabaLiveASREmptyTranscriptBackoffIsBounded() {
+    XCTAssertEqual(AlibabaLiveAudioChunkTranscriber.emptyTranscriptBackoffSeconds(consecutiveEmptyResponses: 1), 0)
+    XCTAssertEqual(AlibabaLiveAudioChunkTranscriber.emptyTranscriptBackoffSeconds(consecutiveEmptyResponses: 2), 6)
+    XCTAssertEqual(AlibabaLiveAudioChunkTranscriber.emptyTranscriptBackoffSeconds(consecutiveEmptyResponses: 3), 12)
+    XCTAssertEqual(AlibabaLiveAudioChunkTranscriber.emptyTranscriptBackoffSeconds(consecutiveEmptyResponses: 9), 30)
+  }
+
+  func testSceneContextRunsOnTenSecondCadence() {
+    XCTAssertEqual(SceneContextPipeline.frameSampleInterval, 10)
+    XCTAssertEqual(SceneContextPipeline.analysisInterval, 10)
+  }
+
+  private func int16PCMData(
+    sampleRate: Int,
+    seconds: Double,
+    sample: (Int) -> Int16
+  ) -> Data {
+    let sampleCount = Int(Double(sampleRate) * seconds)
+    var data = Data(capacity: sampleCount * MemoryLayout<Int16>.size)
+    for index in 0..<sampleCount {
+      var value = sample(index).littleEndian
+      withUnsafeBytes(of: &value) { bytes in
+        data.append(contentsOf: bytes)
+      }
+    }
+    return data
   }
 
   func testPeopleDisplayShowsBriefLatestTranscript() {
@@ -2766,7 +3320,7 @@ final class VisionInputSafetyTests: XCTestCase {
       segmentCount: 2,
       totalSeconds: 5,
       conversationSessionId: sessionId,
-      clipData: try MonoPCM16WAVData.make(samples: [1200, -1200, 900, -900], sampleRate: 16_000)
+      clipData: makeMono16BitWAV(seconds: 3.1)
     )
     let missingPreview = UnknownDiarizationSpeaker(
       id: "Speaker 1",
@@ -2786,6 +3340,144 @@ final class VisionInputSafetyTests: XCTestCase {
     XCTAssertEqual(
       StreamSessionViewModel.promptableUnknownSpeakers([missingPreview, withPreview]).map(\.speakerIndex),
       [0]
+    )
+  }
+
+  func testUnknownDiarizationSpeakerPromptRejectsClipBelowEnrollmentMinimum() {
+    let speaker = UnknownDiarizationSpeaker(
+      id: "Speaker 1",
+      speakerIndex: 1,
+      clipS3Key: nil,
+      segmentCount: 1,
+      totalSeconds: 1.1,
+      conversationSessionId: UUID(),
+      clipData: makeMono16BitWAV(seconds: 1.1)
+    )
+
+    XCTAssertEqual(
+      StreamSessionViewModel.speakerEnrollmentSuppressionReason(for: speaker),
+      "clipTooShort"
+    )
+    XCTAssertTrue(StreamSessionViewModel.promptableUnknownSpeakers([speaker]).isEmpty)
+  }
+
+  func testDiarizationAlignmentAcceptsPartialOverlap() {
+    let alignment = StreamSessionViewModel.diarizationSpeakerAlignment(
+      forStart: 2.9,
+      end: 4.2,
+      diarizationSegments: [
+        DiarizenSegment(start: 3.0, end: 5.0, speakerIndex: 2, text: "")
+      ]
+    )
+
+    XCTAssertEqual(alignment.speakerIndex, 2)
+    XCTAssertEqual(alignment.reason, "overlap")
+    XCTAssertEqual(alignment.overlapSeconds, 1.2, accuracy: 0.001)
+  }
+
+  func testSortformerCanaryResultIsAuthoritativeForPostStreamTranscript() throws {
+    let json = """
+      {
+        "jobId": "job-1",
+        "speakerCount": 1,
+        "segments": [
+          {"start": 1.0, "end": 2.0, "speakerIndex": 0, "text": "Cloud Canary text."}
+        ],
+        "speakerClipKeys": {},
+        "processedAt": "2026-06-18T10:00:00Z",
+        "pipelineVersion": "sortformer-canary-v1",
+        "diarizationModel": "nvidia/diar_streaming_sortformer_4spk-v2.1",
+        "transcriptionModel": "nvidia/canary-qwen-2.5b",
+        "transcriptionSource": "awsCanaryQwen",
+        "timings": {"sortformerInferenceSeconds": 0.5, "canaryInferenceSeconds": 2.0}
+      }
+      """
+
+    let result = try JSONDecoder().decode(DiarizenResult.self, from: Data(json.utf8))
+
+    XCTAssertTrue(StreamSessionViewModel.cloudTranscriptIsAuthoritative(result))
+    XCTAssertEqual(result.pipelineVersion, "sortformer-canary-v1")
+    XCTAssertEqual(result.segments.first?.text, "Cloud Canary text.")
+  }
+
+  func testLegacyDiarizationResultDoesNotOverrideLocalPostStreamTranscript() throws {
+    let json = """
+      {
+        "jobId": "legacy-job",
+        "speakerCount": 1,
+        "segments": [
+          {"start": 1.0, "end": 2.0, "speakerIndex": 0, "text": "Unverified cloud text"}
+        ],
+        "speakerClipKeys": {},
+        "processedAt": "2026-06-18T10:00:00Z"
+      }
+      """
+
+    let result = try JSONDecoder().decode(DiarizenResult.self, from: Data(json.utf8))
+
+    XCTAssertFalse(StreamSessionViewModel.cloudTranscriptIsAuthoritative(result))
+    XCTAssertNil(result.transcriptionModel)
+  }
+
+  func testDiarizationAlignmentKeepsDistantTranscriptUnattributed() {
+    let alignment = StreamSessionViewModel.diarizationSpeakerAlignment(
+      forStart: 10.0,
+      end: 11.0,
+      diarizationSegments: [
+        DiarizenSegment(start: 2.0, end: 4.0, speakerIndex: 0, text: "")
+      ]
+    )
+
+    XCTAssertNil(alignment.speakerIndex)
+    XCTAssertEqual(alignment.reason, "outsideSpeechWindows")
+    XCTAssertEqual(alignment.gapSeconds ?? -1, 6.0, accuracy: 0.001)
+  }
+
+  func testParakeetSegmentWithoutSortformerOverlapIsPreservedUnattributed() {
+    let segment = StreamSessionViewModel.speakerAttributedTranscriptSegment(
+      text: "This transcript must survive.",
+      start: 10.0,
+      end: 11.0,
+      diarizationSegments: [
+        DiarizenSegment(start: 2.0, end: 4.0, speakerIndex: 0, text: "")
+      ]
+    )
+
+    XCTAssertEqual(segment.text, "This transcript must survive.")
+    XCTAssertEqual(segment.speakerIndex, -1)
+    XCTAssertEqual(segment.start, 10.0)
+    XCTAssertEqual(segment.end, 11.0)
+  }
+
+  func testDiarizationAlignmentUsesNearbySpeechWindowForTimestampJitter() {
+    let alignment = StreamSessionViewModel.diarizationSpeakerAlignment(
+      forStart: 4.2,
+      end: 5.0,
+      diarizationSegments: [
+        DiarizenSegment(start: 5.4, end: 6.4, speakerIndex: 1, text: "")
+      ]
+    )
+
+    XCTAssertEqual(alignment.speakerIndex, 1)
+    XCTAssertEqual(alignment.reason, "nearbySpeechWindow")
+    XCTAssertEqual(alignment.gapSeconds ?? -1, 0.4, accuracy: 0.001)
+  }
+
+  func testDiarizationMergeCombinesShortSameSpeakerSegmentsIntoEnrollmentWindow() {
+    let merged = StreamSessionViewModel.mergedSpeakerPreviewSegments(
+      [
+        DiarizenSegment(start: 0.0, end: 1.2, speakerIndex: 0, text: "one"),
+        DiarizenSegment(start: 2.0, end: 3.1, speakerIndex: 1, text: "other"),
+        DiarizenSegment(start: 3.5, end: 4.7, speakerIndex: 0, text: "two"),
+        DiarizenSegment(start: 5.0, end: 6.1, speakerIndex: 0, text: "three")
+      ],
+      speakerIndex: 0
+    )
+
+    XCTAssertEqual(merged.count, 3)
+    XCTAssertGreaterThanOrEqual(
+      merged.reduce(0) { $0 + ($1.end - $1.start) },
+      SpeakerIdentityConfig.minSpeechSecondsForEmbedding
     )
   }
 
@@ -2818,7 +3510,7 @@ final class VisionInputSafetyTests: XCTestCase {
   }
 
   func testUnknownDiarizationSpeakerPromptDedupesIdenticalPreviewData() throws {
-    let clip = try MonoPCM16WAVData.make(samples: [1800, -1800, 600, -600], sampleRate: 16_000)
+    let clip = makeMono16BitWAV(seconds: 3.2)
     let sessionId = UUID()
     let first = UnknownDiarizationSpeaker(
       id: "Speaker 0",
@@ -2843,6 +3535,45 @@ final class VisionInputSafetyTests: XCTestCase {
       StreamSessionViewModel.promptableUnknownSpeakers([duplicate, first]).map(\.speakerIndex),
       [0]
     )
+  }
+
+  func testPendingDiarizedEnrollmentCompletesAfterPostStreamWorkerBecomesAvailable() async {
+    await withTemporarySpeakerStorage {
+      let personId = UUID()
+      let worker = FixedSpeakerEmbeddingModel(
+        runtime: SpeakerEmbeddingRuntime.awsTitaNet,
+        vector: [0, 1, 0]
+      )
+      let pipeline = SpeakerIdentityPipeline(
+        iPhoneEmbeddingModel: FixedSpeakerEmbeddingModel(
+          runtime: SpeakerEmbeddingRuntime.localCoreML,
+          vector: [1, 0, 0]
+        )
+      )
+      let clip = makeMono16BitWAV(seconds: 3.2)
+
+      let pending = await pipeline.enrollFromAudioData(
+        clip,
+        personId: personId,
+        name: "Gary",
+        preferAWS: true
+      )
+      XCTAssertTrue(pending.pending)
+      let pendingCountBeforeRetry = await pipeline.pendingDiarizedEnrollmentCount()
+      XCTAssertEqual(pendingCountBeforeRetry, 1)
+
+      await pipeline.configureWorkerEmbeddingForTesting(worker)
+      let completed = await pipeline.retryPendingDiarizedEnrollments()
+      let pendingCountAfterRetry = await pipeline.pendingDiarizedEnrollmentCount()
+      let hasEnrollment = await pipeline.hasCompatibleSpeakerEnrollment(
+        for: personId,
+        runtime: SpeakerEmbeddingRuntime.awsTitaNet
+      )
+
+      XCTAssertEqual(completed, [personId])
+      XCTAssertEqual(pendingCountAfterRetry, 0)
+      XCTAssertTrue(hasEnrollment)
+    }
   }
 
   func testDiarizenJobSpecAndStatusCarryActionableFailureMetadata() throws {
@@ -2886,6 +3617,21 @@ final class VisionInputSafetyTests: XCTestCase {
     XCTAssertEqual(status.state, "failed")
     XCTAssertEqual(status.errorKind, "ec2StoppedBeforeResult")
     XCTAssertEqual(status.instanceState, "stopped")
+  }
+
+  func testDiarizationPollerPrefersLateResultOverStaleFailedStatus() {
+    XCTAssertTrue(CloudDiarizationService.shouldTreatDiarizationStatusAsTerminalFailure(
+      statusState: "failed",
+      resultExists: false
+    ))
+    XCTAssertFalse(CloudDiarizationService.shouldTreatDiarizationStatusAsTerminalFailure(
+      statusState: "failed",
+      resultExists: true
+    ))
+    XCTAssertFalse(CloudDiarizationService.shouldTreatDiarizationStatusAsTerminalFailure(
+      statusState: "processing",
+      resultExists: false
+    ))
   }
 
   func testMonoPCM16WAVDataBuildsReadablePreviewClipWithoutAVAudioFileWriter() throws {
@@ -3171,6 +3917,43 @@ final class VisionInputSafetyTests: XCTestCase {
     ))
   }
 
+  func testDATStreamStartDecisionSerializesLifecycleOperations() {
+    XCTAssertEqual(
+      DATGlassesManager.streamStartDecision(startInFlight: false, stopInFlight: false),
+      .proceed
+    )
+    XCTAssertEqual(
+      DATGlassesManager.streamStartDecision(startInFlight: true, stopInFlight: false),
+      .duplicateStartInFlight
+    )
+    XCTAssertEqual(
+      DATGlassesManager.streamStartDecision(startInFlight: false, stopInFlight: true),
+      .stopInFlight
+    )
+    XCTAssertEqual(
+      DATGlassesManager.streamStartDecision(startInFlight: true, stopInFlight: true),
+      .duplicateStartInFlight
+    )
+  }
+
+  func testDegradedDATTransportTriggersAdaptiveVisualBackoffAfterStartupWindow() {
+    XCTAssertFalse(StreamSessionViewModel.shouldAdaptVisualWorkForDegradedTransport(
+      observedFPS: 1.2,
+      requestedFPS: 5,
+      streamAgeSeconds: 5
+    ))
+    XCTAssertTrue(StreamSessionViewModel.shouldAdaptVisualWorkForDegradedTransport(
+      observedFPS: 1.2,
+      requestedFPS: 5,
+      streamAgeSeconds: 30
+    ))
+    XCTAssertFalse(StreamSessionViewModel.shouldAdaptVisualWorkForDegradedTransport(
+      observedFPS: 3.2,
+      requestedFPS: 5,
+      streamAgeSeconds: 30
+    ))
+  }
+
   func testLightListCardTextTokensMeetReadableContrast() {
     let card = Color.mementoListCard
     XCTAssertGreaterThanOrEqual(Self.contrastRatio(MementoTheme.listCardPrimaryText, card), 12.0)
@@ -3230,6 +4013,30 @@ final class VisionInputSafetyTests: XCTestCase {
       previewImageAvailable: true,
       isDATAnalysisPaused: false,
       frameAccepted: true
+    ))
+  }
+
+  func testSceneContextPixelBufferEncodingDoesNotDependOnPhonePreview() {
+    XCTAssertTrue(StreamSessionViewModel.shouldEncodeSceneContextFromPixelBuffer(
+      sceneContextEnabled: true,
+      isDATAnalysisPaused: false,
+      frameAccepted: true,
+      captureDue: true,
+      encodingInFlight: false
+    ))
+    XCTAssertFalse(StreamSessionViewModel.shouldEncodeSceneContextFromPixelBuffer(
+      sceneContextEnabled: true,
+      isDATAnalysisPaused: false,
+      frameAccepted: true,
+      captureDue: true,
+      encodingInFlight: true
+    ))
+    XCTAssertFalse(StreamSessionViewModel.shouldEncodeSceneContextFromPixelBuffer(
+      sceneContextEnabled: true,
+      isDATAnalysisPaused: true,
+      frameAccepted: true,
+      captureDue: true,
+      encodingInFlight: false
     ))
   }
 
@@ -3563,6 +4370,8 @@ private actor RecordingIdentitySyncRemote: IdentitySyncRemote {
   private var transcriptHook: (() async -> Void)?
   private var personAveragedEmbeddingError: Error?
   private var personAveragedEmbeddingAttemptCount = 0
+  private var faceEmbeddingDependencyFailuresRemaining = 0
+  private var faceEmbeddingAttemptCount = 0
 
   func setTranscriptHook(_ hook: @escaping () async -> Void) {
     transcriptHook = hook
@@ -3574,6 +4383,14 @@ private actor RecordingIdentitySyncRemote: IdentitySyncRemote {
 
   func personAveragedEmbeddingAttempts() -> Int {
     personAveragedEmbeddingAttemptCount
+  }
+
+  func setFaceEmbeddingDependencyFailures(_ count: Int) {
+    faceEmbeddingDependencyFailuresRemaining = count
+  }
+
+  func faceEmbeddingAttempts() -> Int {
+    faceEmbeddingAttemptCount
   }
 
   func appliedLabels() -> [String] {
@@ -3604,6 +4421,14 @@ private actor RecordingIdentitySyncRemote: IdentitySyncRemote {
     _ record: FaceEmbeddingRecord,
     image: SupabaseIdentityStore.FaceCropImageSource?
   ) async throws {
+    faceEmbeddingAttemptCount += 1
+    if faceEmbeddingDependencyFailuresRemaining > 0 {
+      faceEmbeddingDependencyFailuresRemaining -= 1
+      throw SupabaseClientError.badHTTPStatus(
+        409,
+        #"{"code":"23503","message":"insert or update violates foreign key constraint; parent is not present in table"}"#
+      )
+    }
     labels.append("faceEmbedding:\(record.id.uuidString)")
   }
 

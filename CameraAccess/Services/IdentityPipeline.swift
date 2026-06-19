@@ -528,6 +528,27 @@ actor IdentityPipeline {
 
   func saveSceneContext(_ record: SceneContextRecord) async {
     try? await store.saveSceneContext(record, context: currentContext())
+    Self.indexMemory(
+      MemoryIndexRequest(
+        id: record.id,
+        sourceRecordId: record.id,
+        sourceType: .sceneContext,
+        conversationId: record.conversationSessionId,
+        streamId: record.conversationSessionId,
+        personId: record.personId,
+        chunkText: [record.summary, record.whereText, record.what, record.why]
+          .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+          .joined(separator: "\n"),
+        summaryText: record.summary,
+        keywords: [],
+        categories: [],
+        startTime: record.startedAt,
+        endTime: record.endedAt,
+        importanceScore: Double(record.confidence),
+        sensitivityLevel: nil,
+        metadata: ["source": "scene_context_pipeline"]
+      )
+    )
   }
 
   func savePresenceEpisode(_ record: PresenceEpisodeRecord) async {
@@ -724,6 +745,40 @@ actor IdentityPipeline {
   // Saves a transcript chunk produced by the cloud diarization pipeline.
   func saveCloudTranscriptChunk(_ chunk: TranscriptChunk) async {
     try? await store.saveTranscriptChunk(chunk, context: currentContext())
+    guard chunk.isFinal else { return }
+    Self.indexMemory(
+      MemoryIndexRequest(
+        id: chunk.id,
+        sourceRecordId: chunk.id,
+        sourceType: .transcriptChunk,
+        conversationId: chunk.conversationSessionId,
+        streamId: chunk.conversationSessionId,
+        personId: chunk.personId,
+        chunkText: chunk.text,
+        summaryText: nil,
+        keywords: [],
+        categories: [],
+        startTime: chunk.startedAt,
+        endTime: chunk.endedAt,
+        importanceScore: nil,
+        sensitivityLevel: nil,
+        metadata: ["source": chunk.source]
+      )
+    )
+  }
+
+  nonisolated private static func indexMemory(_ request: MemoryIndexRequest) {
+    Task {
+      do {
+        let service = try RemoteMemoryRetrievalService()
+        try await service.index(request)
+      } catch {
+        AppLogger.log(
+          .memory,
+          "[MEMORY_INDEX] source=\(request.sourceType.rawValue) id=\(request.id.uuidString.prefix(8)) status=deferred reason=\(error.localizedDescription)"
+        )
+      }
+    }
   }
 
   // Returns the personId for an existing person with this name, or creates a voice-only profile.
@@ -1912,6 +1967,25 @@ actor IdentityPipeline {
     )
     activePartialTranscriptChunk = nil
     try? await store.saveTranscriptChunk(chunk, context: context)
+    Self.indexMemory(
+      MemoryIndexRequest(
+        id: chunk.id,
+        sourceRecordId: chunk.id,
+        sourceType: .transcriptChunk,
+        conversationId: chunk.conversationSessionId,
+        streamId: chunk.conversationSessionId,
+        personId: chunk.personId,
+        chunkText: chunk.text,
+        summaryText: nil,
+        keywords: [],
+        categories: [],
+        startTime: chunk.startedAt,
+        endTime: chunk.endedAt,
+        importanceScore: nil,
+        sensitivityLevel: nil,
+        metadata: ["source": chunk.source]
+      )
+    )
     AppLogger.log(.transcript, "\(context.logPrefix) final committed chunk=\(chunk.id.uuidString) person=\(personId?.uuidString ?? "unknown") state=\(stateText) source=\(sourceText) textLen=\(text.count) preview=\"\(Self.preview(text))\"")
     AppLogger.log(.transcriptAttach, "\(context.logPrefix) chunk=\(chunk.id.uuidString) person=\(attribution?.displayName ?? activeState.displayName ?? "unknown") personId=\(personId?.uuidString ?? "nil") isFinal=true textLength=\(text.count) reason=\(attribution?.sourceEvidence ?? (personId == nil ? "noConfirmedIdentity" : "activeIdentityConfirmed"))")
   }

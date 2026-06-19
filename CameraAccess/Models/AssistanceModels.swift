@@ -205,6 +205,113 @@ struct LiveTranscriptResolvedTrigger: Equatable, Sendable {
   }
 }
 
+enum LiveQuestionThrottleReason: String, Equatable, Sendable {
+  case allowed
+  case duplicateQuestion
+  case nearDuplicateQuestion
+}
+
+struct LiveQuestionThrottleEvaluation: Equatable, Sendable {
+  let shouldThrottle: Bool
+  let reason: LiveQuestionThrottleReason
+  let textSimilarity: Double
+  let elapsedSeconds: TimeInterval?
+}
+
+enum LiveQuestionThrottlePolicy {
+  static let previousGeneralThrottleSeconds: TimeInterval = 12
+  static let duplicateThrottleSeconds: TimeInterval = 60
+  static let nearDuplicateSimilarityThreshold = 0.90
+
+  static func evaluate(
+    currentQuestion: String,
+    previousQuestion: String,
+    currentAt: Date,
+    previousAt: Date?
+  ) -> LiveQuestionThrottleEvaluation {
+    guard let previousAt else {
+      return LiveQuestionThrottleEvaluation(
+        shouldThrottle: false,
+        reason: .allowed,
+        textSimilarity: 0,
+        elapsedSeconds: nil
+      )
+    }
+
+    let elapsed = currentAt.timeIntervalSince(previousAt)
+    let similarity = textSimilarity(currentQuestion, previousQuestion)
+    if similarity >= nearDuplicateSimilarityThreshold,
+       elapsed < duplicateThrottleSeconds {
+      return LiveQuestionThrottleEvaluation(
+        shouldThrottle: true,
+        reason: similarity == 1 ? .duplicateQuestion : .nearDuplicateQuestion,
+        textSimilarity: similarity,
+        elapsedSeconds: elapsed
+      )
+    }
+    return LiveQuestionThrottleEvaluation(
+      shouldThrottle: false,
+      reason: .allowed,
+      textSimilarity: similarity,
+      elapsedSeconds: elapsed
+    )
+  }
+
+  static func textSimilarity(_ lhs: String, _ rhs: String) -> Double {
+    let lhsTokens = canonicalContentTokens(lhs)
+    let rhsTokens = canonicalContentTokens(rhs)
+    guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else {
+      return canonicalQuestionText(lhs) == canonicalQuestionText(rhs) ? 1 : 0
+    }
+
+    var lhsCounts = Dictionary(lhsTokens.map { ($0, 1) }, uniquingKeysWith: +)
+    let rhsCounts = Dictionary(rhsTokens.map { ($0, 1) }, uniquingKeysWith: +)
+    var intersectionCount = 0
+    for (token, rhsCount) in rhsCounts {
+      intersectionCount += min(lhsCounts.removeValue(forKey: token) ?? 0, rhsCount)
+    }
+    return (2 * Double(intersectionCount)) / Double(lhsTokens.count + rhsTokens.count)
+  }
+
+  private static let questionScaffoldingWords: Set<String> = [
+    "a", "about", "an", "are", "can", "could", "did", "do", "does", "for", "how",
+    "i", "is", "me", "my", "of", "our", "please", "tell", "the", "to", "was", "were",
+    "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your"
+  ]
+
+  private static let numberWords: [String: String] = [
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14",
+    "fifteen": "15", "sixteen": "16", "seventeen": "17", "eighteen": "18",
+    "nineteen": "19", "twenty": "20"
+  ]
+
+  private static func canonicalContentTokens(_ text: String) -> [String] {
+    let allTokens = canonicalQuestionText(text).split(separator: " ").map(String.init)
+    let contentTokens = allTokens.filter { !questionScaffoldingWords.contains($0) }
+    return (contentTokens.isEmpty ? allTokens : contentTokens).map { numberWords[$0] ?? $0 }
+  }
+
+  private static func canonicalQuestionText(_ text: String) -> String {
+    let expanded = text
+      .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+      .replacingOccurrences(of: "’", with: "'")
+      .replacingOccurrences(of: "what's", with: "what is")
+      .replacingOccurrences(of: "who's", with: "who is")
+      .replacingOccurrences(of: "where's", with: "where is")
+      .replacingOccurrences(of: "when's", with: "when is")
+      .replacingOccurrences(of: "how's", with: "how is")
+      .replacingOccurrences(of: "+", with: " plus ")
+    let scalars = expanded.unicodeScalars.map { scalar -> Character in
+      CharacterSet.alphanumerics.contains(scalar) ? Character(String(scalar)) : " "
+    }
+    return String(scalars)
+      .split(whereSeparator: \.isWhitespace)
+      .joined(separator: " ")
+  }
+}
+
 struct LiveTranscriptTriggerLLMDecision: Codable, Equatable, Sendable {
   let isTrigger: Bool
   let needsMoreTranscript: Bool
@@ -322,12 +429,17 @@ struct LiveTranscriptQuestionAssembler {
     let start = startedAt ?? end
     segments.removeAll { end.timeIntervalSince($0.endedAt) > maxWindowSeconds }
     let previous = segments.map(\.text).joined(separator: " ")
-    let deduped = AlibabaLiveAudioChunkTranscriber.removingOverlappingPrefix(
+    let merge = AlibabaLiveAudioChunkTranscriber.mergeOverlappingTranscript(
       previousTranscript: previous,
       currentTranscript: trimmed
     )
-    guard !deduped.isEmpty else { return nil }
-    segments.append(Segment(text: deduped, startedAt: start, endedAt: end))
+    guard !merge.deliveredText.isEmpty else { return nil }
+    if merge.decision == .replacePartial {
+      let windowStart = segments.first?.startedAt ?? start
+      segments = [Segment(text: merge.updatedContext, startedAt: windowStart, endedAt: end)]
+    } else {
+      segments.append(Segment(text: merge.deliveredText, startedAt: start, endedAt: end))
+    }
     let windowText = currentWindowText
     let questionText = LiveTranscriptQuestionRouter.extractQuestionOrTriggerSentence(from: windowText)
     let localTrigger = questionText.flatMap {
@@ -339,7 +451,7 @@ struct LiveTranscriptQuestionAssembler {
       )
     }
     return LiveTranscriptQuestionObservation(
-      currentTranscript: deduped,
+      currentTranscript: merge.deliveredText,
       rollingTranscript: windowText,
       startedAt: segments.first?.startedAt ?? start,
       endedAt: end,
@@ -438,6 +550,21 @@ struct LiveTranscriptQuestionRouter {
       return isIncompleteTrigger(normalized, answerMode: .memory)
     }
 
+    return false
+  }
+
+  static func shouldSendToLLMTriggerClassifier(_ text: String) -> Bool {
+    let normalized = normalizedSearchText(text)
+    guard !normalized.isEmpty else { return false }
+    let tokenCount = normalized.split(whereSeparator: \.isWhitespace).count
+    if isQuestionLike(normalized) { return tokenCount >= 2 }
+    if containsAny(normalized, phrases: memoryQuestionStarts)
+      || containsAny(normalized, phrases: memoryTerms) {
+      return tokenCount >= 4
+    }
+    if normalized.hasPrefix("tell me") {
+      return tokenCount >= 4
+    }
     return false
   }
 
@@ -940,8 +1067,10 @@ struct MementoGlassesDisplayRenderer {
     identityPhotoSection: AssistanceDisplaySection? = nil,
     statusLine: String,
     isStreaming: Bool,
+    streamTitle: String = "Transport streaming",
     streamModeLine: String = "Mode: General - looking around",
-    recognizedPeopleLine: String = "Recognized people: None"
+    recognizedPeopleLine: String = "Recognized people: None",
+    readinessLine: String = "Context: visual waiting, speech waiting, face on demand"
   ) -> [AssistanceDisplaySection] {
     liveViewSections(
       assistanceCard: assistanceCard,
@@ -950,8 +1079,10 @@ struct MementoGlassesDisplayRenderer {
       identityPhotoSection: identityPhotoSection,
       statusLine: statusLine,
       isStreaming: isStreaming,
+      streamTitle: streamTitle,
       streamModeLine: streamModeLine,
-      recognizedPeopleLine: recognizedPeopleLine
+      recognizedPeopleLine: recognizedPeopleLine,
+      readinessLine: readinessLine
     )
   }
 
@@ -962,8 +1093,10 @@ struct MementoGlassesDisplayRenderer {
     identityPhotoSection: AssistanceDisplaySection? = nil,
     statusLine: String,
     isStreaming: Bool,
+    streamTitle: String = "Transport streaming",
     streamModeLine: String = "Mode: General - looking around",
-    recognizedPeopleLine: String = "Recognized people: None"
+    recognizedPeopleLine: String = "Recognized people: None",
+    readinessLine: String = "Context: visual waiting, speech waiting, face on demand"
   ) -> [AssistanceDisplaySection] {
     var sections: [AssistanceDisplaySection] = []
     if let identityPromptSection {
@@ -975,8 +1108,8 @@ struct MementoGlassesDisplayRenderer {
     if isStreaming {
       sections.append(contentsOf: recallSections)
       sections.append(AssistanceDisplaySection(
-        title: "Stream running successfully",
-        lines: [streamModeLine, recognizedPeopleLine]
+        title: streamTitle,
+        lines: [streamModeLine, recognizedPeopleLine, readinessLine]
           .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
           .filter { !$0.isEmpty }
       ))

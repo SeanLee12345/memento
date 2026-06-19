@@ -117,11 +117,14 @@ final class SpeechTranscriptionManager: ObservableObject {
 
     let inputNode = audioEngine.inputNode
     gainRide.reset()
-    // 4096-frame tap (~256 ms at 16 kHz) is more tolerant of brief BT SCO stalls
-    // than the original 1024-frame (~64 ms) tap. Larger taps trade a tiny bit of
-    // latency for fewer underruns during HFP packet loss.
+    // 8192-frame tap (~170 ms at 48 kHz built-in mic) is more tolerant of brief BT
+    // SCO stalls than the original 1024-frame (~64 ms) tap, and ~halves the callback
+    // rate vs the previous 4096 — each callback spawns a Task + main-actor hop for
+    // speaker bookkeeping, so fewer callbacks means less Thread-1 churn. The
+    // transcriber re-chunks internally, so ASR latency only grows by ~one tap of
+    // granularity. Bump to 16384 if even fewer callbacks are wanted (more latency).
     let rideRef = gainRide
-    inputNode.installTap(onBus: 0, bufferSize: 4_096, format: nil) { [weak self] buffer, _ in
+    inputNode.installTap(onBus: 0, bufferSize: 8_192, format: nil) { [weak self] buffer, _ in
       if let copiedBuffer = SpeechTranscriptionManager.copyPCMBuffer(buffer) {
         rideRef.processInPlace(copiedBuffer)
         self?.onAudioBuffer?(copiedBuffer)
@@ -155,7 +158,7 @@ final class SpeechTranscriptionManager: ObservableObject {
     microphoneStatusText = "Microphone live"
     let inputRouteDesc = audioSession.currentRoute.inputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
     let outputRouteDesc = audioSession.currentRoute.outputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
-    AppLogger.log(.audio, "Live audio capture started sampleRate=\(liveFormat.sampleRate), channels=\(liveFormat.channelCount), inputRoute=[\(inputRouteDesc)], outputRoute=[\(outputRouteDesc)], preferredSR=\(audioSession.preferredSampleRate), ioBuffer=\(String(format: "%.3f", Double(audioSession.ioBufferDuration)))s, tapBufferFrames=4096")
+    AppLogger.log(.audio, "Live audio capture started sampleRate=\(liveFormat.sampleRate), channels=\(liveFormat.channelCount), inputRoute=[\(inputRouteDesc)], outputRoute=[\(outputRouteDesc)], preferredSR=\(audioSession.preferredSampleRate), ioBuffer=\(String(format: "%.3f", Double(audioSession.ioBufferDuration)))s, tapBufferFrames=8192")
   }
 
   private func subscribeToAudioSessionEvents(_ session: AVAudioSession) {

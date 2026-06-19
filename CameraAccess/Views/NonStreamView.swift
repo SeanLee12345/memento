@@ -844,7 +844,7 @@ private struct SettingsCard: View {
   private var liveTranscriptionRow: some View {
     VStack(alignment: .leading, spacing: 8) {
       HStack {
-        Toggle("Alibaba live transcript", isOn: $viewModel.liveTranscriptionEnabled)
+        Toggle("Live transcript", isOn: $viewModel.liveTranscriptionEnabled)
           .font(.system(size: 13, weight: .medium))
           .foregroundColor(.white.opacity(0.82))
         Spacer()

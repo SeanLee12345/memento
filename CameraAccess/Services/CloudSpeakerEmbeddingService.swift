@@ -92,6 +92,19 @@ struct CloudSpeakerWorkerStartResult {
 }
 
 actor CloudSpeakerEmbeddingLifecycleService {
+  nonisolated static func workerHealthRetryDelaySeconds(attempt: Int) -> TimeInterval {
+    switch attempt {
+    case ...1: return 0
+    case 2: return 5
+    case 3: return 10
+    default: return 20
+    }
+  }
+
+  nonisolated static func workerHealthRetryCadenceText(maxAttempts: Int) -> String {
+    "5/10/20s capped maxAttempts=\(maxAttempts)"
+  }
+
   private let lambda: AWSCognitoLambdaClient
   private var liveStartRequested = false
   private var startedLiveWorker = false
@@ -105,7 +118,10 @@ actor CloudSpeakerEmbeddingLifecycleService {
     self.lambda = lambda
   }
 
-  func startAndWarm(settings: CloudSpeakerEmbeddingSettings) async throws -> CloudSpeakerWorkerStartResult {
+  func startAndWarm(
+    settings: CloudSpeakerEmbeddingSettings,
+    maxHealthAttempts: Int = 24
+  ) async throws -> CloudSpeakerWorkerStartResult {
     guard settings.enabled else { throw CloudSpeakerEmbeddingLifecycleError.disabled }
 
     var publicIp: String?
@@ -151,7 +167,11 @@ actor CloudSpeakerEmbeddingLifecycleService {
       endpoint: endpoint,
       fallbackAPIKey: settings.apiKey
     )
-    let health = try await waitForWorkerHealth(endpoint: endpoint, apiKey: workerAPIKey)
+    let health = try await waitForWorkerHealth(
+      endpoint: endpoint,
+      apiKey: workerAPIKey,
+      maxAttempts: maxHealthAttempts
+    )
     return CloudSpeakerWorkerStartResult(
       endpoint: endpoint,
       apiKey: workerAPIKey,
@@ -254,37 +274,52 @@ actor CloudSpeakerEmbeddingLifecycleService {
     throw CloudSpeakerEmbeddingLifecycleError.lambdaResponseInvalid("missing publicIp after polling instance state=\(lastState)")
   }
 
-  private func waitForWorkerHealth(endpoint: String, apiKey: String) async throws -> String {
+  private func waitForWorkerHealth(
+    endpoint: String,
+    apiKey: String,
+    maxAttempts: Int
+  ) async throws -> String {
+    var lastError = "not attempted"
+    let boundedAttempts = max(1, maxAttempts)
+    let retryCadence = Self.workerHealthRetryCadenceText(maxAttempts: boundedAttempts)
+    for attempt in 1...boundedAttempts {
+      if attempt > 1 {
+        try await Task.sleep(nanoseconds: UInt64(Self.workerHealthRetryDelaySeconds(attempt: attempt) * 1_000_000_000))
+      }
+      do {
+        let text = try await requestWorkerHealth(endpoint: endpoint, apiKey: apiKey, timeout: 2)
+        AppLogger.log(.speakerEmbeddingModel, "AWS live speaker worker ready attempt=\(attempt) endpoint=\(endpoint) health=\(text) retryCadence=\(retryCadence)")
+        return text
+      } catch {
+        lastError = error.localizedDescription
+      }
+      let shouldLog = attempt <= 3 || attempt % 3 == 0 || attempt == boundedAttempts
+      if shouldLog {
+        AppLogger.log(
+          .speakerEmbeddingModel,
+          "AWS live speaker worker not ready attempt=\(attempt)/\(boundedAttempts) endpoint=\(endpoint) retryCadence=\(retryCadence) serviceStatus=speakerServiceWarming error=\(lastError)"
+        )
+      }
+    }
+    throw CloudSpeakerEmbeddingLifecycleError.workerNotReady(lastError)
+  }
+
+  private func requestWorkerHealth(endpoint: String, apiKey: String, timeout: TimeInterval) async throws -> String {
     guard var url = URL(string: endpoint) else {
       throw CloudSpeakerEmbeddingLifecycleError.invalidEndpoint
     }
     url.appendPathComponent("health")
-    var lastError = "not attempted"
-    for attempt in 1...24 {
-      var request = URLRequest(url: url)
-      request.timeoutInterval = 5
-      let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmedKey.isEmpty {
-        request.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
-      }
-      do {
-        let (data, response) = try await URLSession.shared.data(for: request)
-        if let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
-          let text = String(data: data, encoding: .utf8) ?? "ok"
-          AppLogger.log(.speakerEmbeddingModel, "AWS live speaker worker ready attempt=\(attempt) endpoint=\(endpoint) health=\(text)")
-          return text
-        }
-        lastError = "HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)"
-      } catch {
-        lastError = error.localizedDescription
-      }
-      AppLogger.log(
-        .speakerEmbeddingModel,
-        "AWS live speaker worker not ready attempt=\(attempt)/24 endpoint=\(endpoint) error=\(lastError)"
-      )
-      try await Task.sleep(nanoseconds: 3_000_000_000)
+    var request = URLRequest(url: url)
+    request.timeoutInterval = timeout
+    let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmedKey.isEmpty {
+      request.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
     }
-    throw CloudSpeakerEmbeddingLifecycleError.workerNotReady(lastError)
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+      throw CloudSpeakerEmbeddingLifecycleError.workerNotReady("HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+    }
+    return String(data: data, encoding: .utf8) ?? "ok"
   }
 
   private func workerAuthorizationToken(

@@ -98,11 +98,36 @@ enum ActivityModeTaxonomy: String, Codable, CaseIterable, Sendable {
     case "unknown", "":
       return ActivityModeTaxonomy.unknown.rawValue
     default:
-      if ActivityModeTaxonomy.allCases.contains(where: { $0.rawValue == normalized }) {
+      if ActivityModeTaxonomy.allCases.contains(where: { $0 != .custom && $0.rawValue == normalized }) {
         return normalized
       }
-      return normalized.count > 24 ? String(normalized.prefix(24)) : normalized
+      if containsAny(normalized, ["movie", "baseball", "game", "television", "video", "watching"]) {
+        return ActivityModeTaxonomy.entertainment.rawValue
+      }
+      if containsAny(normalized, ["run", "jog", "exercise", "workout", "gym", "cycling", "sport"]) {
+        return ActivityModeTaxonomy.sport.rawValue
+      }
+      if containsAny(normalized, ["study", "reading", "homework", "school", "class", "textbook"]) {
+        return ActivityModeTaxonomy.study.rawValue
+      }
+      if containsAny(normalized, ["talk", "conversation", "meeting with", "social"]) {
+        return ActivityModeTaxonomy.social.rawValue
+      }
+      if containsAny(normalized, ["driv", "train", "bus", "subway", "commut", "travel"]) {
+        return ActivityModeTaxonomy.commute.rawValue
+      }
+      if containsAny(normalized, ["shop", "store", "checkout", "mall"]) {
+        return ActivityModeTaxonomy.shopping.rawValue
+      }
+      if containsAny(normalized, ["work", "coding", "laptop", "computer", "office", "desk"]) {
+        return ActivityModeTaxonomy.work.rawValue
+      }
+      return ActivityModeTaxonomy.unknown.rawValue
     }
+  }
+
+  private static func containsAny(_ value: String, _ fragments: [String]) -> Bool {
+    fragments.contains { value.contains($0) }
   }
 
   static func displayName(for mode: String) -> String {
@@ -241,6 +266,22 @@ enum ActivityModeClassifier {
   static let promptVersion = "activity-mode-v1"
   static let minimumSwitchConfidence = 0.58
   static let minimumDifferentModeSwitchConfidence = 0.68
+  static let minimumSpecificActivityConfidence = 0.88
+
+  static func conservativeClassification(
+    _ classification: ActivityModeClassification
+  ) -> ActivityModeClassification {
+    let broadMode = ActivityModeTaxonomy.normalizedMode(classification.mode)
+    let permitsSpecificDetail = classification.confidence >= minimumSpecificActivityConfidence
+      && broadMode != ActivityModeTaxonomy.general.rawValue
+      && broadMode != ActivityModeTaxonomy.unknown.rawValue
+    return ActivityModeClassification(
+      mode: broadMode,
+      specificActivity: permitsSpecificDetail ? classification.specificActivity : "",
+      confidence: classification.confidence,
+      reason: classification.reason
+    )
+  }
 
   static func shouldApply(
     current: ActivityModeClassification,
@@ -300,6 +341,111 @@ enum ActivityModeClassifier {
 
   private static func containsAny(_ text: String, _ needles: [String]) -> Bool {
     needles.contains { text.contains($0) }
+  }
+}
+
+struct ActivityModeStabilizationResult: Equatable, Sendable {
+  let classification: ActivityModeClassification
+  let shouldApply: Bool
+  let shouldSendDisplay: Bool
+  let reason: String
+  let matchingObservationCount: Int
+}
+
+struct ActivityModeStabilizer: Sendable {
+  private static let requiredMatchingObservations = 2
+  private static let minimumStableSwitchConfidence = 0.75
+
+  private var pendingMode: String?
+  private var pendingSpecificActivity: String?
+  private var matchingObservationCount = 0
+
+  mutating func reset() {
+    pendingMode = nil
+    pendingSpecificActivity = nil
+    matchingObservationCount = 0
+  }
+
+  mutating func evaluate(
+    current: ActivityModeClassification,
+    candidate rawCandidate: ActivityModeClassification
+  ) -> ActivityModeStabilizationResult {
+    let candidate = ActivityModeClassifier.conservativeClassification(rawCandidate)
+    let currentMode = ActivityModeTaxonomy.normalizedMode(current.mode)
+    let candidateMode = ActivityModeTaxonomy.normalizedMode(candidate.mode)
+
+    guard ActivityModeClassifier.shouldApply(current: current, candidate: candidate) else {
+      reset()
+      return result(candidate, apply: false, display: false, reason: "confidenceGate", count: 0)
+    }
+
+    if currentMode == candidateMode {
+      guard !candidate.specificActivity.isEmpty,
+            candidate.specificActivity != current.specificActivity else {
+        reset()
+        return result(candidate, apply: false, display: false, reason: "broadModeUnchanged", count: 0)
+      }
+      let count = recordObservation(mode: candidateMode, specificActivity: candidate.specificActivity)
+      let stable = count >= Self.requiredMatchingObservations
+      return result(
+        candidate,
+        apply: stable,
+        display: false,
+        reason: stable ? "specificDetailStable" : "specificDetailPending",
+        count: count
+      )
+    }
+
+    let currentIsUnclassified = currentMode == ActivityModeTaxonomy.unknown.rawValue
+      || currentMode == ActivityModeTaxonomy.general.rawValue
+    if currentIsUnclassified, candidate.confidence >= 0.85 {
+      reset()
+      return result(candidate, apply: true, display: true, reason: "initialHighConfidenceMode", count: 1)
+    }
+
+    let requiredConfidence = currentIsUnclassified
+      ? ActivityModeClassifier.minimumSwitchConfidence
+      : Self.minimumStableSwitchConfidence
+    guard candidate.confidence >= requiredConfidence else {
+      reset()
+      return result(candidate, apply: false, display: false, reason: "switchConfidenceGate", count: 0)
+    }
+    let count = recordObservation(mode: candidateMode, specificActivity: candidate.specificActivity)
+    let stable = count >= Self.requiredMatchingObservations
+    return result(
+      candidate,
+      apply: stable,
+      display: stable,
+      reason: stable ? "broadModeStable" : "broadModePending",
+      count: count
+    )
+  }
+
+  private mutating func recordObservation(mode: String, specificActivity: String) -> Int {
+    if pendingMode == mode, pendingSpecificActivity == specificActivity {
+      matchingObservationCount += 1
+    } else {
+      pendingMode = mode
+      pendingSpecificActivity = specificActivity
+      matchingObservationCount = 1
+    }
+    return matchingObservationCount
+  }
+
+  private func result(
+    _ classification: ActivityModeClassification,
+    apply: Bool,
+    display: Bool,
+    reason: String,
+    count: Int
+  ) -> ActivityModeStabilizationResult {
+    ActivityModeStabilizationResult(
+      classification: classification,
+      shouldApply: apply,
+      shouldSendDisplay: display,
+      reason: reason,
+      matchingObservationCount: count
+    )
   }
 }
 

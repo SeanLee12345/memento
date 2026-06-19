@@ -300,6 +300,16 @@ final class SupabaseClient {
     }
   }
 
+  func rpcVoid<Params: Encodable>(
+    _ functionName: String,
+    params: Params
+  ) async throws {
+    var request = try await makeRequest(path: "/rest/v1/rpc/\(functionName)", method: "POST")
+    request.httpBody = try encoder.encode(params)
+    let (data, response) = try await session.data(for: request)
+    try Self.assertSuccess(response: response, body: data)
+  }
+
   func storageOwnerFolder() async throws -> String {
     if settings.usesServiceRole {
       return "service-role"

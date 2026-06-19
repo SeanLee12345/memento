@@ -1,6 +1,7 @@
 import Combine
 import CoreMedia
 import CoreVideo
+import Foundation
 import MWDATCamera
 import MWDATCore
 import MWDATDisplay
@@ -13,6 +14,7 @@ final class DATGlassesManager: ObservableObject {
   private static let appFrameDeliveryMaxFPS: Double = 5
   private static let noVideoFramesWarningDelaySeconds: TimeInterval = 10
   private static let displayActionDispatchDelayNanoseconds: UInt64 = 150_000_000
+  private static let sdkCallbackDrainDelayNanoseconds: UInt64 = 2_000_000_000
 
   @Published private(set) var sdkStatusText = "Not configured"
   @Published private(set) var configurationModeText = DATConfigurationMode.developerMode.rawValue
@@ -87,6 +89,7 @@ final class DATGlassesManager: ObservableObject {
   private var wearables: WearablesInterface?
   private var deviceSelector: AutoDeviceSelector?
   private var deviceSession: DeviceSession?
+  private var observedDeviceSession: DeviceSession?
   private var activeDeviceSessionDeviceId: DeviceIdentifier?
   private var streamSession: MWDATCamera.Stream?
   private var stateListenerToken: AnyListenerToken?
@@ -105,8 +108,14 @@ final class DATGlassesManager: ObservableObject {
   private var displayGeneration: UInt64 = 0
   private var displaySDKTeardownInProgress = false
   private var teardownRetainedListenerTokens: [AnyListenerToken] = []
+  private var teardownRetainedDeviceSessions: [DeviceSession] = []
   private var teardownRetainedStreams: [MWDATCamera.Stream] = []
   private var teardownRetainedDisplays: [Display] = []
+  private var teardownRetainedReleaseTask: Task<Void, Never>?
+  private var teardownRetainedReleaseGeneration: UInt64 = 0
+  private var streamStartInFlight = false
+  private var streamStopInFlight = false
+  private var deviceSessionResetInFlight = false
   private var lastSentDisplayCardKey = ""
   private var currentDisplayCardKey = ""
   private var currentDisplayPageIndex = 0
@@ -146,6 +155,32 @@ final class DATGlassesManager: ObservableObject {
 
   private init() {}
 
+  enum StreamStartDecision: Equatable {
+    case proceed
+    case duplicateStartInFlight
+    case stopInFlight
+  }
+
+  nonisolated static func streamStartDecision(
+    startInFlight: Bool,
+    stopInFlight: Bool
+  ) -> StreamStartDecision {
+    if startInFlight { return .duplicateStartInFlight }
+    if stopInFlight { return .stopInFlight }
+    return .proceed
+  }
+
+  private func logLifecycle(_ event: String, _ detail: String = "") {
+    let suffix = detail.isEmpty ? "" : " \(detail)"
+    AppLogger.log(.sdk, "[DATLifecycle] event=\(event)\(suffix) thread=\(Self.threadInfo())")
+  }
+
+  nonisolated private static func threadInfo() -> String {
+    let thread = Thread.current
+    let name = thread.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return "main=\(Thread.isMainThread) name=\(name.isEmpty ? "unnamed" : name)"
+  }
+
   nonisolated static func noVideoFramesDiagnosticMessage(
     elapsedSeconds: TimeInterval,
     streamState: String,
@@ -159,11 +194,13 @@ final class DATGlassesManager: ObservableObject {
   }
 
   func configureAtStartup() {
+    logLifecycle("configure_at_startup_requested")
     ensureConfigured()
   }
 
   func ensureConfigured() {
     guard !didAttemptConfigure else {
+      logLifecycle("configure_skipped_duplicate", "configured=\(isConfigured) status=\"\(sdkStatusText)\"")
       updateStartReadinessReason()
       return
     }
@@ -180,6 +217,7 @@ final class DATGlassesManager: ObservableObject {
 
     let mode = detectConfigurationMode()
     configurationModeText = mode.rawValue
+    logLifecycle("configure_requested", "mode=\(mode.rawValue)")
     AppLogger.log(.sdk, "DAT configure requested. simulator=\(isSimulator), physicalDevice=\(!isSimulator), configurationMode=\(mode.rawValue)")
     refreshRuntimeConfigurationSnapshot(reason: "ensureConfigured")
     logConfigurationInputs(mode: mode)
@@ -208,6 +246,10 @@ final class DATGlassesManager: ObservableObject {
       self.sdkStatusText = "Configured"
       self.applyRegistrationState(wearables.registrationState)
       self.deviceCount = wearables.devices.count
+      logLifecycle(
+        "configure_completed",
+        "count=\(configureCallCount) registrationState=\(wearables.registrationState) deviceCount=\(wearables.devices.count)"
+      )
       AppLogger.log(.sdk, "Wearables SDK configured. registrationState=\(wearables.registrationState), initialDeviceCount=\(wearables.devices.count)")
       observeRegistration(wearables: wearables)
       if wearables.registrationState == .registered {
@@ -231,6 +273,7 @@ final class DATGlassesManager: ObservableObject {
       sdkStatusText = "Configure failed"
       let message = "Wearables SDK configuration failed: \(error.localizedDescription)"
       lastDATErrorText = message
+      logLifecycle("configure_failed", "error=\"\(error.localizedDescription)\"")
       AppLogger.log(.sdk, message)
       onError?(message)
       updateStartReadinessReason()
@@ -398,6 +441,22 @@ final class DATGlassesManager: ObservableObject {
   }
 
   func startStream() async -> Bool {
+    logLifecycle(
+      "stream_start_requested",
+      "configured=\(isConfigured) startInFlight=\(streamStartInFlight) stopInFlight=\(streamStopInFlight) streamState=\(streamSessionStateText) deviceSession=\(deviceSessionStateText)"
+    )
+    switch Self.streamStartDecision(startInFlight: streamStartInFlight, stopInFlight: streamStopInFlight) {
+    case .proceed:
+      break
+    case .duplicateStartInFlight:
+      logLifecycle("stream_start_skipped_duplicate", "streamState=\(streamSessionStateText)")
+      AppLogger.log(.stream, "Start stream ignored because a DAT stream start is already in flight.")
+      return true
+    case .stopInFlight:
+      logLifecycle("stream_start_blocked_stop_in_flight", "streamState=\(streamSessionStateText)")
+      emitError("Start streaming blocked: previous DAT stream stop is still finishing.")
+      return false
+    }
     guard isConfigured else {
       emitUnavailable()
       return false
@@ -408,6 +467,12 @@ final class DATGlassesManager: ObservableObject {
       AppLogger.log(.stream, "Start stream blocked: \(reason)")
       return false
     }
+    streamStartInFlight = true
+    defer {
+      streamStartInFlight = false
+      logLifecycle("stream_start_completed", "streamState=\(streamSessionStateText) running=\(isStreamRunning)")
+    }
+
     guard await requestCameraPermission() else { return false }
 
     if let existingStream = streamSession {
@@ -421,8 +486,11 @@ final class DATGlassesManager: ObservableObject {
         return true
       }
       AppLogger.log(.stream, "Clearing stopped DAT Stream before creating a new stream. state=\(streamSessionStateText)")
-      clearStreamListeners()
-      streamSession = nil
+      releaseLocalStreamReference(
+        reason: "clear-stopped-before-start",
+        stateText: streamSessionStateText,
+        preserveSDKReferencesForTeardown: true
+      )
       _ = existingStream
     }
 
@@ -453,6 +521,7 @@ final class DATGlassesManager: ObservableObject {
         emitError("Failed to create DAT Stream.")
         return false
       }
+      logLifecycle("stream_created", "deviceId=\(session.deviceId) resolution=\(resolution) frameRate=\(frameRate)")
       streamSession = stream
       resetFrameDiagnostics()
       cancelNoVideoFramesWatchdog()
@@ -471,11 +540,45 @@ final class DATGlassesManager: ObservableObject {
   }
 
   func stopStream(reason: String = "callerRequested") async {
+    logLifecycle(
+      "stream_stop_requested",
+      "reason=\(reason) startInFlight=\(streamStartInFlight) stopInFlight=\(streamStopInFlight) streamState=\(streamSessionStateText) running=\(isStreamRunning)"
+    )
+    if streamStartInFlight {
+      logLifecycle("stream_stop_waiting_for_start", "reason=\(reason)")
+      while streamStartInFlight && !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 100_000_000)
+      }
+    }
+    guard !streamStopInFlight else {
+      logLifecycle("stream_stop_skipped_duplicate", "reason=\(reason) streamState=\(streamSessionStateText)")
+      AppLogger.log(.stream, "Stop stream ignored because a DAT stream stop is already in flight reason=\(reason)")
+      return
+    }
+    streamStopInFlight = true
+    defer {
+      streamStopInFlight = false
+      logLifecycle("stream_stop_completed", "reason=\(reason) streamState=\(streamSessionStateText) running=\(isStreamRunning)")
+    }
+
     let stream = streamSession
-    releaseLocalStreamReference(reason: "stopStream-\(reason)", stateText: "STOPPED")
+    AppLogger.log(
+      .stream,
+      "DAT stopStream invoked reason=\(reason), callsite=\(Self.teardownCallsiteSummary())"
+    )
     if let stream {
       AppLogger.log(.stream, "Stopping real DAT Stream reason=\(reason)")
       await stream.stop()
+      // Keep the capability and listener graph alive until the SDK publishes its
+      // terminal state. Releasing before stop() returns races late DCTEvent callbacks
+      // in MWDATCore 0.7.0 and can crash in its internal listener registry.
+      if streamSession != nil {
+        releaseLocalStreamReference(
+          reason: "stopStream-completed-\(reason)",
+          stateText: "STOPPED",
+          preserveSDKReferencesForTeardown: true
+        )
+      }
     } else {
       AppLogger.log(.stream, "Stop real DAT Stream requested with no active stream reason=\(reason)")
     }
@@ -550,7 +653,10 @@ final class DATGlassesManager: ObservableObject {
   func clearAssistanceDisplay(reason: String) async {
     guard isDATAppModelEnabled else { return }
     guard isDisplaySDKInteractionAllowed else {
-      releaseLocalDisplayReference(reason: "clear-\(reason)-sessionNotStarted")
+      releaseLocalDisplayReference(
+        reason: "clear-\(reason)-sessionNotStarted",
+        preserveSDKReferencesForTeardown: true
+      )
       return
     }
     guard let display else { return }
@@ -571,8 +677,16 @@ final class DATGlassesManager: ObservableObject {
   }
 
   func detachAssistanceDisplay(reason: String) async {
+    logLifecycle("display_teardown_requested", "reason=\(reason) state=\(assistanceDisplayStateText)")
+    AppLogger.log(
+      .display,
+      "Assistance display detach requested reason=\(reason), callsite=\(Self.teardownCallsiteSummary())"
+    )
     guard isDisplaySDKInteractionAllowed else {
-      releaseLocalDisplayReference(reason: "detach-\(reason)-sessionNotStarted")
+      releaseLocalDisplayReference(
+        reason: "detach-\(reason)-sessionNotStarted",
+        preserveSDKReferencesForTeardown: true
+      )
       return
     }
     pendingDisplayAction = nil
@@ -587,21 +701,23 @@ final class DATGlassesManager: ObservableObject {
       return
     }
     displayDetachAfterSendReason = nil
-    displayStateListenerToken = nil
-    displayStateContinuation?.finish()
-    displayStateContinuation = nil
-    displayStateTask?.cancel()
-    displayStateTask = nil
     displayAttachInFlight = false
     displayAttachBlockedDeviceSessionId = nil
     if let display {
+      releaseLocalDisplayReference(
+        reason: "detach-\(reason)-beforeStop",
+        preserveSDKReferencesForTeardown: true
+      )
       AppLogger.log(.display, "Stopping assistance display reason=\(reason)")
       await display.stop()
+    } else {
+      releaseLocalDisplayReference(
+        reason: "detach-\(reason)-noDisplay",
+        preserveSDKReferencesForTeardown: true
+      )
     }
-    display = nil
-    isAssistanceDisplayConnected = false
-    assistanceDisplayStateText = "Not connected"
-    assistanceDisplayStatusText = "Display stopped"
+    assistanceDisplayStatusText = "Display stop requested"
+    logLifecycle("display_teardown_completed", "reason=\(reason) state=\(assistanceDisplayStateText)")
   }
 
   private var isDisplaySDKInteractionAllowed: Bool {
@@ -647,8 +763,12 @@ final class DATGlassesManager: ObservableObject {
     isAssistanceDisplayConnected = false
     assistanceDisplayStateText = "Not connected"
     assistanceDisplayStatusText = "Display stopped"
+    logLifecycle("display_callback_unregistered", "reason=\(reason)")
     if hadDisplayState {
-      AppLogger.log(.display, "Released local assistance display reference reason=\(reason), deviceSession=\(deviceSessionStateText)")
+      AppLogger.log(
+        .display,
+        "Released local assistance display reference reason=\(reason), deviceSession=\(deviceSessionStateText), callsite=\(Self.teardownCallsiteSummary())"
+      )
     }
   }
 
@@ -685,15 +805,22 @@ final class DATGlassesManager: ObservableObject {
         teardownRetainedDisplays.append(display)
       }
       displaySDKTeardownInProgress = true
+      logLifecycle(
+        "display_callback_retained_for_drain",
+        "reason=\(reason) listenerTokens=\(retainedCount) displayRetained=\(display != nil)"
+      )
       AppLogger.log(.display, "Retained DAT display references through SDK teardown reason=\(reason), listenerTokens=\(retainedCount), displayRetained=\(display != nil)")
     } else {
       AppLogger.log(.display, "DAT display teardown already pending reason=\(reason)")
     }
+    scheduleTeardownRetainedDATReferenceRelease(reason: "display-\(reason)")
   }
 
   private func finalizeDisplaySDKTeardown(reason: String) {
     if displaySDKTeardownInProgress {
       AppLogger.log(.display, "Finalizing DAT display teardown reason=\(reason)")
+      scheduleTeardownRetainedDATReferenceRelease(reason: "display-finalize-\(reason)")
+      return
     }
     releaseLocalDisplayReference(reason: reason)
   }
@@ -754,6 +881,7 @@ final class DATGlassesManager: ObservableObject {
       displayStateListenerToken = capability.statePublisher.listen { state in
         continuation.yield(state)
       }
+      logLifecycle("display_callback_registered", "reason=\(reason) deviceId=\(session.deviceId)")
       displayStateTask = Task { [weak self] in
         for await state in stateStream {
           guard let self, !Task.isCancelled else { return }
@@ -766,17 +894,27 @@ final class DATGlassesManager: ObservableObject {
     } catch DeviceSessionError.datAppOnTheGlassesUpdateRequired {
       assistanceDisplayRequiresDATAppUpdate = true
       assistanceDisplayStatusText = "DAT glasses app update required"
-      display = nil
+      releaseLocalDisplayReference(
+        reason: "display-start-update-required-\(reason)",
+        preserveSDKReferencesForTeardown: true
+      )
       AppLogger.log(.display, "Assistance display failed: DAT app on glasses update required")
     } catch {
       assistanceDisplayRequiresDATAppUpdate = false
-      display = nil
       if Self.isDisplayCapabilityAlreadyActiveError(error) {
+        releaseLocalDisplayReference(
+          reason: "display-already-active-\(reason)",
+          preserveSDKReferencesForTeardown: true
+        )
         displayAttachBlockedDeviceSessionId = sessionDeviceIdText
         assistanceDisplayStatusText = "Glasses display already active"
         AppLogger.log(.display, "Assistance display attach blocked for active capability deviceId=\(session.deviceId) reason=\(reason): \(error.localizedDescription)")
         return
       }
+      releaseLocalDisplayReference(
+        reason: "display-start-failed-\(reason)",
+        preserveSDKReferencesForTeardown: true
+      )
       assistanceDisplayStatusText = "Display failed: \(error.localizedDescription)"
       AppLogger.log(.display, "Assistance display failed reason=\(reason): \(error.localizedDescription)")
     }
@@ -807,12 +945,15 @@ final class DATGlassesManager: ObservableObject {
       isAssistanceDisplayConnected = false
       assistanceDisplayStatusText = "Stopping glasses display..."
     case .stopped:
-      if displaySDKTeardownInProgress,
-         deviceSessionStateText.lowercased().contains("stopping") {
-        AppLogger.log(.display, "Assistance display stopped during DeviceSession teardown; waiting for DeviceSession stopped before releasing references")
+      if displaySDKTeardownInProgress {
+        AppLogger.log(.display, "Assistance display stopped during SDK teardown; waiting for callback-drain before releasing references")
+        scheduleTeardownRetainedDATReferenceRelease(reason: "displayStateStopped")
         return
       }
-      releaseLocalDisplayReference(reason: "displayStateStopped")
+      releaseLocalDisplayReference(
+        reason: "displayStateStopped",
+        preserveSDKReferencesForTeardown: true
+      )
     }
     AppLogger.log(.display, "Assistance display state=\(state)")
   }
@@ -827,7 +968,10 @@ final class DATGlassesManager: ObservableObject {
   ) async -> Bool {
     guard !pages.isEmpty else { return false }
     guard isDisplaySDKInteractionAllowed else {
-      releaseLocalDisplayReference(reason: "send-\(reason)-sessionNotStarted")
+      releaseLocalDisplayReference(
+        reason: "send-\(reason)-sessionNotStarted",
+        preserveSDKReferencesForTeardown: true
+      )
       return false
     }
     let clampedPageIndex = min(max(pageIndex, 0), pages.count - 1)
@@ -1115,10 +1259,32 @@ final class DATGlassesManager: ObservableObject {
     for page: AssistanceDisplayPage,
     isStreamRunning: Bool
   ) -> Bool {
-    isStreamRunning
+    let pageActions = [page.primaryAction, page.secondaryAction, page.tertiaryAction]
+    if pageActions.contains(where: { $0?.isIdentityPromptAction == true }) {
+      return false
+    }
+    return isStreamRunning
       || page.primaryAction == .stopStream
       || page.secondaryAction == .stopStream
       || page.tertiaryAction == .stopStream
+  }
+
+  nonisolated static func shouldPinStreamControlsForTesting(
+    primaryAction: GlassesDisplayAction?,
+    secondaryAction: GlassesDisplayAction?,
+    tertiaryAction: GlassesDisplayAction?,
+    isStreamRunning: Bool
+  ) -> Bool {
+    let page = AssistanceDisplayPage(
+      title: "Test",
+      lines: [],
+      number: 1,
+      count: 1,
+      primaryAction: primaryAction,
+      secondaryAction: secondaryAction,
+      tertiaryAction: tertiaryAction
+    )
+    return shouldPinStreamControls(for: page, isStreamRunning: isStreamRunning)
   }
 
   private static func displayView(
@@ -1449,6 +1615,7 @@ final class DATGlassesManager: ObservableObject {
   }
 
   func unregisterDATApp() async {
+    logLifecycle("unregister_requested", "configured=\(isConfigured) state=\(registrationStateText)")
     ensureConfigured()
     guard let wearables = wearables, isConfigured, !isSimulator else {
       emitUnavailable()
@@ -1456,7 +1623,12 @@ final class DATGlassesManager: ObservableObject {
     }
 
     do {
+      await stopStream(reason: "unregisterDATApp")
       await detachAssistanceDisplay(reason: "unregisterDATApp")
+      if let session = deviceSession {
+        retainDeviceSessionForSDKTeardown(session, reason: "unregisterDATApp")
+        session.stop()
+      }
       AppLogger.log(.registration, "Calling startUnregistration for Developer Mode one-app-rule recovery")
       try await wearables.startUnregistration()
       applyRegistrationState(wearables.registrationState)
@@ -1464,6 +1636,7 @@ final class DATGlassesManager: ObservableObject {
       deviceTask = nil
       activeDeviceTask?.cancel()
       activeDeviceTask = nil
+      retainRemovedDeviceListenerTokens(activeDeviceIds: [], reason: "unregisterDATApp")
       devicesStreamActive = false
       deviceCount = 0
       hasActiveDevice = false
@@ -1471,44 +1644,69 @@ final class DATGlassesManager: ObservableObject {
       selectedDeviceCompatibilityText = "unknown"
       selectedDeviceLinkStateText = "unknown"
       selectedDeviceIsCompatible = false
-      deviceSession = nil
-      activeDeviceSessionDeviceId = nil
       isDeviceSessionReady = false
       connectionStageText = DATConnectionStage.registrationAvailable.rawValue
       lastDATErrorText = "DAT app unregistered. Tap Connect my glasses to register again."
+      logLifecycle("unregister_completed", "state=\(wearables.registrationState)")
       updateStartReadinessReason()
     } catch {
       let detail = detailedErrorDescription(error)
+      logLifecycle("unregister_failed", "error=\"\(detail)\"")
       emitError("Unregistration failed: \(detail)")
     }
   }
 
   func resetDeviceSession() async {
-    AppLogger.log(.devices, "Stop/Reset Session requested by user")
+    guard !deviceSessionResetInFlight else {
+      logLifecycle("device_session_reset_skipped_duplicate", "state=\(deviceSessionStateText)")
+      AppLogger.log(.devices, "Stop/Reset Session ignored because reset is already in flight")
+      return
+    }
+    deviceSessionResetInFlight = true
+    defer {
+      deviceSessionResetInFlight = false
+      logLifecycle("device_session_reset_completed", "state=\(deviceSessionStateText)")
+    }
+    logLifecycle("device_session_reset_requested", "state=\(deviceSessionStateText)")
+    AppLogger.log(
+      .devices,
+      "Stop/Reset Session requested by user callsite=\(Self.teardownCallsiteSummary())"
+    )
     await stopStream(reason: "resetDeviceSession")
     await detachAssistanceDisplay(reason: "resetDeviceSession")
     if let session = deviceSession {
       AppLogger.log(.devices, "Stopping DeviceSession for reset. deviceId=\(session.deviceId), state=\(session.state)")
+      retainDeviceSessionForSDKTeardown(session, reason: "resetDeviceSession")
+      startDeviceSessionStateObserver(for: session)
       session.stop()
     } else {
       AppLogger.log(.devices, "No local DeviceSession exists to stop during reset; clearing local state only")
+      deviceSessionStateTask?.cancel()
+      deviceSessionStateTask = nil
+      observedDeviceSession = nil
     }
-    deviceSession = nil
-    activeDeviceSessionDeviceId = nil
     isDeviceSessionReady = false
-    deviceSessionStateText = "None"
+    deviceSessionStateText = deviceSession.map { "\($0.state)" } ?? "None"
     runtimeSessionStateText = "StateStream only"
-    deviceSessionStateTask?.cancel()
-    deviceSessionStateTask = nil
     lastDATErrorText = "DeviceSession reset. Keep glasses open/worn and connected in Meta AI, then tap Connect my glasses."
+    scheduleTeardownRetainedDATReferenceRelease(reason: "resetDeviceSession")
     updateStartReadinessReason()
   }
 
   private func releaseLocalDeviceSession(reason: String) {
-    AppLogger.log(.devices, "Releasing local DeviceSession reference reason=\(reason), deviceId=\(activeDeviceSessionDeviceId ?? "nil"), state=\(deviceSession.map { "\($0.state)" } ?? "nil")")
+    AppLogger.log(
+      .devices,
+      "Releasing local DeviceSession reference reason=\(reason), deviceId=\(activeDeviceSessionDeviceId ?? "nil"), state=\(deviceSession.map { "\($0.state)" } ?? "nil"), callsite=\(Self.teardownCallsiteSummary())"
+    )
+    if let session = deviceSession {
+      retainDeviceSessionForSDKTeardown(session, reason: "releaseLocalDeviceSession-\(reason)")
+    }
     if display != nil {
       if isDisplaySDKInteractionAllowed {
-        releaseLocalDisplayReference(reason: "releaseLocalDeviceSession-\(reason)")
+        releaseLocalDisplayReference(
+          reason: "releaseLocalDeviceSession-\(reason)",
+          preserveSDKReferencesForTeardown: true
+        )
       } else {
         finalizeDisplaySDKTeardown(reason: "releaseLocalDeviceSession-\(reason)")
       }
@@ -1520,22 +1718,26 @@ final class DATGlassesManager: ObservableObject {
     runtimeSessionStateText = "StateStream only"
     deviceSessionStateTask?.cancel()
     deviceSessionStateTask = nil
+    observedDeviceSession = nil
   }
 
   @discardableResult
   func prepareDeviceSession(reason: String) async -> DeviceSession? {
+    logLifecycle("device_session_prepare_requested", "reason=\(reason) state=\(deviceSessionStateText)")
     AppLogger.log(.devices, "Preparing DeviceSession reason=\(reason), deviceCount=\(deviceCount), activeDevice=\(deviceSelector?.activeDevice ?? "nil")")
     do {
       let session = try await getDeviceSession(reason: reason)
       isDeviceSessionReady = true
       deviceSessionStateText = "\(session.state)"
       connectionStageText = DATConnectionStage.deviceSessionReady.rawValue
+      logLifecycle("device_session_prepare_completed", "reason=\(reason) deviceId=\(session.deviceId) state=\(session.state)")
       AppLogger.log(.devices, "DeviceSession ready for deviceId=\(session.deviceId), state=\(session.state)")
       updateStartReadinessReason()
       return session
     } catch {
       isDeviceSessionReady = false
       let detail = detailedErrorDescription(error)
+      logLifecycle("device_session_prepare_failed", "reason=\(reason) error=\"\(detail)\"")
       AppLogger.log(.devices, "DeviceSession failed detail: \(detail)")
       emitError("DeviceSession failed: \(error.localizedDescription)")
       updateStartReadinessReason()
@@ -1583,6 +1785,7 @@ final class DATGlassesManager: ObservableObject {
     do {
       AppLogger.log(.devices, "DeviceSession creation attempted, reason=\(reason), activeDevice=\(deviceSelector.activeDevice ?? "nil")")
       let session = try wearables.createSession(deviceSelector: deviceSelector)
+      logLifecycle("device_session_created", "reason=\(reason) deviceId=\(session.deviceId)")
       deviceSession = session
       activeDeviceSessionDeviceId = session.deviceId
       selectedDeviceIDText = session.deviceId
@@ -1592,6 +1795,7 @@ final class DATGlassesManager: ObservableObject {
       let stateStream = session.stateStream()
       let errorStream = session.errorStream()
       try session.start()
+      logLifecycle("device_session_start_called", "reason=\(reason) deviceId=\(session.deviceId) state=\(session.state)")
       deviceSessionStateText = "\(session.state)"
       AppLogger.log(.devices, "DeviceSession.start() called for deviceId=\(session.deviceId), initialState=\(session.state)")
 
@@ -1610,6 +1814,9 @@ final class DATGlassesManager: ObservableObject {
       return session
     } catch {
       isDeviceSessionReady = false
+      if let session = deviceSession {
+        retainDeviceSessionForSDKTeardown(session, reason: "deviceSessionStartFailed-\(reason)")
+      }
       deviceSession = nil
       activeDeviceSessionDeviceId = nil
       throw error
@@ -1761,7 +1968,22 @@ final class DATGlassesManager: ObservableObject {
   }
 
   private func startDeviceSessionStateObserver(for session: DeviceSession) {
+    if let observedDeviceSession,
+       observedDeviceSession === session,
+       let deviceSessionStateTask,
+       !deviceSessionStateTask.isCancelled {
+      logLifecycle("device_session_callback_registered_skip_duplicate", "deviceId=\(session.deviceId)")
+      return
+    }
+    if let observedDeviceSession {
+      retainDeviceSessionForSDKTeardown(
+        observedDeviceSession,
+        reason: "replaceDeviceSessionObserver"
+      )
+    }
     deviceSessionStateTask?.cancel()
+    observedDeviceSession = session
+    logLifecycle("device_session_callback_registered", "deviceId=\(session.deviceId)")
     deviceSessionStateTask = Task { [weak self] in
       for await state in session.stateStream() {
         guard let self else { return }
@@ -1769,7 +1991,7 @@ final class DATGlassesManager: ObservableObject {
         self.isDeviceSessionReady = state == .started
         AppLogger.log(.devices, "DeviceSession state observed: \(state)")
         if state == .started {
-          self.clearTeardownRetainedDATReferences(reason: "deviceSessionStarted")
+          self.scheduleTeardownRetainedDATReferenceRelease(reason: "deviceSessionStarted")
           self.activeDeviceSessionDeviceId = session.deviceId
         } else if state == .stopping {
           self.disableStreamFrameCallbacks(
@@ -1781,6 +2003,10 @@ final class DATGlassesManager: ObservableObject {
             preserveSDKReferencesForTeardown: true
           )
         } else if state == .stopped {
+          self.retainDeviceSessionForSDKTeardown(
+            session,
+            reason: "deviceSessionStopped"
+          )
           self.releaseLocalStreamReference(
             reason: "deviceSessionStopped",
             stateText: "STOPPED",
@@ -1790,6 +2016,7 @@ final class DATGlassesManager: ObservableObject {
           self.finalizeDisplaySDKTeardown(reason: "deviceSessionStopped")
           self.isDeviceSessionReady = false
           self.deviceSession = nil
+          self.observedDeviceSession = nil
           self.activeDeviceSessionDeviceId = nil
           self.deviceSessionStateTask = nil
           self.updateStartReadinessReason()
@@ -1811,11 +2038,18 @@ final class DATGlassesManager: ObservableObject {
     frameListenerToken = stream.videoFramePublisher.listen { [weak self, appFrameDeliveryGate, callbackGeneration] frame in
       let receivedAtNanos = DispatchTime.now().uptimeNanoseconds
       guard appFrameDeliveryGate.shouldDeliver() else { return }
-      guard let self else { return }
-      guard self.shouldAcceptStreamCallback(generation: callbackGeneration) else { return }
+      guard let self else {
+        appFrameDeliveryGate.completeDelivery()
+        return
+      }
+      guard self.shouldAcceptStreamCallback(generation: callbackGeneration) else {
+        appFrameDeliveryGate.completeDelivery()
+        return
+      }
       var extraction = Self.extractVideoFrame(frame)
       extraction.receivedAtNanos = receivedAtNanos
       Task { @MainActor in
+        defer { appFrameDeliveryGate.completeDelivery() }
         guard self.shouldAcceptStreamCallback(generation: callbackGeneration) else { return }
         self.handleVideoFrame(extraction)
       }
@@ -1825,6 +2059,7 @@ final class DATGlassesManager: ObservableObject {
         self?.handleStreamError(error)
       }
     }
+    logLifecycle("stream_callback_registered", "generation=\(callbackGeneration)")
   }
 
   private func clearStreamListeners(preserveForSDKTeardown reason: String? = nil) {
@@ -1843,12 +2078,22 @@ final class DATGlassesManager: ObservableObject {
         retainedCount += 1
       }
       if retainedCount > 0 {
+        logLifecycle("stream_callback_retained_for_drain", "reason=\(reason) count=\(retainedCount)")
         AppLogger.log(.stream, "Retained DAT stream listener tokens through SDK teardown reason=\(reason), count=\(retainedCount)")
       }
+    }
+    if stateListenerToken != nil || frameListenerToken != nil || errorListenerToken != nil {
+      logLifecycle(
+        reason == nil ? "stream_callback_unregistered" : "stream_callback_detached_locally",
+        "reason=\(reason ?? "immediate")"
+      )
     }
     stateListenerToken = nil
     frameListenerToken = nil
     errorListenerToken = nil
+    if let reason {
+      scheduleTeardownRetainedDATReferenceRelease(reason: "stream-listeners-\(reason)")
+    }
   }
 
   private func disableStreamFrameCallbacks(
@@ -1859,7 +2104,9 @@ final class DATGlassesManager: ObservableObject {
     streamCallbackGate.disableFrames(stateText: streamSessionStateText)
     if preserveListenerTokenForSDKTeardown, let frameListenerToken {
       teardownRetainedListenerTokens.append(frameListenerToken)
+      logLifecycle("stream_frame_callback_retained_for_drain", "reason=\(reason)")
       AppLogger.log(.stream, "Retained DAT frame listener token through SDK teardown reason=\(reason)")
+      scheduleTeardownRetainedDATReferenceRelease(reason: "stream-frame-\(reason)")
     }
     frameListenerToken = nil
     appFrameDeliveryGate.reset()
@@ -1880,6 +2127,7 @@ final class DATGlassesManager: ObservableObject {
     streamCallbackGate.release(stateText: stateText ?? streamSessionStateText)
     if preserveSDKReferencesForTeardown, let streamSession {
       teardownRetainedStreams.append(streamSession)
+      logLifecycle("stream_retained_for_drain", "reason=\(reason)")
       AppLogger.log(.stream, "Retained DAT Stream reference through SDK teardown reason=\(reason)")
     }
     clearStreamListeners(preserveForSDKTeardown: preserveSDKReferencesForTeardown ? reason : nil)
@@ -1893,18 +2141,113 @@ final class DATGlassesManager: ObservableObject {
     }
     guard hadLocalStreamState else { return }
     let prefix = isUnexpected ? "warning...---- " : ""
-    AppLogger.log(.stream, "\(prefix)Released local DAT Stream reference reason=\(reason), streamState=\(streamSessionStateText), deviceSession=\(deviceSessionStateText)")
+    AppLogger.log(
+      .stream,
+      "\(prefix)Released local DAT Stream reference reason=\(reason), streamState=\(streamSessionStateText), deviceSession=\(deviceSessionStateText), callsite=\(Self.teardownCallsiteSummary())"
+    )
+    if preserveSDKReferencesForTeardown {
+      scheduleTeardownRetainedDATReferenceRelease(reason: "stream-\(reason)")
+    }
+  }
+
+  private func retainDeviceSessionForSDKTeardown(
+    _ session: DeviceSession,
+    reason: String
+  ) {
+    guard !teardownRetainedDeviceSessions.contains(where: { $0 === session }) else {
+      AppLogger.log(
+        .devices,
+        "DAT DeviceSession already retained through SDK callback drain reason=\(reason), deviceId=\(session.deviceId)"
+      )
+      return
+    }
+    teardownRetainedDeviceSessions.append(session)
+    logLifecycle("device_session_retained_for_drain", "reason=\(reason) deviceId=\(session.deviceId) state=\(session.state)")
+    AppLogger.log(
+      .devices,
+      "Retained DAT DeviceSession through SDK callback drain reason=\(reason), deviceId=\(session.deviceId), state=\(session.state)"
+    )
+    scheduleTeardownRetainedDATReferenceRelease(reason: "device-session-\(reason)")
+  }
+
+  nonisolated private static func teardownCallsiteSummary(
+    skip: Int = 2,
+    limit: Int = 5
+  ) -> String {
+    Thread.callStackSymbols
+      .dropFirst(skip)
+      .prefix(limit)
+      .map { symbol in
+        symbol
+          .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+      .joined(separator: " <= ")
   }
 
   private func clearTeardownRetainedDATReferences(reason: String) {
     let listenerCount = teardownRetainedListenerTokens.count
+    let deviceSessionCount = teardownRetainedDeviceSessions.count
     let streamCount = teardownRetainedStreams.count
     let displayCount = teardownRetainedDisplays.count
-    guard listenerCount > 0 || streamCount > 0 || displayCount > 0 else { return }
+    guard listenerCount > 0
+      || deviceSessionCount > 0
+      || streamCount > 0
+      || displayCount > 0
+    else { return }
     teardownRetainedListenerTokens.removeAll()
+    teardownRetainedDeviceSessions.removeAll()
     teardownRetainedStreams.removeAll()
     teardownRetainedDisplays.removeAll()
-    AppLogger.log(.devices, "Cleared retained DAT teardown references reason=\(reason), listenerTokens=\(listenerCount), streams=\(streamCount), displays=\(displayCount)")
+    logLifecycle(
+      "sdk_callbacks_unregistered_after_drain",
+      "reason=\(reason) listenerTokens=\(listenerCount) deviceSessions=\(deviceSessionCount) streams=\(streamCount) displays=\(displayCount)"
+    )
+    AppLogger.log(
+      .devices,
+      "Cleared retained DAT teardown references reason=\(reason), listenerTokens=\(listenerCount), deviceSessions=\(deviceSessionCount), streams=\(streamCount), displays=\(displayCount)"
+    )
+  }
+
+  private func scheduleTeardownRetainedDATReferenceRelease(reason: String) {
+    let listenerCount = teardownRetainedListenerTokens.count
+    let deviceSessionCount = teardownRetainedDeviceSessions.count
+    let streamCount = teardownRetainedStreams.count
+    let displayCount = teardownRetainedDisplays.count
+    guard listenerCount > 0
+      || deviceSessionCount > 0
+      || streamCount > 0
+      || displayCount > 0
+    else { return }
+
+    teardownRetainedReleaseGeneration &+= 1
+    let generation = teardownRetainedReleaseGeneration
+    teardownRetainedReleaseTask?.cancel()
+    logLifecycle(
+      "sdk_callback_drain_scheduled",
+      "reason=\(reason) generation=\(generation) listenerTokens=\(listenerCount) deviceSessions=\(deviceSessionCount) streams=\(streamCount) displays=\(displayCount)"
+    )
+    teardownRetainedReleaseTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: Self.sdkCallbackDrainDelayNanoseconds)
+      guard let self, !Task.isCancelled else { return }
+      guard self.teardownRetainedReleaseGeneration == generation else { return }
+      if self.streamStartInFlight
+        || self.streamStopInFlight
+        || self.deviceSessionResetInFlight
+        || self.displaySendInFlight {
+        self.logLifecycle(
+          "sdk_callback_drain_deferred_busy",
+          "reason=\(reason) startInFlight=\(self.streamStartInFlight) stopInFlight=\(self.streamStopInFlight) resetInFlight=\(self.deviceSessionResetInFlight) displaySendInFlight=\(self.displaySendInFlight)"
+        )
+        self.scheduleTeardownRetainedDATReferenceRelease(reason: "busy-\(reason)")
+        return
+      }
+      self.teardownRetainedReleaseTask = nil
+      if self.displaySDKTeardownInProgress {
+        self.releaseLocalDisplayReference(reason: "drain-\(reason)")
+      }
+      self.clearTeardownRetainedDATReferences(reason: "drain-\(reason)")
+    }
   }
 
   nonisolated private func shouldAcceptStreamCallback(generation: UInt64) -> Bool {
@@ -1925,16 +2268,22 @@ final class DATGlassesManager: ObservableObject {
   nonisolated private static func extractVideoFrame(_ frame: VideoFrame) -> DATFrameExtraction {
     let frameType = String(describing: type(of: frame))
     let pixelBuffer = copyPixelBuffer(from: frame.sampleBuffer)
-    let image = autoreleasepool {
-      frame.makeUIImage()
-    }
-    if pixelBuffer != nil {
+    // Common path: the copied pixel buffer drives both Vision and the preview
+    // (StreamSessionViewModel.renderLiveDATPreview renders the preview straight from
+    // it). Skip the per-frame makeUIImage() decode here — it was a full
+    // decode→CGImage→UIImage render on the SDK delivery thread for every frame, and
+    // the result was discarded whenever the preview was throttled out. Only fall back
+    // to makeUIImage() when there is no usable pixel buffer to render from.
+    if let pixelBuffer {
       return DATFrameExtraction(
         frameType: frameType,
         pixelBuffer: pixelBuffer,
-        image: image,
-        errorText: image == nil ? "makeUIImage returned nil for \(frameType)" : nil
+        image: nil,
+        errorText: nil
       )
+    }
+    let image = autoreleasepool {
+      frame.makeUIImage()
     }
     guard let image else {
       return DATFrameExtraction(
@@ -2135,7 +2484,7 @@ final class DATGlassesManager: ObservableObject {
     let avgLatencyMs = fpsWindowLatencySamples > 0 ? fpsWindowLatencySumMs / Double(fpsWindowLatencySamples) : 0
     AppLogger.log(
       .frames,
-      "DAT app frame health appDeliveredFPS=\(String(format: "%.1f", deliveredFPS)) sdkArrivedFPS=\(String(format: "%.1f", arrivedFPS)) deliveredFrames=\(fpsWindowFrameCount) sdkArrivedFrames=\(gate.arrived) droppedByAppGate=\(gate.dropped) conversionFailures=\(conversionFailures) procLatencyAvgMs=\(String(format: "%.1f", avgLatencyMs)) procLatencyMaxMs=\(String(format: "%.1f", fpsWindowLatencyMaxMs)) windowSeconds=\(String(format: "%.1f", elapsed)) totalReceived=\(totalFramesReceived) note=sdkArrivedFPS is raw SDK delivery; appDeliveredFPS is post-gate app throughput; droppedByAppGate are intentional rate-limit drops not link loss. If sdkArrivedFPS is also low the bottleneck is SDK delivery/glasses link/network, not the app. procLatency is SDK-callback→app-handoff time. dec fps=0 in SDK stats is expected for raw/undecoded frame delivery and is not a fault."
+      "DAT app frame health appDeliveredFPS=\(String(format: "%.1f", deliveredFPS)) sdkArrivedFPS=\(String(format: "%.1f", arrivedFPS)) deliveredFrames=\(fpsWindowFrameCount) sdkArrivedFrames=\(gate.arrived) droppedByAppGate=\(gate.dropped) droppedHandoffBusy=\(gate.droppedHandoffBusy) conversionFailures=\(conversionFailures) procLatencyAvgMs=\(String(format: "%.1f", avgLatencyMs)) procLatencyMaxMs=\(String(format: "%.1f", fpsWindowLatencyMaxMs)) windowSeconds=\(String(format: "%.1f", elapsed)) totalReceived=\(totalFramesReceived) note=sdkArrivedFPS is raw SDK delivery; appDeliveredFPS is post-gate app throughput; droppedByAppGate are intentional stale/rate-limit drops not link loss. If sdkArrivedFPS is also low the bottleneck is SDK delivery/glasses link/network, not the app. procLatency is SDK-callback→app-handoff time. dec fps=0 in SDK stats is expected for raw/undecoded frame delivery and is not a fault."
     )
     fpsWindowStartedAt = now
     fpsWindowFrameCount = 0
@@ -2462,8 +2811,10 @@ final class DATGlassesManager: ObservableObject {
   private func monitorCompatibility(for devices: [DeviceIdentifier]) {
     guard let wearables else { return }
     let current = Set(devices)
-    compatibilityListenerTokens = compatibilityListenerTokens.filter { current.contains($0.key) }
-    linkStateListenerTokens = linkStateListenerTokens.filter { current.contains($0.key) }
+    retainRemovedDeviceListenerTokens(
+      activeDeviceIds: current,
+      reason: "deviceListChanged"
+    )
     for id in devices where compatibilityListenerTokens[id] == nil {
       guard let device = wearables.deviceForIdentifier(id) else {
         AppLogger.log(.devices, "No Device object available for id=\(id)")
@@ -2489,7 +2840,31 @@ final class DATGlassesManager: ObservableObject {
         }
       }
       linkStateListenerTokens[id] = linkToken
+      logLifecycle("device_callback_registered", "deviceId=\(id) callbacks=compatibility,linkState")
     }
+  }
+
+  private func retainRemovedDeviceListenerTokens(
+    activeDeviceIds: Set<DeviceIdentifier>,
+    reason: String
+  ) {
+    let removedCompatibility = compatibilityListenerTokens.filter { !activeDeviceIds.contains($0.key) }
+    let removedLinkState = linkStateListenerTokens.filter { !activeDeviceIds.contains($0.key) }
+    guard !removedCompatibility.isEmpty || !removedLinkState.isEmpty else { return }
+
+    teardownRetainedListenerTokens.append(contentsOf: removedCompatibility.values)
+    teardownRetainedListenerTokens.append(contentsOf: removedLinkState.values)
+    for id in removedCompatibility.keys {
+      compatibilityListenerTokens[id] = nil
+    }
+    for id in removedLinkState.keys {
+      linkStateListenerTokens[id] = nil
+    }
+    logLifecycle(
+      "device_callback_retained_for_drain",
+      "reason=\(reason) compatibility=\(removedCompatibility.count) linkState=\(removedLinkState.count)"
+    )
+    scheduleTeardownRetainedDATReferenceRelease(reason: "device-listener-\(reason)")
   }
 
   private func handleDeviceLinkState(_ linkState: LinkState, deviceId: DeviceIdentifier) {
@@ -2742,16 +3117,19 @@ private final class DATFrameDeliveryGate: @unchecked Sendable {
   private let lock = NSLock()
   private let minimumIntervalNanoseconds: UInt64
   private var lastDeliveryNanoseconds: UInt64 = 0
+  private var deliveryInFlight = false
   // Window counters for diagnostics: every frame the SDK hands us is counted as
   // "arrived"; frames rate-limited out by the gate are counted as "dropped".
   // Comparing arrived-FPS (SDK delivery) to delivered-FPS (app throughput)
   // localizes a slow stream to the link/SDK vs intentional app rate limiting.
   private var windowArrived: Int = 0
   private var windowDropped: Int = 0
+  private var windowDroppedHandoffBusy: Int = 0
 
   struct WindowCounts {
     let arrived: Int
     let dropped: Int
+    let droppedHandoffBusy: Int
   }
 
   init(maxFPS: Double) {
@@ -2762,8 +3140,10 @@ private final class DATFrameDeliveryGate: @unchecked Sendable {
   func reset() {
     lock.lock()
     lastDeliveryNanoseconds = 0
+    deliveryInFlight = false
     windowArrived = 0
     windowDropped = 0
+    windowDroppedHandoffBusy = 0
     lock.unlock()
   }
 
@@ -2772,12 +3152,24 @@ private final class DATFrameDeliveryGate: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     windowArrived += 1
+    if deliveryInFlight {
+      windowDropped += 1
+      windowDroppedHandoffBusy += 1
+      return false
+    }
     if lastDeliveryNanoseconds == 0 || now - lastDeliveryNanoseconds >= minimumIntervalNanoseconds {
       lastDeliveryNanoseconds = now
+      deliveryInFlight = true
       return true
     }
     windowDropped += 1
     return false
+  }
+
+  func completeDelivery() {
+    lock.lock()
+    deliveryInFlight = false
+    lock.unlock()
   }
 
   /// Reads and zeroes the window counters. Called by the FPS logger each window.
@@ -2786,9 +3178,14 @@ private final class DATFrameDeliveryGate: @unchecked Sendable {
     defer {
       windowArrived = 0
       windowDropped = 0
+      windowDroppedHandoffBusy = 0
       lock.unlock()
     }
-    return WindowCounts(arrived: windowArrived, dropped: windowDropped)
+    return WindowCounts(
+      arrived: windowArrived,
+      dropped: windowDropped,
+      droppedHandoffBusy: windowDroppedHandoffBusy
+    )
   }
 }
 

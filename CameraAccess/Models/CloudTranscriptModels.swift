@@ -78,6 +78,35 @@ struct DiarizenResult: Codable, Sendable {
   let segments: [DiarizenSegment]
   let speakerClipKeys: [String: String]  // "0" → S3 key of speaker audio clip
   let processedAt: String
+  let pipelineVersion: String?
+  let diarizationModel: String?
+  let transcriptionModel: String?
+  let transcriptionSource: String?
+  let timings: [String: Double]?
+
+  init(
+    jobId: String,
+    speakerCount: Int,
+    segments: [DiarizenSegment],
+    speakerClipKeys: [String: String],
+    processedAt: String,
+    pipelineVersion: String? = nil,
+    diarizationModel: String? = nil,
+    transcriptionModel: String? = nil,
+    transcriptionSource: String? = nil,
+    timings: [String: Double]? = nil
+  ) {
+    self.jobId = jobId
+    self.speakerCount = speakerCount
+    self.segments = segments
+    self.speakerClipKeys = speakerClipKeys
+    self.processedAt = processedAt
+    self.pipelineVersion = pipelineVersion
+    self.diarizationModel = diarizationModel
+    self.transcriptionModel = transcriptionModel
+    self.transcriptionSource = transcriptionSource
+    self.timings = timings
+  }
 }
 
 // MARK: - Speaker timeline (recorded during the live stream)

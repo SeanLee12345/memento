@@ -137,9 +137,9 @@ actor IdentitySyncQueue {
 
   // MARK: - Configuration
 
-  private let maxAttempts = 8
-  private let baseBackoff: TimeInterval = 2
-  private let maxBackoff: TimeInterval = 60
+  private let maxAttempts: Int
+  private let baseBackoff: TimeInterval
+  private let maxBackoff: TimeInterval
   private let persistURL: URL
   private let remote: (any IdentitySyncRemote)?
 
@@ -153,9 +153,15 @@ actor IdentitySyncQueue {
   init(
     remote: (any IdentitySyncRemote)?,
     fileManager: FileManager = .default,
-    persistenceDirectory: URL? = nil
+    persistenceDirectory: URL? = nil,
+    maxAttempts: Int = 8,
+    baseBackoff: TimeInterval = 2,
+    maxBackoff: TimeInterval = 60
   ) {
     self.remote = remote
+    self.maxAttempts = max(1, maxAttempts)
+    self.baseBackoff = max(0, baseBackoff)
+    self.maxBackoff = max(0, maxBackoff)
     let directory: URL
     if let persistenceDirectory {
       directory = persistenceDirectory
@@ -277,18 +283,32 @@ actor IdentitySyncQueue {
           for: updated.operation,
           error: error
         ) ?? error.localizedDescription
-        // Foreign-key ordering races (Postgres 23503 / "is not present in
-        // table") are NOT failures — the parent row simply hasn't drained yet.
-        // Never burn the dead-letter budget on them; keep the child queued and
-        // retry with backoff until the parent exists remotely. Dependency
-        // ordering means the parent is ahead in the queue and lands first.
+        // Foreign-key ordering races are retried with backoff, but remain
+        // bounded. A missing parent must not spin forever if it can never be
+        // reconstructed locally or is rejected remotely.
         if Self.isRecoverableDependencyFailure(updated.lastError) {
-          updated.attempts = min(updated.attempts, maxAttempts - 1)
+          if updated.attempts >= maxAttempts {
+            updated.lastError = [
+              "Terminal parent dependency unresolved after \(updated.attempts) attempts.",
+              "The child row was not dropped; it is archived in the Supabase sync dead-letter file.",
+              "Re-enqueue the parent and child explicitly after repairing the missing or inaccessible parent row."
+            ].joined(separator: " ")
+            archiveDeadLetter(updated)
+            entries.remove(at: index)
+            persist()
+            AppLogger.log(
+              .database,
+              "[SUPABASE_SYNC] dependency-terminal kind=\(updated.operation.label) entry=\(updated.id.uuidString.prefix(8)) attempts=\(updated.attempts) reason=parent-not-yet-synced action=dead-letter"
+            )
+            continue
+          }
           entries[index] = updated
           sortByDependencies()
           persist()
           let delay = min(maxBackoff, baseBackoff * pow(2, Double(max(0, updated.attempts - 1))))
-          AppLogger.log(.database, "[SUPABASE_SYNC] deferred kind=\(updated.operation.label) entry=\(updated.id.uuidString.prefix(8)) reason=parent-not-yet-synced sleep=\(String(format: "%.1f", delay))s — requeue until parent row exists")
+          if Self.shouldLogRecoverableDependencyDeferral(attempts: updated.attempts, maxAttempts: maxAttempts) {
+            AppLogger.log(.database, "[SUPABASE_SYNC] deferred kind=\(updated.operation.label) entry=\(updated.id.uuidString.prefix(8)) reason=parent-not-yet-synced attempts=\(updated.attempts) sleep=\(String(format: "%.1f", delay))s — requeue until parent row exists")
+          }
           try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
           continue
         }
@@ -457,6 +477,10 @@ actor IdentitySyncQueue {
     return message.contains("\"23503\"")
       || message.contains("foreign key constraint")
       || message.contains("is not present in table")
+  }
+
+  static func shouldLogRecoverableDependencyDeferral(attempts: Int, maxAttempts: Int) -> Bool {
+    attempts <= 1 || attempts >= maxAttempts - 1
   }
 
   private static func isRecoverableDeadLetter(_ message: String?) -> Bool {

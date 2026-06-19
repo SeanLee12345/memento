@@ -659,11 +659,7 @@ enum IdentityConfig {
   #endif
   static let enableFaceQualityFilter = true
   static let enableTranscriptAttachment = true
-  #if DEBUG
-  static let allowLowQualityEmbeddingDebug = true
-  #else
   static let allowLowQualityEmbeddingDebug = false
-  #endif
 
   static let identityProcessingFPS: TimeInterval = 3
   static let qualityConfig = FaceQualityConfig()

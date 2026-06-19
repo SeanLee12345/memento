@@ -3,6 +3,9 @@ import Foundation
 
 @MainActor
 final class SceneLocationProvider: NSObject, CLLocationManagerDelegate {
+  nonisolated private static let collectionDisabledForStreamPerformance = true
+  private static var didLogDisabled = false
+
   private let manager = CLLocationManager()
   private var lastLocation: CLLocation?
   private var isActive = false
@@ -15,6 +18,15 @@ final class SceneLocationProvider: NSObject, CLLocationManagerDelegate {
   }
 
   func start(enabled: Bool) {
+    guard !Self.collectionDisabledForStreamPerformance else {
+      stop()
+      lastLocation = nil
+      if !Self.didLogDisabled {
+        Self.didLogDisabled = true
+        AppLogger.log(.streamPerf, "[LOCATION_PERF] disabled=true reads=0 reason=stream-cpu-battery")
+      }
+      return
+    }
     guard enabled else {
       stop()
       return
@@ -38,6 +50,7 @@ final class SceneLocationProvider: NSObject, CLLocationManagerDelegate {
   }
 
   func currentSnapshot() -> SceneLocationSnapshot? {
+    guard !Self.collectionDisabledForStreamPerformance else { return nil }
     guard let location = lastLocation else { return nil }
     return SceneLocationSnapshot(
       latitude: location.coordinate.latitude,
@@ -52,6 +65,7 @@ final class SceneLocationProvider: NSObject, CLLocationManagerDelegate {
   }
 
   nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+    guard !Self.collectionDisabledForStreamPerformance else { return }
     Task { @MainActor in
       guard self.isActive else { return }
       switch manager.authorizationStatus {
@@ -68,6 +82,7 @@ final class SceneLocationProvider: NSObject, CLLocationManagerDelegate {
   }
 
   nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+    guard !Self.collectionDisabledForStreamPerformance else { return }
     guard let location = locations.last else { return }
     Task { @MainActor in
       self.lastLocation = location
@@ -75,6 +90,7 @@ final class SceneLocationProvider: NSObject, CLLocationManagerDelegate {
   }
 
   nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+    guard !Self.collectionDisabledForStreamPerformance else { return }
     AppLogger.log(.sceneContext, "Location context failed: \(error.localizedDescription)")
   }
 }

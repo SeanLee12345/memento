@@ -35,6 +35,7 @@ enum AppLogCategory: String {
   case rollingIdentity = "ROLLING_IDENTITY"
   case identityRolling = "IDENTITY_ROLLING"
   case transcript = "TRANSCRIPT"
+  case parakeetASR = "PARAKEET_ASR"
   case transcriptAttach = "TRANSCRIPT_ATTACH"
   case transcriptAttachSkip = "TRANSCRIPT_ATTACH_SKIP"
   case enrollment = "ENROLLMENT"
@@ -57,6 +58,7 @@ enum AppLogCategory: String {
   case database = "DATABASE"
   case runSession = "RUN_SESSION"
   case pipelineStats = "PIPELINE_STATS"
+  case streamPerf = "STREAM_PERF"
   case display = "DISPLAY"
   case facePipelineStats = "FACE_PIPELINE_STATS"
   case facePipelineStop = "FACE_PIPELINE_STOP"
@@ -138,12 +140,35 @@ enum AppLogger {
     return formatter
   }()
 
-  static func log(_ category: AppLogCategory, _ message: String) {
-    guard shouldPrint(category, message) else { return }
+  static func log(_ category: AppLogCategory, _ message: @autoclosure () -> String) {
+    // Cheap, message-independent rejection first so suppressed hot-path
+    // categories never pay to build their interpolated string.
+    guard shouldPrintCategory(category) else { return }
+    let resolved = message()
+    guard shouldPrint(category, resolved) else { return }
     timestampLock.lock()
     let timestamp = timestampFormatter.string(from: Date())
     timestampLock.unlock()
-    print("[MetaFace][\(timestamp)][\(category.rawValue)] \(message)")
+    print("[MetaFace][\(timestamp)][\(category.rawValue)] \(resolved)")
+  }
+
+  /// Message-independent gate. Returns false for categories that can never
+  /// print regardless of content, so the caller can skip resolving the
+  /// `@autoclosure` message entirely on hot paths.
+  private static func shouldPrintCategory(_ category: AppLogCategory) -> Bool {
+    if category == .activityMode {
+      return ActivityModeDebugSettings.isLoggingEnabled()
+    }
+    // .sceneContext is listed in suppressedCategories but is special-cased by message
+    // content in shouldPrint(_:_:) (only summary lines print). It must reach that
+    // check, so don't reject it on the cheap category-only gate.
+    if category == .sceneContext {
+      return true
+    }
+    if suppressedCategories.contains(category) {
+      return false
+    }
+    return true
   }
 
   private static func shouldPrint(_ category: AppLogCategory, _ message: String) -> Bool {

@@ -27,6 +27,34 @@ actor SupabaseIdentityStore {
   private let bucketID = "face-crops"
   private let urlSession: URLSession
 
+  private struct UpsertOwnedPersonProfileParams: Encodable {
+    let p_id: UUID
+    let p_display_name: String
+    let p_created_at: Date
+    let p_updated_at: Date
+    let p_notes: String?
+    let p_is_unknown_placeholder: Bool
+    let p_last_seen_at: Date?
+    let p_enrollment_status: String
+    let p_consent_status: String
+    let p_primary_embedding_id: UUID?
+    let p_embedding_count: Int
+
+    init(_ profile: PersonProfile) {
+      p_id = profile.id
+      p_display_name = profile.displayName
+      p_created_at = profile.createdAt
+      p_updated_at = profile.updatedAt
+      p_notes = profile.notes
+      p_is_unknown_placeholder = profile.isUnknownPlaceholder
+      p_last_seen_at = profile.lastSeenAt
+      p_enrollment_status = profile.enrollmentStatus.rawValue
+      p_consent_status = profile.consentStatus.rawValue
+      p_primary_embedding_id = profile.primaryEmbeddingId
+      p_embedding_count = profile.embeddingIds.count
+    }
+  }
+
   init?(client: SupabaseClient? = nil) {
     guard let settings = SupabaseSettings.load() else { return nil }
     do {
@@ -55,11 +83,22 @@ actor SupabaseIdentityStore {
   }
 
   func upsertPersonProfile(_ profile: PersonProfile) async throws {
-    try await client.upsert(
-      table: SupabaseTable.personProfiles,
-      rows: [SupabaseRowPersonProfile(profile)],
-      onConflict: "id"
-    )
+    do {
+      try await client.rpcVoid(
+        "upsert_owned_person_profile",
+        params: UpsertOwnedPersonProfileParams(profile)
+      )
+    } catch {
+      AppLogger.log(
+        .database,
+        "[SUPABASE_SYNC] owned person profile RPC failed; falling back to direct upsert person=\(profile.id.uuidString.prefix(8)) reason=\(error.localizedDescription)"
+      )
+      try await client.upsert(
+        table: SupabaseTable.personProfiles,
+        rows: [SupabaseRowPersonProfile(profile)],
+        onConflict: "id"
+      )
+    }
   }
 
   func upsertConversationSession(_ session: ConversationSession) async throws {

@@ -319,6 +319,16 @@ actor SpeakerIdentityPipeline {
     }
   }
 
+  #if DEBUG
+  func configureWorkerEmbeddingForTesting(_ model: SpeakerEmbeddingModel) async {
+    workerEmbeddingModel = model
+    workerEmbeddingEnabled = true
+    workerEmbeddingDisabledReason = nil
+    lastWorkerEmbeddedAt = nil
+    try? await workerEmbeddingModel.load()
+  }
+  #endif
+
   func disableWorkerEmbedding(reason: String) {
     workerEmbeddingEnabled = false
     workerEmbeddingDisabledReason = reason

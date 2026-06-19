@@ -53,8 +53,9 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
   private var remoteDisabledUntil: Date?
   private var lastRemoteFailureLogAt: Date?
 
-  private let embedTimeoutSeconds: TimeInterval = 12
+  private let embedTimeoutSeconds: TimeInterval = 25
   private let remoteFailureBackoffSeconds: TimeInterval = 60
+  private let remoteEmbedRetryDelays: [TimeInterval] = [5, 10]
 
   init(
     endpoint: String = LocalWorkerSettings.defaultSpeakerEndpoint,
@@ -118,6 +119,40 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
   }
 
   private func embedRemotely(samples: [Float], sampleRate: Double) async throws -> VoiceEmbedding {
+    var lastError: Error?
+    let requestID = UUID().uuidString
+    let attempts = remoteEmbedRetryDelays.count + 1
+    for attempt in 1...attempts {
+      do {
+        return try await embedRemotelyOnce(
+          samples: samples,
+          sampleRate: sampleRate,
+          requestID: requestID,
+          attempt: attempt,
+          maxAttempts: attempts
+        )
+      } catch {
+        lastError = error
+        let message = error.localizedDescription
+        AppLogger.log(
+          .speakerEmbedding,
+          "Remote TitaNet embedding attempt failed requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(attempts) endpoint=\(endpoint) state=speakerEmbeddingTimedOutOrUnavailable error=\(message)"
+        )
+        guard attempt <= remoteEmbedRetryDelays.count else { break }
+        let delay = remoteEmbedRetryDelays[attempt - 1]
+        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      }
+    }
+    throw lastError ?? SpeakerEmbeddingError.remoteEmbeddingFailed("unknown remote embedding failure")
+  }
+
+  private func embedRemotelyOnce(
+    samples: [Float],
+    sampleRate: Double,
+    requestID: String,
+    attempt: Int,
+    maxAttempts: Int
+  ) async throws -> VoiceEmbedding {
     guard let url = URL(string: endpoint)?.appendingPathComponent("speaker").appendingPathComponent("embed") else {
       throw SpeakerEmbeddingError.remoteEmbeddingFailed("invalid endpoint \(endpoint)")
     }
@@ -139,7 +174,22 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
     request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
     request.httpBody = body
 
-    let (data, response) = try await session.data(for: request)
+    let startedAt = Date()
+    AppLogger.log(
+      .speakerEmbedding,
+      "Remote TitaNet embedding request start requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(maxAttempts) endpoint=\(endpoint) audioSeconds=\(String(format: "%.2f", Double(window.count) / sampleRate)) payloadBytes=\(body.count) timeoutSeconds=\(Int(embedTimeoutSeconds))"
+    )
+    let (data, response): (Data, URLResponse)
+    do {
+      (data, response) = try await session.data(for: request)
+    } catch {
+      let elapsedMS = Date().timeIntervalSince(startedAt) * 1_000
+      AppLogger.log(
+        .speakerEmbedding,
+        "Remote TitaNet embedding request failed requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(maxAttempts) endpoint=\(endpoint) elapsedMs=\(String(format: "%.1f", elapsedMS)) audioSeconds=\(String(format: "%.2f", Double(window.count) / sampleRate)) payloadBytes=\(body.count) state=speakerEmbeddingTimedOut error=\(error.localizedDescription)"
+      )
+      throw error
+    }
     guard let http = response as? HTTPURLResponse else {
       throw SpeakerEmbeddingError.remoteEmbeddingFailed("invalid HTTP response")
     }
@@ -161,7 +211,11 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
       throw SpeakerEmbeddingError.invalidEmbeddingValues("remote near-zero norm")
     }
     let normalized = vector.map { $0 / norm }
-    AppLogger.log(.speakerEmbedding, "Remote TitaNet embedding succeeded endpoint=\(endpoint) dim=\(normalized.count)")
+    let elapsedMS = Date().timeIntervalSince(startedAt) * 1_000
+    AppLogger.log(
+      .speakerEmbedding,
+      "Remote TitaNet embedding succeeded requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(maxAttempts) endpoint=\(endpoint) dim=\(normalized.count) elapsedMs=\(String(format: "%.1f", elapsedMS)) audioSeconds=\(String(format: "%.2f", Double(window.count) / sampleRate)) payloadBytes=\(body.count) state=speakerEmbeddingReady"
+    )
     return VoiceEmbedding(
       vector: normalized,
       modelName: modelName,

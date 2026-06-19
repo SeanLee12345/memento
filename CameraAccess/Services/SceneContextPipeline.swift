@@ -1,6 +1,17 @@
 import Foundation
 import UIKit
 
+struct SceneContextPipelineMetrics: Equatable {
+  var framesSampled: UInt64 = 0
+  var imagesEncoded: UInt64 = 0
+  var imageBytes: UInt64 = 0
+  var requestsStarted: UInt64 = 0
+  var requestsSucceeded: UInt64 = 0
+  var requestsFailed: UInt64 = 0
+  var lastRequestLatencyMS: Double = 0
+  var lastEvidenceSource = "neither"
+}
+
 @MainActor
 final class SceneContextPipeline {
   private var frames: [SceneFrameSnapshot] = []
@@ -9,13 +20,14 @@ final class SceneContextPipeline {
   private var lastAnalysisAt: Date?
   private var isSubmitting = false
   private var generation = UUID()
+  private var metrics = SceneContextPipelineMetrics()
   private var onStatus: ((String) -> Void)?
   private var onRecord: ((SceneContextRecord) async -> Void)?
 
-  private let maxFrames = 5
+  private let maxFrames = 1
   private let maxTranscripts = 8
-  private let frameSampleInterval: TimeInterval = 5
-  private let analysisInterval: TimeInterval = 5
+  static let frameSampleInterval: TimeInterval = 10
+  static let analysisInterval: TimeInterval = 10
 
   func start(
     onStatus: @escaping (String) -> Void,
@@ -24,6 +36,12 @@ final class SceneContextPipeline {
     self.onStatus = onStatus
     self.onRecord = onRecord
     generation = UUID()
+    frames.removeAll()
+    transcripts.removeAll()
+    lastFrameSampleAt = nil
+    lastAnalysisAt = nil
+    isSubmitting = false
+    metrics = SceneContextPipelineMetrics()
     let settings = SceneContextSettings.load()
     if SupabaseEdgeFunctionClient.isConfigured() {
       onStatus("Scene context proxy listening: \(settings.model)")
@@ -38,6 +56,8 @@ final class SceneContextPipeline {
     generation = UUID()
     frames.removeAll()
     transcripts.removeAll()
+    lastFrameSampleAt = nil
+    lastAnalysisAt = nil
     isSubmitting = false
     onStatus?("Scene context stopped")
   }
@@ -45,16 +65,34 @@ final class SceneContextPipeline {
   @discardableResult
   func captureFrame(image: UIImage, timestamp: Date) -> Bool {
     guard SceneContextSettings.load().enabled else { return false }
-    if let lastFrameSampleAt, timestamp.timeIntervalSince(lastFrameSampleAt) < frameSampleInterval {
-      return false
-    }
+    guard isFrameCaptureDue(at: timestamp) else { return false }
     guard let data = Self.resizedJPEGData(from: image, maxDimension: 512) else { return false }
+    return captureEncodedFrame(jpegData: data, timestamp: timestamp)
+  }
+
+  func isFrameCaptureDue(at timestamp: Date) -> Bool {
+    guard SceneContextSettings.load().enabled else { return false }
+    guard let lastFrameSampleAt else { return true }
+    return timestamp.timeIntervalSince(lastFrameSampleAt) >= Self.frameSampleInterval
+  }
+
+  @discardableResult
+  func captureEncodedFrame(jpegData: Data, timestamp: Date) -> Bool {
+    guard SceneContextSettings.load().enabled, !jpegData.isEmpty else { return false }
+    guard isFrameCaptureDue(at: timestamp) else { return false }
     lastFrameSampleAt = timestamp
-    frames.append(SceneFrameSnapshot(timestamp: timestamp, jpegData: data))
+    frames.append(SceneFrameSnapshot(timestamp: timestamp, jpegData: jpegData))
     if frames.count > maxFrames {
       frames.removeFirst(frames.count - maxFrames)
     }
+    metrics.framesSampled += 1
+    metrics.imagesEncoded += 1
+    metrics.imageBytes += UInt64(jpegData.count)
     return true
+  }
+
+  func metricsSnapshot() -> SceneContextPipelineMetrics {
+    metrics
   }
 
   func captureTranscript(
@@ -114,7 +152,7 @@ final class SceneContextPipeline {
       return
     }
     let now = Date()
-    if let lastAnalysisAt, now.timeIntervalSince(lastAnalysisAt) < analysisInterval {
+    if let lastAnalysisAt, now.timeIntervalSince(lastAnalysisAt) < Self.analysisInterval {
       return
     }
 
@@ -133,14 +171,27 @@ final class SceneContextPipeline {
       endedAt: endedAt
     )
     let currentGeneration = generation
+    let requestID = UUID().uuidString
+    let requestBytes = requestFrames.reduce(0) { $0 + $1.jpegData.count }
+    let evidenceSource = requestTranscripts.isEmpty ? "vision" : "vision+transcript"
     isSubmitting = true
     lastAnalysisAt = now
+    metrics.requestsStarted += 1
+    metrics.lastEvidenceSource = evidenceSource
     onStatus?("Scene context analyzing...")
+    AppLogger.log(
+      .sceneContext,
+      "[SCENE_CONTEXT_REQUEST] requestId=\(requestID) model=\(settings.model) cadenceSec=\(Int(Self.analysisInterval)) frames=\(requestFrames.count) transcripts=\(requestTranscripts.count) jpegBytes=\(requestBytes) evidence=\(evidenceSource)"
+    )
 
     Task {
+      let requestStartedAt = Date()
       do {
         let analysis = try await SceneContextClient(settings: settings).analyze(request)
         guard currentGeneration == self.generation else { return }
+        let latencyMS = Date().timeIntervalSince(requestStartedAt) * 1_000
+        metrics.requestsSucceeded += 1
+        metrics.lastRequestLatencyMS = latencyMS
         let record = Self.record(
           from: analysis,
           request: request,
@@ -149,10 +200,20 @@ final class SceneContextPipeline {
         )
         await onRecord?(record)
         onStatus?("Scene context saved")
+        AppLogger.log(
+          .sceneContext,
+          "[SCENE_CONTEXT_RESULT] requestId=\(requestID) status=success latencyMs=\(String(format: "%.0f", latencyMS)) evidence=\(evidenceSource) confidence=\(String(format: "%.2f", analysis.confidence)) summary=\"\(Self.truncated(analysis.summary, maxLength: 160))\""
+        )
       } catch {
         guard currentGeneration == self.generation else { return }
+        let latencyMS = Date().timeIntervalSince(requestStartedAt) * 1_000
+        metrics.requestsFailed += 1
+        metrics.lastRequestLatencyMS = latencyMS
         onStatus?("Scene context failed: \(error.localizedDescription)")
-        AppLogger.log(.sceneContext, "analysis failed: \(error.localizedDescription)")
+        AppLogger.log(
+          .sceneContext,
+          "[SCENE_CONTEXT_RESULT] requestId=\(requestID) status=failure latencyMs=\(String(format: "%.0f", latencyMS)) evidence=\(evidenceSource) error=\"\(Self.truncated(error.localizedDescription, maxLength: 180))\""
+        )
       }
       if currentGeneration == self.generation {
         isSubmitting = false
@@ -230,6 +291,12 @@ final class SceneContextPipeline {
       result.append(trimmed)
     }
     return result
+  }
+
+  private static func truncated(_ text: String, maxLength: Int) -> String {
+    let flattened = text.replacingOccurrences(of: "\n", with: " ")
+    guard flattened.count > maxLength else { return flattened }
+    return String(flattened.prefix(maxLength)) + "..."
   }
 
   private static func transcriptIdentityEvidence(from transcripts: [SceneTranscriptSnapshot]) -> SceneContextIdentityEvidence? {

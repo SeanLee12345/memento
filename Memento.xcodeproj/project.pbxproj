@@ -21,7 +21,8 @@
 		C0DE00030000000000000003 /* SceneLocationProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE10030000000000000003 /* SceneLocationProvider.swift */; };
 		C0DE00040000000000000004 /* SceneContextPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE10040000000000000004 /* SceneContextPipeline.swift */; };
 			1E0D5E12F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E0D5E11F53E4C9AA73A0101 /* DeepSeekAssistanceClient.swift */; };
-			24AE205704D10E09A3E708CF /* SpeakerIdentityPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDF22D128E471F692906139D /* SpeakerIdentityPipeline.swift */; };
+		24AE205704D10E09A3E708CF /* SpeakerIdentityPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDF22D128E471F692906139D /* SpeakerIdentityPipeline.swift */; };
+		A30000022FA0000000000002 /* RemoteMemoryRetrievalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A30000012FA0000000000001 /* RemoteMemoryRetrievalService.swift */; };
 			25025AFFA700912F76A7D988 /* FaceCropper.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB727D49817BF890F8C9AEB4 /* FaceCropper.swift */; };
 			4AA90001BEEF000000000001 /* AlibabaLiveTranscriptionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AA90002BEEF000000000002 /* AlibabaLiveTranscriptionService.swift */; };
 			45B41B236D6C01548084449B /* FaceVisionDebugPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CF435A8291677ED9672D195 /* FaceVisionDebugPipeline.swift */; };
@@ -72,7 +73,7 @@
 		F10000112F96000000000011 /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = F30000112F96000000000011 /* MWDATCore */; };
 		F10000122F96000000000012 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = F30000122F96000000000012 /* MWDATCamera */; };
 		F10000142F96000000000014 /* MWDATDisplay in Frameworks */ = {isa = PBXBuildFile; productRef = F30000142F96000000000014 /* MWDATDisplay */; };
-		F10000152F96000000000015 /* DebugBridgeUI in Frameworks */ = {isa = PBXBuildFile; productRef = F30000152F96000000000015 /* DebugBridgeUI */; };
+		FA0000012FA5000000000001 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = FA0000032FA5000000000003 /* FluidAudio */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -173,6 +174,7 @@
 		FD5B1C14C1DAB598479D586D /* PeopleDictionaryView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PeopleDictionaryView.swift; sourceTree = "<group>"; };
 		FDF22D128E471F692906139D /* SpeakerIdentityPipeline.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SpeakerIdentityPipeline.swift; sourceTree = "<group>"; };
 		FF9DE5BEB701F62F4D10CB05 /* LocalIdentityStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalIdentityStore.swift; sourceTree = "<group>"; };
+		A30000012FA0000000000001 /* RemoteMemoryRetrievalService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteMemoryRetrievalService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -205,10 +207,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				FA0000012FA5000000000001 /* FluidAudio in Frameworks */,
 				F10000112F96000000000011 /* MWDATCore in Frameworks */,
 				F10000122F96000000000012 /* MWDATCamera in Frameworks */,
 				F10000142F96000000000014 /* MWDATDisplay in Frameworks */,
-				F10000152F96000000000015 /* DebugBridgeUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -357,6 +359,7 @@
 				A20000052F9B000000000005 /* IdentitySyncQueue.swift */,
 				A20000042F9B000000000004 /* SupabaseIdentityStore.swift */,
 				A20000012F9B000000000001 /* SupabaseClient.swift */,
+				A30000012FA0000000000001 /* RemoteMemoryRetrievalService.swift */,
 				A20000022F9B000000000002 /* SupabaseSession.swift */,
 				A20000032F9B000000000003 /* SupabaseRowEncoders.swift */,
 				06EE842E424DF45A3C475BF3 /* LocalWorkerClient.swift */,
@@ -387,10 +390,10 @@
 			);
 			name = Memento;
 			packageProductDependencies = (
+				FA0000032FA5000000000003 /* FluidAudio */,
 				F30000112F96000000000011 /* MWDATCore */,
 				F30000122F96000000000012 /* MWDATCamera */,
 					F30000142F96000000000014 /* MWDATDisplay */,
-				F30000152F96000000000015 /* DebugBridgeUI */,
 			);
 			productName = Memento;
 			productReference = 3A3A3A3A3A3A3A3A3A3A3A3A /* Memento.app */;
@@ -469,8 +472,8 @@
 			);
 			mainGroup = 5A5A5A5A5A5A5A5A5A5A5A5A;
 			packageReferences = (
+				FA0000022FA5000000000002 /* XCRemoteSwiftPackageReference "FluidAudio" */,
 				F30000102F96000000000010 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */,
-				F30000162F96000000000016 /* XCLocalSwiftPackageReference "DebugBridge" */,
 			);
 			productRefGroup = 7A7A7A7A7A7A7A7A7A7A7A7A /* Products */;
 			projectDirPath = "";
@@ -551,6 +554,7 @@
 				D4B412BB5A2085E74C737204 /* IdentityModels.swift in Sources */,
 				8E5AE7382E172FC908AD04BF /* SpeakerModels.swift in Sources */,
 				A10000012F9B000000000001 /* SupabaseClient.swift in Sources */,
+				A30000022FA0000000000002 /* RemoteMemoryRetrievalService.swift in Sources */,
 				A10000022F9B000000000002 /* SupabaseSession.swift in Sources */,
 				A10000032F9B000000000003 /* SupabaseRowEncoders.swift in Sources */,
 				A10000042F9B000000000004 /* SupabaseIdentityStore.swift in Sources */,
@@ -942,6 +946,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		FA0000022FA5000000000002 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio";
+			requirement = {
+				kind = exactVersion;
+				version = 0.15.3;
+			};
+		};
 		F30000102F96000000000010 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/facebook/meta-wearables-dat-ios";
@@ -952,14 +964,12 @@
 		};
 /* End XCRemoteSwiftPackageReference section */
 
-/* Begin XCLocalSwiftPackageReference section */
-		F30000162F96000000000016 /* XCLocalSwiftPackageReference "DebugBridge" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = DebugBridge;
-		};
-/* End XCLocalSwiftPackageReference section */
-
 /* Begin XCSwiftPackageProductDependency section */
+		FA0000032FA5000000000003 /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = FA0000022FA5000000000002 /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
+		};
 		F30000112F96000000000011 /* MWDATCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = F30000102F96000000000010 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
@@ -974,11 +984,6 @@
 			isa = XCSwiftPackageProductDependency;
 			package = F30000102F96000000000010 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
 			productName = MWDATDisplay;
-		};
-		F30000152F96000000000015 /* DebugBridgeUI */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = F30000162F96000000000016 /* XCLocalSwiftPackageReference "DebugBridge" */;
-			productName = DebugBridgeUI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
