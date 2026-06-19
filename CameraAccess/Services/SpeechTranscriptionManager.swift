@@ -16,8 +16,8 @@ enum AudioSource: String, CaseIterable, Identifiable, Sendable {
 
   var detailText: String {
     switch self {
-    case .glasses: return "Wearer-focused, far speakers suppressed"
-    case .iPhone: return "Omnidirectional, captures conversations, defaults output to iPhone speaker"
+    case .glasses: return "Experimental Bluetooth mic route; avoid during DAT stability tests"
+    case .iPhone: return "Omnidirectional capture; record-only session avoids glasses audio output"
     }
   }
 }
@@ -101,13 +101,12 @@ final class SpeechTranscriptionManager: ObservableObject {
 
   private func startAudioEngine(audioSource: AudioSource) throws {
     let audioSession = AVAudioSession.sharedInstance()
-    try Self.applyPreferredAudioSession(audioSession, includeDefaultToSpeaker: audioSource == .iPhone, audioSource: audioSource)
+    try Self.applyPreferredAudioSession(audioSession, audioSource: audioSource)
     try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
     if audioSource == .iPhone {
-      try? audioSession.overrideOutputAudioPort(.speaker)
       // Explicitly pick the iPhone's built-in mic. Without this, iOS may still
-      // route to the glasses if they were the last-used input even though we
-      // omitted .allowBluetoothHFP.
+      // use another available input. The record-only category below has no output
+      // route, so it cannot route spoken results to the glasses during DAT video.
       if let builtIn = audioSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
         try audioSession.setPreferredInput(builtIn)
       } else {
@@ -118,11 +117,14 @@ final class SpeechTranscriptionManager: ObservableObject {
 
     let inputNode = audioEngine.inputNode
     gainRide.reset()
-    // 4096-frame tap (~256 ms at 16 kHz) is more tolerant of brief BT SCO stalls
-    // than the original 1024-frame (~64 ms) tap. Larger taps trade a tiny bit of
-    // latency for fewer underruns during HFP packet loss.
+    // 8192-frame tap (~170 ms at 48 kHz built-in mic) is more tolerant of brief BT
+    // SCO stalls than the original 1024-frame (~64 ms) tap, and ~halves the callback
+    // rate vs the previous 4096 — each callback spawns a Task + main-actor hop for
+    // speaker bookkeeping, so fewer callbacks means less Thread-1 churn. The
+    // transcriber re-chunks internally, so ASR latency only grows by ~one tap of
+    // granularity. Bump to 16384 if even fewer callbacks are wanted (more latency).
     let rideRef = gainRide
-    inputNode.installTap(onBus: 0, bufferSize: 4_096, format: nil) { [weak self] buffer, _ in
+    inputNode.installTap(onBus: 0, bufferSize: 8_192, format: nil) { [weak self] buffer, _ in
       if let copiedBuffer = SpeechTranscriptionManager.copyPCMBuffer(buffer) {
         rideRef.processInPlace(copiedBuffer)
         self?.onAudioBuffer?(copiedBuffer)
@@ -142,13 +144,21 @@ final class SpeechTranscriptionManager: ObservableObject {
           userInfo: [NSLocalizedDescriptionKey: "iPhone audio requested but active input route is [\(routeDesc)]"]
         )
       }
+      let outputRouteDesc = audioSession.currentRoute.outputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
+      if Self.routeDescriptionContainsGlassesOutput(outputRouteDesc) {
+        throw NSError(
+          domain: "SpeechTranscriptionManager",
+          code: 2,
+          userInfo: [NSLocalizedDescriptionKey: "iPhone audio requested but output route is glasses [\(outputRouteDesc)]"]
+        )
+      }
     }
     isRunning = true
     let liveFormat = inputNode.outputFormat(forBus: 0)
     microphoneStatusText = "Microphone live"
     let inputRouteDesc = audioSession.currentRoute.inputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
     let outputRouteDesc = audioSession.currentRoute.outputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
-    AppLogger.log(.audio, "Live audio capture started sampleRate=\(liveFormat.sampleRate), channels=\(liveFormat.channelCount), inputRoute=[\(inputRouteDesc)], outputRoute=[\(outputRouteDesc)], preferredSR=\(audioSession.preferredSampleRate), ioBuffer=\(String(format: "%.3f", audioSession.ioBufferDuration))s, tapBufferFrames=4096")
+    AppLogger.log(.audio, "Live audio capture started sampleRate=\(liveFormat.sampleRate), channels=\(liveFormat.channelCount), inputRoute=[\(inputRouteDesc)], outputRoute=[\(outputRouteDesc)], preferredSR=\(audioSession.preferredSampleRate), ioBuffer=\(String(format: "%.3f", Double(audioSession.ioBufferDuration)))s, tapBufferFrames=8192")
   }
 
   private func subscribeToAudioSessionEvents(_ session: AVAudioSession) {
@@ -159,8 +169,10 @@ final class SpeechTranscriptionManager: ObservableObject {
         let reasonRaw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
         let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw)
         let previousRoute = note.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
-        let prevDesc = previousRoute?.inputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",") ?? "none"
-        let nowDesc = session.currentRoute.inputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
+        let prevInputDesc = previousRoute?.inputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",") ?? "none"
+        let prevOutputDesc = previousRoute?.outputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",") ?? "none"
+        let nowInputDesc = session.currentRoute.inputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
+        let nowOutputDesc = session.currentRoute.outputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
         let reasonText: String
         switch reason {
         case .newDeviceAvailable: reasonText = "newDeviceAvailable"
@@ -172,9 +184,11 @@ final class SpeechTranscriptionManager: ObservableObject {
         case .routeConfigurationChange: reasonText = "routeConfigurationChange"
         default: reasonText = "unknown(\(reasonRaw))"
         }
-        let droppedBT = prevDesc.lowercased().contains("bluetoothhfp") && !nowDesc.lowercased().contains("bluetoothhfp")
+        let droppedBT = prevInputDesc.lowercased().contains("bluetoothhfp") && !nowInputDesc.lowercased().contains("bluetoothhfp")
+        let glassesOutput = Self.routeDescriptionContainsGlassesOutput(nowOutputDesc)
         let warning = droppedBT ? " ⚠ DROPPED BT MIC — falling back to a different input" : ""
-        AppLogger.log(.audio, "[AudioRoute] change reason=\(reasonText) prev=[\(prevDesc)] now=[\(nowDesc)]\(warning)")
+        let outputWarning = glassesOutput ? " glassesOutput=true" : ""
+        AppLogger.log(.audio, "[AudioRoute] change reason=\(reasonText) prevInput=[\(prevInputDesc)] prevOutput=[\(prevOutputDesc)] nowInput=[\(nowInputDesc)] nowOutput=[\(nowOutputDesc)]\(outputWarning)\(warning)")
         _ = self  // silence unused warning; observer keeps the manager alive
       }
     interruptionObserver = NotificationCenter.default
@@ -192,33 +206,35 @@ final class SpeechTranscriptionManager: ObservableObject {
       }
   }
 
-  // Configures the shared audio session for live capture only after DAT video
-  // streaming has delivered its first frame.
-  //
-  // .allowBluetoothHFP (modern option) enables mSBC wideband (16 kHz) negotiation
-  // on supporting accessories. Ray-Ban Gen 2 supports mSBC. .allowBluetooth (the
-  // legacy flag we previously used) would settle for CVSD narrowband (8 kHz).
-  //
-  // `includeDefaultToSpeaker` is omitted during live capture: with HFP duplex,
-  // forcing output to the phone speaker can destabilize the SCO link on some iOS
-  // versions and cause mid-stream drops.
-  private static func applyPreferredAudioSession(_ session: AVAudioSession, includeDefaultToSpeaker: Bool, audioSource: AudioSource) throws {
+  // Configures the shared audio session for live capture before DAT video streaming
+  // starts. Production live identity capture uses the iPhone mic with a record-only
+  // category so iOS does not route output to the Meta/Ray-Ban glasses.
+  private static func applyPreferredAudioSession(_ session: AVAudioSession, audioSource: AudioSource) throws {
+    if audioSource == .iPhone {
+      try session.setCategory(.record, mode: .measurement, options: [])
+      try? session.setPreferredSampleRate(48_000)
+      try? session.setPreferredInputNumberOfChannels(1)
+      try? session.setPreferredIOBufferDuration(0.020)
+      return
+    }
+
     var options: AVAudioSession.CategoryOptions = []
-    // Only allow HFP routing when the user has picked the glasses as source.
-    // For .iPhone, omitting this flag prevents iOS from picking the BT mic even
-    // when the glasses are paired (they remain paired for DAT video over BLE).
-    if audioSource == .glasses { options.insert(.allowBluetoothHFP) }
-    if includeDefaultToSpeaker { options.insert(.defaultToSpeaker) }
-    // .videoRecording gives the least-processed input mode iOS exposes for the
-    // built-in mic, which matters when the user picks .iPhone for conversations.
-    // For .glasses, the glasses' firmware DSP dominates anyway so mode mostly
-    // affects iOS-side processing — .default keeps AGC on for HFP.
-    let mode: AVAudioSession.Mode = audioSource == .iPhone ? .videoRecording : .default
-    try session.setCategory(.playAndRecord, mode: mode, options: options)
-    let preferredSR: Double = audioSource == .iPhone ? 48_000 : 16_000
-    try? session.setPreferredSampleRate(preferredSR)
+    // This route is retained only for explicit Bluetooth mic testing. It may
+    // destabilize DAT camera streaming and should not be the production default.
+    options.insert(.allowBluetoothHFP)
+    try session.setCategory(.playAndRecord, mode: .default, options: options)
+    try? session.setPreferredSampleRate(16_000)
     try? session.setPreferredInputNumberOfChannels(1)
     try? session.setPreferredIOBufferDuration(0.020)
+  }
+
+  private static func routeDescriptionContainsGlassesOutput(_ route: String) -> Bool {
+    let lower = route.lowercased()
+    return lower.contains("rb meta")
+      || lower.contains("ray-ban")
+      || lower.contains("rayban")
+      || lower.contains("bluetootha2dpoutput")
+      || lower.contains("bluetoothhfp")
   }
 
   // Single-threaded gain ride run from the audio tap. The tap fires from a
@@ -315,7 +331,7 @@ final class SpeechTranscriptionManager: ObservableObject {
         let aggPostRMS = min(1.0, sqrt(windowPostRMSSumSq / Double(windowFrameCount)))
         let preDBFS = aggPreRMS > 0 ? 20.0 * log10(aggPreRMS) : -120.0
         let postDBFS = aggPostRMS > 0 ? 20.0 * log10(aggPostRMS) : -120.0
-        AppLogger.log(.audio, "[AudioLevel] t=\(String(format: "%.1f", elapsed))s preRMS=\(String(format: "%.5f", aggPreRMS)) (\(String(format: "%.1f", preDBFS))dBFS) prePeak=\(String(format: "%.5f", windowPrePeak)) gain=\(String(format: "%.2f", gain))x postRMS=\(String(format: "%.5f", aggPostRMS)) (\(String(format: "%.1f", postDBFS))dBFS) postPeak=\(String(format: "%.5f", windowPostPeak)) smoothedRMS=\(String(format: "%.5f", smoothedRMS))")
+        AppLogger.log(.audio, "[AudioLevel] t=\(String(format: "%.1f", Double(elapsed)))s preRMS=\(String(format: "%.5f", Double(aggPreRMS))) (\(String(format: "%.1f", Double(preDBFS)))dBFS) prePeak=\(String(format: "%.5f", Double(windowPrePeak))) gain=\(String(format: "%.2f", Double(gain)))x postRMS=\(String(format: "%.5f", Double(aggPostRMS))) (\(String(format: "%.1f", Double(postDBFS)))dBFS) postPeak=\(String(format: "%.5f", Double(windowPostPeak))) smoothedRMS=\(String(format: "%.5f", Double(smoothedRMS)))")
         lastDiagWindowStart = now
         windowPreRMSSumSq = 0
         windowPrePeak = 0

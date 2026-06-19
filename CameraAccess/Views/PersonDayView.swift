@@ -46,6 +46,8 @@ struct PersonDayView: View {
         statItem(value: "\(day.totalFaceDetections)", label: "Face detections")
         Divider().frame(height: 32)
         statItem(value: "\(day.totalTranscripts)", label: "Transcripts")
+        Divider().frame(height: 32)
+        statItem(value: "\(day.totalGlassesInteractions)", label: "Glasses")
       }
       .padding(.vertical, 6)
     }
@@ -55,7 +57,7 @@ struct PersonDayView: View {
 
   private func hourSection(_ hour: PersonInteractionHour) -> some View {
     Section {
-      if hour.transcripts.isEmpty {
+      if hour.transcripts.isEmpty && hour.glassesInteractions.isEmpty {
         HStack {
           Image(systemName: "person.fill.viewfinder")
             .foregroundColor(.secondary)
@@ -79,6 +81,9 @@ struct PersonDayView: View {
         ForEach(hour.transcripts) { chunk in
           transcriptRow(chunk)
         }
+        ForEach(hour.glassesInteractions) { event in
+          glassesInteractionRow(event)
+        }
       }
     } header: {
       hourHeader(hour)
@@ -92,8 +97,8 @@ struct PersonDayView: View {
       Text(Self.hourFormatter.string(from: hour.hour))
         .font(.system(size: 13, weight: .semibold))
       Spacer()
-      if hour.faceDetectionCount > 0 || !hour.transcripts.isEmpty {
-        Text("\(hour.faceDetectionCount) detected · \(hour.transcripts.count) transcript\(hour.transcripts.count == 1 ? "" : "s")")
+      if hour.faceDetectionCount > 0 || !hour.transcripts.isEmpty || !hour.glassesInteractions.isEmpty {
+        Text("\(hour.faceDetectionCount) detected · \(hour.transcripts.count) transcript\(hour.transcripts.count == 1 ? "" : "s") · \(hour.glassesInteractions.count) glasses")
           .font(.caption2)
           .foregroundColor(.secondary)
       }
@@ -107,6 +112,22 @@ struct PersonDayView: View {
         .foregroundColor(.primary)
         .fixedSize(horizontal: false, vertical: true)
       Text(Self.timeFormatter.string(from: chunk.createdAt))
+        .font(.caption2)
+        .foregroundColor(.secondary)
+    }
+    .padding(.vertical, 4)
+  }
+
+  private func glassesInteractionRow(_ event: GlassesDisplayInteractionEvent) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Label(event.actionLabel, systemImage: event.actionKind == .displayed ? "rectangle.on.rectangle" : "hand.tap")
+        .font(.system(size: 13, weight: .semibold))
+        .foregroundColor(event.actionKind == .displayed ? .secondary : .blue)
+      Text(event.displaySummary)
+        .font(.system(size: 13))
+        .foregroundColor(.secondary)
+        .lineLimit(3)
+      Text(Self.timeFormatter.string(from: event.createdAt))
         .font(.caption2)
         .foregroundColor(.secondary)
     }

@@ -115,6 +115,12 @@ enum InputMode: String, CaseIterable, Equatable {
   case realGlasses = "REAL GLASSES"
 }
 
+enum PhoneVideoFootagePolicy {
+  static func hidesFootage(inputMode: InputMode, lifecycleState: StreamLifecycleState) -> Bool {
+    inputMode == .realGlasses && lifecycleState.isStreamingSurfaceVisible
+  }
+}
+
 enum DATConfigurationMode: String, Equatable {
   case developerMode = "developerMode"
   case production = "production"

@@ -70,6 +70,39 @@ actor VisionFaceFrameProcessor {
     )
   }
 
+  func process(
+    pixelBuffer: CVPixelBuffer,
+    sequence: UInt64,
+    timestamp: CMTime? = nil,
+    forceTestFaceOverlay: Bool = false,
+    context: PipelineContext? = nil
+  ) async -> ProcessedVideoFrame? {
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    guard width > 0, height > 0 else {
+      AppLogger.log(.frames, "Dropped frame #\(sequence): invalid CVPixelBuffer size \(width)x\(height)")
+      return nil
+    }
+
+    guard let cgImage = makeDisplayCGImage(from: pixelBuffer) else {
+      AppLogger.log(.frames, "Dropped frame #\(sequence): CoreImage could not create a display CGImage")
+      return nil
+    }
+    AppLogger.log(.visionInput, "\(context.logPrefix) frame=\(sequence) input=CVPixelBuffer width=\(width) height=\(height) orientation=up mirrored=false")
+    let image = UIImage(cgImage: cgImage)
+
+    return await process(
+      image: image,
+      cgImage: cgImage,
+      pixelBuffer: pixelBuffer,
+      sequence: sequence,
+      timestamp: timestamp,
+      inputType: "CVPixelBuffer",
+      forceTestFaceOverlay: forceTestFaceOverlay,
+      context: context
+    )
+  }
+
   private func process(
     sampleBuffer: CMSampleBuffer,
     sequence: UInt64,
@@ -120,7 +153,7 @@ actor VisionFaceFrameProcessor {
       AppLogger.log(.frames, "Dropped frame #\(sequence): UIImage.cgImage returned nil")
       return nil
     }
-    AppLogger.log(.visionInput, "\(context.logPrefix) frame=\(sequence) input=UIImage fallback=true reason=pixelBufferUnavailable width=\(cgImage.width) height=\(cgImage.height) orientation=\(Self.cgImagePropertyOrientation(for: image.imageOrientation).debugName)")
+    AppLogger.log(.visionInput, "\(context.logPrefix) WARNING frame=\(sequence) input=UIImage fallback=true reason=pixelBufferUnavailable width=\(cgImage.width) height=\(cgImage.height) orientation=\(Self.cgImagePropertyOrientation(for: image.imageOrientation).debugName) action=investigateLiveDATFrameAPI")
 
     return await process(
       image: image,

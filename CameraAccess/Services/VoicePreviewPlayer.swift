@@ -93,14 +93,30 @@ final class VoicePreviewPlayer {
   }
 
   private func configureAudioSessionForPreview(_ session: AVAudioSession) throws {
-    do {
-      AppLogger.log(.audio, "VoicePreviewPlayer configuring audio session category=playAndRecord mode=spokenAudio options=allowBluetoothHFP,defaultToSpeaker")
-      try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.allowBluetoothHFP, .defaultToSpeaker])
-      try session.setActive(true)
-    } catch {
-      AppLogger.log(.audio, "VoicePreviewPlayer playAndRecord audio session failed: \(error.localizedDescription); retrying playback without defaultToSpeaker")
-      try session.setCategory(.playback, mode: .spokenAudio, options: [])
-      try session.setActive(true)
+    AppLogger.log(.audio, "VoicePreviewPlayer configuring audio session category=playAndRecord mode=spokenAudio options=defaultToSpeaker")
+    try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker])
+    if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+      try? session.setPreferredInput(builtIn)
     }
+    try session.overrideOutputAudioPort(.speaker)
+    try session.setActive(true)
+
+    let outputRouteDesc = session.currentRoute.outputs.map { "\($0.portName)/\($0.portType.rawValue)" }.joined(separator: ",")
+    if Self.routeDescriptionContainsGlassesOutput(outputRouteDesc) {
+      throw NSError(
+        domain: "VoicePreviewPlayer",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Voice preview refused glasses output route [\(outputRouteDesc)]"]
+      )
+    }
+  }
+
+  private static func routeDescriptionContainsGlassesOutput(_ route: String) -> Bool {
+    let lower = route.lowercased()
+    return lower.contains("rb meta")
+      || lower.contains("ray-ban")
+      || lower.contains("rayban")
+      || lower.contains("bluetootha2dpoutput")
+      || lower.contains("bluetoothhfp")
   }
 }

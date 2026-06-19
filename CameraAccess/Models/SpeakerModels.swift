@@ -7,14 +7,48 @@ struct VoiceEmbedding: Codable, Equatable {
   let modelName: String
   let modelVersion: String
   let preprocessingVersion: String
+  let embeddingRuntime: String
 
-  init(vector: [Float], modelName: String, modelVersion: String, preprocessingVersion: String) {
+  init(
+    vector: [Float],
+    modelName: String,
+    modelVersion: String,
+    preprocessingVersion: String,
+    embeddingRuntime: String = SpeakerEmbeddingRuntime.localCoreML
+  ) {
     self.vector = vector
     self.dimension = vector.count
     self.modelName = modelName
     self.modelVersion = modelVersion
     self.preprocessingVersion = preprocessingVersion
+    self.embeddingRuntime = embeddingRuntime
   }
+
+  private enum CodingKeys: String, CodingKey {
+    case vector
+    case dimension
+    case modelName
+    case modelVersion
+    case preprocessingVersion
+    case embeddingRuntime
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    vector = try container.decode([Float].self, forKey: .vector)
+    dimension = try container.decodeIfPresent(Int.self, forKey: .dimension) ?? vector.count
+    modelName = try container.decode(String.self, forKey: .modelName)
+    modelVersion = try container.decode(String.self, forKey: .modelVersion)
+    preprocessingVersion = try container.decode(String.self, forKey: .preprocessingVersion)
+    embeddingRuntime = try container.decodeIfPresent(String.self, forKey: .embeddingRuntime)
+      ?? SpeakerEmbeddingRuntime.localCoreML
+  }
+}
+
+enum SpeakerEmbeddingRuntime {
+  static let localCoreML = "coreml-titanet"
+  static let awsTitaNet = "aws-titanet"
+  static let missing = "none"
 }
 
 struct SpeakerEmbeddingRecord: Codable {
@@ -25,6 +59,7 @@ struct SpeakerEmbeddingRecord: Codable {
   var modelName: String
   var modelVersion: String
   var preprocessingVersion: String
+  var embeddingRuntime: String?
   var recordedAt: Date
 
   init(embedding: VoiceEmbedding, personId: UUID? = nil) {
@@ -35,6 +70,7 @@ struct SpeakerEmbeddingRecord: Codable {
     modelName = embedding.modelName
     modelVersion = embedding.modelVersion
     preprocessingVersion = embedding.preprocessingVersion
+    embeddingRuntime = embedding.embeddingRuntime
     recordedAt = Date()
   }
 }
@@ -49,6 +85,7 @@ struct SpeakerAveragedEmbedding: Codable {
   var modelName: String
   var modelVersion: String
   var preprocessingVersion: String
+  var embeddingRuntime: String?
   var updatedAt: Date
 }
 
@@ -69,6 +106,21 @@ struct SpeakerSimilarityDiagnostic {
   let matchResult: SpeakerMatchResult?
   let error: String?
   let embedding: VoiceEmbedding?
+  let latencyMS: Double?
+
+  init(
+    label: String,
+    matchResult: SpeakerMatchResult?,
+    error: String?,
+    embedding: VoiceEmbedding?,
+    latencyMS: Double? = nil
+  ) {
+    self.label = label
+    self.matchResult = matchResult
+    self.error = error
+    self.embedding = embedding
+    self.latencyMS = latencyMS
+  }
 
   var bestSimilarity: Float? {
     guard let matchResult, matchResult.reason != "noEnrollment", matchResult.reason != "noCompatibleEnrollment" else {
@@ -79,7 +131,7 @@ struct SpeakerSimilarityDiagnostic {
 
   var statusText: String {
     if let bestSimilarity {
-      return "\(label): \(String(format: "%.3f", bestSimilarity))"
+      return "\(label): \(String(format: "%.3f", Double(bestSimilarity)))"
     }
     if let reason = matchResult?.reason {
       switch reason {
@@ -133,9 +185,9 @@ struct CapturedVoiceClipSnapshot: Identifiable, Equatable {
   var summaryText: String {
     let dimText = embeddingDimension.map { "dim \($0)" } ?? "no embedding"
     let mergeText = mergedSegmentCount > 1 ? ", \(mergedSegmentCount) merged clips" : ""
-    let similarityText = bestSimilarity.map { String(format: ", best %.2f", $0) } ?? ""
+    let similarityText = bestSimilarity.map { String(format: ", best %.2f", Double($0)) } ?? ""
     let labelText = speakerLabel.map { "\($0), " } ?? ""
-    return String(format: "%@%.1f s, %@%@%@", labelText, durationSeconds, dimText, mergeText, similarityText)
+    return String(format: "%@%.1f s, %@%@%@", labelText, Double(durationSeconds), dimText, mergeText, similarityText)
   }
 }
 
@@ -144,13 +196,20 @@ struct SpeakerEnrollmentSaveResult: Equatable {
   let message: String
   let personId: UUID?
   let removedDuplicateClipCount: Int
+  // True when a usable voice embedding could not be created yet (e.g. the AWS
+  // speaker worker was unavailable) but the clip was persisted and the
+  // enrollment is queued to finish automatically once the service is reachable.
+  // `pending` is mutually exclusive with `saved`: a pending enrollment is NOT
+  // complete and must not be treated as a usable speaker profile.
+  let pending: Bool
 
   static func success(personId: UUID, name: String, removedDuplicateClipCount: Int) -> SpeakerEnrollmentSaveResult {
     SpeakerEnrollmentSaveResult(
       saved: true,
       message: "Saved voice: \(name)",
       personId: personId,
-      removedDuplicateClipCount: removedDuplicateClipCount
+      removedDuplicateClipCount: removedDuplicateClipCount,
+      pending: false
     )
   }
 
@@ -159,7 +218,18 @@ struct SpeakerEnrollmentSaveResult: Equatable {
       saved: false,
       message: message,
       personId: personId,
-      removedDuplicateClipCount: 0
+      removedDuplicateClipCount: 0,
+      pending: false
+    )
+  }
+
+  static func pendingEmbedding(_ message: String, personId: UUID) -> SpeakerEnrollmentSaveResult {
+    SpeakerEnrollmentSaveResult(
+      saved: false,
+      message: message,
+      personId: personId,
+      removedDuplicateClipCount: 0,
+      pending: true
     )
   }
 }
@@ -211,18 +281,18 @@ struct WearerVoiceProfileSnapshot: Equatable {
     if isRecording {
       return String(
         format: "Recording %.1f s / %.0f s total, prompts %d/%d",
-        recordingSeconds,
-        SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds,
+        Double(recordingSeconds),
+        Double(SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds),
         completedPromptCount,
         SpeakerIdentityConfig.wearerVoiceMinCompletedPrompts
       )
     }
     guard isEnrolled else {
       return String(format: "Not enrolled. Record %.0f-%.0f s total while streaming.",
-                    SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds,
-                    SpeakerIdentityConfig.wearerVoiceMaxEnrollmentSeconds)
+                    Double(SpeakerIdentityConfig.wearerVoiceMinEnrollmentSeconds),
+                    Double(SpeakerIdentityConfig.wearerVoiceMaxEnrollmentSeconds))
     }
-    let consistency = consistencyScore.map { String(format: ", consistency %.2f", $0) } ?? ""
+    let consistency = consistencyScore.map { String(format: ", consistency %.2f", Double($0)) } ?? ""
     let dimText = embeddingDimension.map { ", dim \($0)" } ?? ""
     return "Enrolled with \(sampleCount) voice windows, \(centroidCount) centroids\(consistency)\(dimText)"
   }
@@ -238,7 +308,7 @@ struct WearerVoiceEnrollmentResult: Equatable {
   static func success(acceptedWindowCount: Int, rejectedWindowCount: Int, consistencyScore: Float) -> WearerVoiceEnrollmentResult {
     WearerVoiceEnrollmentResult(
       saved: true,
-      message: String(format: "Saved my voice: %d windows, consistency %.2f", acceptedWindowCount, consistencyScore),
+      message: String(format: "Saved my voice: %d windows, consistency %.2f", acceptedWindowCount, Double(consistencyScore)),
       acceptedWindowCount: acceptedWindowCount,
       rejectedWindowCount: rejectedWindowCount,
       consistencyScore: consistencyScore
@@ -335,8 +405,13 @@ enum SpeakerIdentityConfig {
   static let maxSpeechBufferSeconds: Double = 5.0
   // Silence window that flushes an in-progress utterance.
   static let silenceFlushSeconds: Double = 0.8
-  // Rate-limit: minimum gap between successive embedding runs.
-  static let embeddingIntervalSeconds: TimeInterval = 0.5
+  // Rate-limit: minimum gap between successive live embedding runs. Keep this
+  // conservative during DAT camera streaming; the iPhone already records the full
+  // session for post-session diarization/enrollment.
+  static let embeddingIntervalSeconds: TimeInterval = 2.0
+  // Cloud/AWS speaker embeddings are higher-latency than local TitaNet, but the
+  // live worker should still participate frequently while the toggle is on.
+  static let cloudEmbeddingMinIntervalSeconds: TimeInterval = 2.0
   // All models and feature extraction operate at this sample rate.
   static let targetSampleRate: Double = 16_000
   // Samples in the 3-second embedding window fed to the model.

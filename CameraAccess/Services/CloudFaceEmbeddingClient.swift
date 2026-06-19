@@ -15,12 +15,35 @@ struct CloudFaceEmbeddingSettings {
   var endpoint: String
   var apiKey: String
 
+  var hasUsableEndpoint: Bool {
+    let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed != Self.defaultEndpoint, !trimmed.contains("YOUR_") else {
+      return false
+    }
+    guard let url = URL(string: trimmed), url.scheme != nil, url.host != nil else {
+      return false
+    }
+    return true
+  }
+
   static func load() -> CloudFaceEmbeddingSettings {
     let defaults = UserDefaults.standard
+    let env = DotEnvFile.load()
+      .merging(ProcessInfo.processInfo.environment) { _, new in new }
+    let environmentEndpoint = env["CLOUD_FACE_EMBEDDING_ENDPOINT"]
+      ?? env["FACE_WORKER_ENDPOINT"]
+      ?? env["FACE_EMBEDDING_ENDPOINT"]
+      ?? ""
+    let environmentKey = env["CLOUD_FACE_EMBEDDING_API_KEY"]
+      ?? env["FACE_WORKER_API_KEY"]
+      ?? env["FACE_EMBEDDING_API_KEY"]
+      ?? ""
+    let savedEndpoint = defaults.string(forKey: Keys.endpoint) ?? defaultEndpoint
+    let savedKey = defaults.string(forKey: Keys.apiKey) ?? ""
     return CloudFaceEmbeddingSettings(
       enabled: defaults.bool(forKey: Keys.enabled),
-      endpoint: defaults.string(forKey: Keys.endpoint) ?? defaultEndpoint,
-      apiKey: defaults.string(forKey: Keys.apiKey) ?? ""
+      endpoint: environmentEndpoint.isEmpty ? savedEndpoint : environmentEndpoint,
+      apiKey: environmentKey.isEmpty ? savedKey : environmentKey
     )
   }
 
@@ -168,10 +191,12 @@ struct CloudFaceEmbeddingClient {
 }
 
 actor CloudFaceEmbeddingModel: FaceEmbeddingModel {
-  let embeddingDimension = 512
-  let inputImageSize = CGSize(width: 112, height: 112)
-  let modelName = "AdaFace"
-  let modelVersion = "cvlface_adaface_ir101_webface12m"
+  static let defaultInputImageSize = CGSize(width: 112, height: 112)
+
+  nonisolated let embeddingDimension = 512
+  nonisolated let inputImageSize = defaultInputImageSize
+  nonisolated let modelName = "AdaFace"
+  nonisolated let modelVersion = "cvlface_adaface_ir101_webface12m"
   private let settings: CloudFaceEmbeddingSettings
 
   init(settings: CloudFaceEmbeddingSettings) {
@@ -182,6 +207,7 @@ actor CloudFaceEmbeddingModel: FaceEmbeddingModel {
     guard settings.enabled else {
       throw CloudFaceEmbeddingError.disabled
     }
+    IdentityConfig.activeEmbeddingModelInputSize = inputImageSize
     _ = try CloudFaceEmbeddingClient(endpoint: settings.endpoint, apiKey: settings.apiKey)
   }
 
@@ -189,38 +215,8 @@ actor CloudFaceEmbeddingModel: FaceEmbeddingModel {
     guard settings.enabled else {
       throw CloudFaceEmbeddingError.disabled
     }
+    IdentityConfig.activeEmbeddingModelInputSize = inputImageSize
     let client = try CloudFaceEmbeddingClient(endpoint: settings.endpoint, apiKey: settings.apiKey)
     return try await client.embed(faceImage: faceImage)
-  }
-}
-
-actor CloudFallbackFaceEmbeddingModel: FaceEmbeddingModel {
-  private let cloud: CloudFaceEmbeddingModel
-  private let local: FaceEmbeddingModel
-
-  let embeddingDimension: Int
-  let inputImageSize: CGSize
-  let modelName = "CloudAdaFaceWithLocalFallback"
-  let modelVersion = "cloud-adaface-ir101-local-mobilefacenet-v1"
-
-  init(settings: CloudFaceEmbeddingSettings, local: FaceEmbeddingModel) {
-    cloud = CloudFaceEmbeddingModel(settings: settings)
-    self.local = local
-    embeddingDimension = cloud.embeddingDimension
-    inputImageSize = cloud.inputImageSize
-  }
-
-  func load() async throws {
-    try? await cloud.load()
-    try? await local.load()
-  }
-
-  func embed(faceImage: CGImage) async throws -> FaceEmbeddingVector {
-    do {
-      return try await cloud.embed(faceImage: faceImage)
-    } catch {
-      AppLogger.log(.faceEmbedding, "Cloud AdaFace embedding failed; falling back to local model: \(error.localizedDescription)")
-      return try await local.embed(faceImage: faceImage)
-    }
   }
 }

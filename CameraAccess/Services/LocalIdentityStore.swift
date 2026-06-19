@@ -32,12 +32,21 @@ protocol IdentityStore {
   func saveConversationEvent(_ event: ConversationEvent, context: PipelineContext?) async throws
   func saveFaceDetectionEvent(_ event: FaceDetectionEvent, context: PipelineContext?) async throws
   func saveTranscriptChunk(_ chunk: TranscriptChunk, context: PipelineContext?) async throws
+  func saveSceneContext(_ record: SceneContextRecord, context: PipelineContext?) async throws
+  func updateSceneContext(_ record: SceneContextRecord, context: PipelineContext?) async throws
+  func savePresenceEpisode(_ record: PresenceEpisodeRecord, context: PipelineContext?) async throws
+  func saveActivityModeEpisode(_ record: ActivityModeEpisodeRecord, context: PipelineContext?) async throws
+  func saveGlassesDisplayInteraction(_ event: GlassesDisplayInteractionEvent, context: PipelineContext?) async throws
   func saveIdentityMatchEvent(_ event: IdentityMatchEvent, context: PipelineContext?) async throws
   func runSessionSnapshot(appRunId: UUID?, conversationSessionId: UUID?) async throws -> RunSessionSnapshot
   func clearIdentities(context: PipelineContext?) async throws
   func clearConversations(context: PipelineContext?) async throws
   func transcriptChunksForPerson(_ personId: UUID) async throws -> [TranscriptChunk]
   func transcriptChunksForConversationSessions(_ sessionIds: [UUID]) async throws -> [TranscriptChunk]
+  func sceneContextsForPerson(_ personId: UUID) async throws -> [SceneContextRecord]
+  func sceneContextsForConversationSessions(_ sessionIds: [UUID]) async throws -> [SceneContextRecord]
+  func glassesDisplayInteractionsForPerson(_ personId: UUID) async throws -> [GlassesDisplayInteractionEvent]
+  func glassesDisplayInteractionsForConversationSessions(_ sessionIds: [UUID]) async throws -> [GlassesDisplayInteractionEvent]
   func thumbnailImage(forDisplayName displayName: String) -> UIImage?
 }
 
@@ -196,6 +205,9 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
       }
       try self.delete(entity: "FaceEmbeddingSample", predicate: NSPredicate(format: "personId == %@", id as CVarArg))
       try self.delete(entity: "PersonAveragedEmbedding", predicate: NSPredicate(format: "personId == %@", id as CVarArg))
+      try self.delete(entity: "SceneContextRecord", predicate: NSPredicate(format: "personId == %@", id as CVarArg))
+      try self.delete(entity: "GlassesDisplayInteractionEvent", predicate: NSPredicate(format: "personId == %@", id as CVarArg))
+      try self.delete(entity: "PresenceEpisodeRecord", predicate: NSPredicate(format: "personId == %@", id as CVarArg))
       let chunks = try self.fetch(entity: "TranscriptChunk", predicate: NSPredicate(format: "personId == %@", id as CVarArg))
       for chunk in chunks {
         chunk.setValue(nil, forKey: "personId")
@@ -281,6 +293,48 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
     }
   }
 
+  func allAppRuns() async throws -> [AppRun] {
+    try requireStoreLoaded()
+    return try await context.perform {
+      try self.fetch(entity: "AppRun")
+        .compactMap(self.readAppRun)
+        .sorted { $0.startedAt < $1.startedAt }
+    }
+  }
+
+  func appRun(id: UUID) async throws -> AppRun? {
+    try requireStoreLoaded()
+    return try await context.perform {
+      guard let object = try self.fetchOne(entity: "AppRun", id: id) else { return nil }
+      return self.readAppRun(object)
+    }
+  }
+
+  func personProfile(id: UUID) async throws -> PersonProfile? {
+    try requireStoreLoaded()
+    return try await context.perform {
+      guard let object = try self.fetchOne(entity: "PersonProfile", id: id) else { return nil }
+      return self.readPersonProfile(object)
+    }
+  }
+
+  func allConversationSessions() async throws -> [ConversationSession] {
+    try requireStoreLoaded()
+    return try await context.perform {
+      try self.fetch(entity: "ConversationSession")
+        .compactMap(self.readConversationSession)
+        .sorted { $0.startedAt < $1.startedAt }
+    }
+  }
+
+  func conversationSession(id: UUID) async throws -> ConversationSession? {
+    try requireStoreLoaded()
+    return try await context.perform {
+      guard let object = try self.fetchOne(entity: "ConversationSession", id: id) else { return nil }
+      return self.readConversationSession(object)
+    }
+  }
+
   func saveConversationSession(_ session: ConversationSession, context pipelineContext: PipelineContext?) async throws {
     try requireStoreLoaded()
     try await self.context.perform {
@@ -340,6 +394,66 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
     )
   }
 
+  func saveSceneContext(_ record: SceneContextRecord, context pipelineContext: PipelineContext?) async throws {
+    try requireStoreLoaded()
+    try await self.context.perform {
+      let object = try self.fetchOne(entity: "SceneContextRecord", id: record.id)
+        ?? NSEntityDescription.insertNewObject(forEntityName: "SceneContextRecord", into: self.context)
+      self.write(record, to: object)
+      try self.context.save()
+    }
+    AppLogger.log(
+      .sceneContext,
+      "\(pipelineContext.logPrefix) saved context=\(record.id.uuidString) person=\(record.personId?.uuidString ?? "unknown") confidence=\(String(format: "%.2f", record.confidence))"
+    )
+  }
+
+  func updateSceneContext(_ record: SceneContextRecord, context pipelineContext: PipelineContext?) async throws {
+    try await saveSceneContext(record, context: pipelineContext)
+  }
+
+  func savePresenceEpisode(_ record: PresenceEpisodeRecord, context pipelineContext: PipelineContext?) async throws {
+    try requireStoreLoaded()
+    try await self.context.perform {
+      let object = try self.fetchOne(entity: "PresenceEpisodeRecord", id: record.id)
+        ?? NSEntityDescription.insertNewObject(forEntityName: "PresenceEpisodeRecord", into: self.context)
+      self.write(record, to: object)
+      try self.context.save()
+    }
+    AppLogger.log(
+      .database,
+      "\(pipelineContext.logPrefix) saved presenceEpisode=\(record.id.uuidString) person=\(record.personId?.uuidString ?? "unknown") status=\(record.status.rawValue)"
+    )
+  }
+
+  func saveActivityModeEpisode(_ record: ActivityModeEpisodeRecord, context pipelineContext: PipelineContext?) async throws {
+    try requireStoreLoaded()
+    try await self.context.perform {
+      let object = try self.fetchOne(entity: "ActivityModeEpisodeRecord", id: record.id)
+        ?? NSEntityDescription.insertNewObject(forEntityName: "ActivityModeEpisodeRecord", into: self.context)
+      self.write(record, to: object)
+      try self.context.save()
+    }
+    AppLogger.log(
+      .activityMode,
+      "\(pipelineContext.logPrefix) saved activityModeEpisode=\(record.id.uuidString) mode=\(record.mode) specific=\"\(record.specificActivity)\" confidence=\(String(format: "%.2f", record.confidence)) ended=\(record.endedAt != nil)"
+    )
+  }
+
+  func saveGlassesDisplayInteraction(_ event: GlassesDisplayInteractionEvent, context pipelineContext: PipelineContext?) async throws {
+    try requireStoreLoaded()
+    try await self.context.perform {
+      let object = try self.fetchOne(entity: "GlassesDisplayInteractionEvent", id: event.id)
+        ?? NSEntityDescription.insertNewObject(forEntityName: "GlassesDisplayInteractionEvent", into: self.context)
+      self.write(event, to: object)
+      try self.context.save()
+    }
+    AppLogger.log(
+      .display,
+      "\(pipelineContext.logPrefix) saved glassesDisplayInteraction=\(event.id.uuidString) action=\(event.action) person=\(event.personId?.uuidString ?? "unknown") source=\(event.source)"
+    )
+  }
+
   func saveIdentityMatchEvent(_ event: IdentityMatchEvent, context pipelineContext: PipelineContext?) async throws {
     try requireStoreLoaded()
     try await self.context.perform {
@@ -385,6 +499,10 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
       try self.delete(entity: "FaceEmbeddingSample")
       try self.delete(entity: "PersonAveragedEmbedding")
       try self.delete(entity: "IdentityMatchEvent")
+      try self.delete(entity: "SceneContextRecord")
+      try self.delete(entity: "GlassesDisplayInteractionEvent")
+      try self.delete(entity: "PresenceEpisodeRecord")
+      try self.delete(entity: "ActivityModeEpisodeRecord")
       try self.delete(entity: "PersonProfile")
       try self.context.save()
     }
@@ -398,6 +516,10 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
       try self.delete(entity: "ConversationSession")
       try self.delete(entity: "TranscriptChunk")
       try self.delete(entity: "FaceDetectionEvent")
+      try self.delete(entity: "SceneContextRecord")
+      try self.delete(entity: "GlassesDisplayInteractionEvent")
+      try self.delete(entity: "PresenceEpisodeRecord")
+      try self.delete(entity: "ActivityModeEpisodeRecord")
       try self.context.save()
     }
     AppLogger.log(.database, "\(pipelineContext.logPrefix) cleared conversation data")
@@ -430,6 +552,50 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
       .compactMap(self.readTranscriptChunk)
       .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
       .sorted { ($0.startedAt ?? $0.createdAt) < ($1.startedAt ?? $1.createdAt) }
+    }
+  }
+
+  func sceneContextsForPerson(_ personId: UUID) async throws -> [SceneContextRecord] {
+    try requireStoreLoaded()
+    return try await context.perform {
+      try self.fetch(entity: "SceneContextRecord", predicate: NSPredicate(format: "personId == %@", personId as CVarArg))
+        .compactMap(self.readSceneContext)
+        .sorted { $0.startedAt > $1.startedAt }
+    }
+  }
+
+  func sceneContextsForConversationSessions(_ sessionIds: [UUID]) async throws -> [SceneContextRecord] {
+    try requireStoreLoaded()
+    guard !sessionIds.isEmpty else { return [] }
+    return try await context.perform {
+      try self.fetch(
+        entity: "SceneContextRecord",
+        predicate: NSPredicate(format: "conversationSessionId IN %@", sessionIds)
+      )
+      .compactMap(self.readSceneContext)
+      .sorted { $0.startedAt > $1.startedAt }
+    }
+  }
+
+  func glassesDisplayInteractionsForPerson(_ personId: UUID) async throws -> [GlassesDisplayInteractionEvent] {
+    try requireStoreLoaded()
+    return try await context.perform {
+      try self.fetch(entity: "GlassesDisplayInteractionEvent", predicate: NSPredicate(format: "personId == %@", personId as CVarArg))
+        .compactMap(self.readGlassesDisplayInteraction)
+        .sorted { $0.createdAt > $1.createdAt }
+    }
+  }
+
+  func glassesDisplayInteractionsForConversationSessions(_ sessionIds: [UUID]) async throws -> [GlassesDisplayInteractionEvent] {
+    try requireStoreLoaded()
+    guard !sessionIds.isEmpty else { return [] }
+    return try await context.perform {
+      try self.fetch(
+        entity: "GlassesDisplayInteractionEvent",
+        predicate: NSPredicate(format: "conversationSessionId IN %@", sessionIds)
+      )
+      .compactMap(self.readGlassesDisplayInteraction)
+      .sorted { $0.createdAt > $1.createdAt }
     }
   }
 
@@ -692,6 +858,79 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
     object.setValue(chunk.createdAt, forKey: "createdAt")
   }
 
+  private func write(_ record: SceneContextRecord, to object: NSManagedObject) {
+    object.setValue(record.id, forKey: "id")
+    object.setValue(record.appRunId, forKey: "appRunId")
+    object.setValue(record.conversationSessionId, forKey: "conversationSessionId")
+    object.setValue(record.personId, forKey: "personId")
+    object.setValue(record.startedAt, forKey: "startedAt")
+    object.setValue(record.endedAt, forKey: "endedAt")
+    object.setValue(record.createdAt, forKey: "createdAt")
+    object.setValue(record.modelName, forKey: "modelName")
+    object.setValue(record.promptVersion, forKey: "promptVersion")
+    object.setValue(record.transcriptChunkIdsJson, forKey: "transcriptChunkIdsJson")
+    object.setValue(record.frameTimestampsJson, forKey: "frameTimestampsJson")
+    object.setValue(record.locationLabel, forKey: "locationLabel")
+    object.setValue(record.latitude, forKey: "latitude")
+    object.setValue(record.longitude, forKey: "longitude")
+    object.setValue(record.locationAccuracyMeters, forKey: "locationAccuracyMeters")
+    object.setValue(record.who, forKey: "who")
+    object.setValue(record.whereText, forKey: "whereText")
+    object.setValue(record.what, forKey: "what")
+    object.setValue(record.whenText, forKey: "whenText")
+    object.setValue(record.why, forKey: "why")
+    object.setValue(record.how, forKey: "how")
+    object.setValue(record.interactionStyle, forKey: "interactionStyle")
+    object.setValue(record.summary, forKey: "summary")
+    object.setValue(record.confidence, forKey: "confidence")
+    object.setValue(record.evidenceJson, forKey: "evidenceJson")
+  }
+
+  private func write(_ record: PresenceEpisodeRecord, to object: NSManagedObject) {
+    object.setValue(record.id, forKey: "id")
+    object.setValue(record.appRunId, forKey: "appRunId")
+    object.setValue(record.conversationSessionId, forKey: "conversationSessionId")
+    object.setValue(record.personId, forKey: "personId")
+    object.setValue(record.displayName, forKey: "displayName")
+    object.setValue(record.startedAt, forKey: "startedAt")
+    object.setValue(record.lastEvidenceAt, forKey: "lastEvidenceAt")
+    object.setValue(record.endedAt, forKey: "endedAt")
+    object.setValue(record.status.rawValue, forKey: "status")
+    object.setValue(Double(record.confidence), forKey: "confidence")
+    object.setValue(record.evidenceSummary, forKey: "evidenceSummary")
+    object.setValue(record.updatedAt, forKey: "updatedAt")
+  }
+
+  private func write(_ record: ActivityModeEpisodeRecord, to object: NSManagedObject) {
+    object.setValue(record.id, forKey: "id")
+    object.setValue(record.appRunId, forKey: "appRunId")
+    object.setValue(record.conversationSessionId, forKey: "conversationSessionId")
+    object.setValue(record.mode, forKey: "mode")
+    object.setValue(record.specificActivity, forKey: "specificActivity")
+    object.setValue(record.startedAt, forKey: "startedAt")
+    object.setValue(record.lastEvidenceAt, forKey: "lastEvidenceAt")
+    object.setValue(record.endedAt, forKey: "endedAt")
+    object.setValue(record.confidence, forKey: "confidence")
+    object.setValue(record.reason, forKey: "reason")
+    object.setValue(record.source, forKey: "source")
+    object.setValue(record.modelName, forKey: "modelName")
+    object.setValue(record.promptVersion, forKey: "promptVersion")
+    object.setValue(record.updatedAt, forKey: "updatedAt")
+  }
+
+  private func write(_ event: GlassesDisplayInteractionEvent, to object: NSManagedObject) {
+    object.setValue(event.id, forKey: "id")
+    object.setValue(event.appRunId, forKey: "appRunId")
+    object.setValue(event.conversationSessionId, forKey: "conversationSessionId")
+    object.setValue(event.personId, forKey: "personId")
+    object.setValue(event.displayName, forKey: "displayName")
+    object.setValue(event.cardTitle, forKey: "cardTitle")
+    object.setValue(event.cardText, forKey: "cardText")
+    object.setValue(event.action, forKey: "action")
+    object.setValue(event.source, forKey: "source")
+    object.setValue(event.createdAt, forKey: "createdAt")
+  }
+
   private func write(_ event: IdentityMatchEvent, to object: NSManagedObject) {
     object.setValue(event.id, forKey: "id")
     object.setValue(event.appRunId, forKey: "appRunId")
@@ -710,6 +949,47 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
     object.setValue(event.decision, forKey: "decision")
     object.setValue(event.rollingConfirmationState, forKey: "rollingConfirmationState")
     object.setValue(event.createdAt, forKey: "createdAt")
+  }
+
+  private func readAppRun(_ object: NSManagedObject) -> AppRun? {
+    guard let id = object.value(forKey: "id") as? UUID,
+          let startedAt = object.value(forKey: "startedAt") as? Date,
+          let createdAt = object.value(forKey: "createdAt") as? Date else { return nil }
+    return AppRun(
+      id: id,
+      startedAt: startedAt,
+      endedAt: object.value(forKey: "endedAt") as? Date,
+      appBuild: object.value(forKey: "appBuild") as? String,
+      appVersion: object.value(forKey: "appVersion") as? String,
+      deviceId: object.value(forKey: "deviceId") as? String,
+      notes: object.value(forKey: "notes") as? String,
+      createdAt: createdAt
+    )
+  }
+
+  private func readConversationSession(_ object: NSManagedObject) -> ConversationSession? {
+    guard let id = object.value(forKey: "id") as? UUID,
+          let startedAt = object.value(forKey: "startedAt") as? Date,
+          let state = object.value(forKey: "state") as? String,
+          let createdAt = object.value(forKey: "createdAt") as? Date,
+          let updatedAt = object.value(forKey: "updatedAt") as? Date else { return nil }
+    let status = ConversationSession.Status(rawValue: state) ?? (state == "ended" ? .ended : .active)
+    return ConversationSession(
+      id: id,
+      personId: nil,
+      startedAt: startedAt,
+      endedAt: object.value(forKey: "endedAt") as? Date,
+      confidence: 0,
+      status: status,
+      appRunId: object.value(forKey: "appRunId") as? UUID,
+      deviceId: object.value(forKey: "deviceId") as? String,
+      datDeviceId: object.value(forKey: "datDeviceId") as? String,
+      streamStartedAt: object.value(forKey: "streamStartedAt") as? Date,
+      streamEndedAt: object.value(forKey: "streamEndedAt") as? Date,
+      state: state,
+      createdAt: createdAt,
+      updatedAt: updatedAt
+    )
   }
 
   private func readPersonProfile(_ object: NSManagedObject) -> PersonProfile? {
@@ -781,6 +1061,76 @@ final class LocalIdentityStore: IdentityStore, @unchecked Sendable {
       startedAt: object.value(forKey: "startedAt") as? Date,
       endedAt: object.value(forKey: "endedAt") as? Date,
       transcriptUpdatedAt: transcriptUpdatedAt,
+      source: source,
+      createdAt: createdAt
+    )
+  }
+
+  private func readSceneContext(_ object: NSManagedObject) -> SceneContextRecord? {
+    guard let id = object.value(forKey: "id") as? UUID,
+          let appRunId = object.value(forKey: "appRunId") as? UUID,
+          let startedAt = object.value(forKey: "startedAt") as? Date,
+          let endedAt = object.value(forKey: "endedAt") as? Date,
+          let createdAt = object.value(forKey: "createdAt") as? Date,
+          let modelName = object.value(forKey: "modelName") as? String,
+          let promptVersion = object.value(forKey: "promptVersion") as? String,
+          let transcriptChunkIdsJson = object.value(forKey: "transcriptChunkIdsJson") as? String,
+          let frameTimestampsJson = object.value(forKey: "frameTimestampsJson") as? String,
+          let who = object.value(forKey: "who") as? String,
+          let whereText = object.value(forKey: "whereText") as? String,
+          let what = object.value(forKey: "what") as? String,
+          let whenText = object.value(forKey: "whenText") as? String,
+          let why = object.value(forKey: "why") as? String,
+          let how = object.value(forKey: "how") as? String,
+          let summary = object.value(forKey: "summary") as? String,
+          let evidenceJson = object.value(forKey: "evidenceJson") as? String else { return nil }
+    return SceneContextRecord(
+      id: id,
+      appRunId: appRunId,
+      conversationSessionId: object.value(forKey: "conversationSessionId") as? UUID,
+      personId: object.value(forKey: "personId") as? UUID,
+      startedAt: startedAt,
+      endedAt: endedAt,
+      createdAt: createdAt,
+      modelName: modelName,
+      promptVersion: promptVersion,
+      transcriptChunkIdsJson: transcriptChunkIdsJson,
+      frameTimestampsJson: frameTimestampsJson,
+      locationLabel: object.value(forKey: "locationLabel") as? String,
+      latitude: object.value(forKey: "latitude") as? Double,
+      longitude: object.value(forKey: "longitude") as? Double,
+      locationAccuracyMeters: object.value(forKey: "locationAccuracyMeters") as? Double,
+      who: who,
+      whereText: whereText,
+      what: what,
+      whenText: whenText,
+      why: why,
+      how: how,
+      interactionStyle: object.value(forKey: "interactionStyle") as? String ?? "unknown",
+      summary: summary,
+      confidence: (object.value(forKey: "confidence") as? Double) ?? 0,
+      evidenceJson: evidenceJson
+    )
+  }
+
+  private func readGlassesDisplayInteraction(_ object: NSManagedObject) -> GlassesDisplayInteractionEvent? {
+    guard let id = object.value(forKey: "id") as? UUID,
+          let appRunId = object.value(forKey: "appRunId") as? UUID,
+          let cardTitle = object.value(forKey: "cardTitle") as? String,
+          let cardText = object.value(forKey: "cardText") as? String,
+          let action = object.value(forKey: "action") as? String,
+          let source = object.value(forKey: "source") as? String,
+          let createdAt = object.value(forKey: "createdAt") as? Date,
+          let actionKind = GlassesDisplayAction(rawValue: action) else { return nil }
+    return GlassesDisplayInteractionEvent(
+      id: id,
+      appRunId: appRunId,
+      conversationSessionId: object.value(forKey: "conversationSessionId") as? UUID,
+      personId: object.value(forKey: "personId") as? UUID,
+      displayName: object.value(forKey: "displayName") as? String,
+      cardTitle: cardTitle,
+      cardText: cardText,
+      action: actionKind,
       source: source,
       createdAt: createdAt
     )
@@ -949,6 +1299,43 @@ private extension LocalIdentityStore {
         attr("personId", .UUIDAttributeType, optional: true), attr("activeIdentityState", .stringAttributeType), attr("text", .stringAttributeType),
         attr("isFinal", .booleanAttributeType), attr("startedAt", .dateAttributeType, optional: true), attr("endedAt", .dateAttributeType, optional: true),
         attr("transcriptUpdatedAt", .dateAttributeType), attr("source", .stringAttributeType), attr("createdAt", .dateAttributeType)
+      ]),
+      entity("SceneContextRecord", [
+        attr("id", .UUIDAttributeType), attr("appRunId", .UUIDAttributeType), attr("conversationSessionId", .UUIDAttributeType, optional: true),
+        attr("personId", .UUIDAttributeType, optional: true), attr("startedAt", .dateAttributeType), attr("endedAt", .dateAttributeType),
+        attr("createdAt", .dateAttributeType), attr("modelName", .stringAttributeType), attr("promptVersion", .stringAttributeType),
+        attr("transcriptChunkIdsJson", .stringAttributeType), attr("frameTimestampsJson", .stringAttributeType),
+        attr("locationLabel", .stringAttributeType, optional: true), attr("latitude", .doubleAttributeType, optional: true),
+        attr("longitude", .doubleAttributeType, optional: true), attr("locationAccuracyMeters", .doubleAttributeType, optional: true),
+        attr("who", .stringAttributeType), attr("whereText", .stringAttributeType), attr("what", .stringAttributeType),
+        attr("whenText", .stringAttributeType), attr("why", .stringAttributeType), attr("how", .stringAttributeType),
+        attr("interactionStyle", .stringAttributeType, optional: true), attr("summary", .stringAttributeType),
+        attr("confidence", .doubleAttributeType), attr("evidenceJson", .stringAttributeType)
+      ]),
+      entity("PresenceEpisodeRecord", [
+        attr("id", .UUIDAttributeType), attr("appRunId", .UUIDAttributeType),
+        attr("conversationSessionId", .UUIDAttributeType, optional: true), attr("personId", .UUIDAttributeType, optional: true),
+        attr("displayName", .stringAttributeType), attr("startedAt", .dateAttributeType),
+        attr("lastEvidenceAt", .dateAttributeType), attr("endedAt", .dateAttributeType, optional: true),
+        attr("status", .stringAttributeType), attr("confidence", .doubleAttributeType),
+        attr("evidenceSummary", .stringAttributeType), attr("updatedAt", .dateAttributeType)
+      ]),
+      entity("ActivityModeEpisodeRecord", [
+        attr("id", .UUIDAttributeType), attr("appRunId", .UUIDAttributeType),
+        attr("conversationSessionId", .UUIDAttributeType, optional: true),
+        attr("mode", .stringAttributeType), attr("specificActivity", .stringAttributeType),
+        attr("startedAt", .dateAttributeType), attr("lastEvidenceAt", .dateAttributeType),
+        attr("endedAt", .dateAttributeType, optional: true), attr("confidence", .doubleAttributeType),
+        attr("reason", .stringAttributeType), attr("source", .stringAttributeType),
+        attr("modelName", .stringAttributeType), attr("promptVersion", .stringAttributeType),
+        attr("updatedAt", .dateAttributeType)
+      ]),
+      entity("GlassesDisplayInteractionEvent", [
+        attr("id", .UUIDAttributeType), attr("appRunId", .UUIDAttributeType),
+        attr("conversationSessionId", .UUIDAttributeType, optional: true), attr("personId", .UUIDAttributeType, optional: true),
+        attr("displayName", .stringAttributeType, optional: true), attr("cardTitle", .stringAttributeType),
+        attr("cardText", .stringAttributeType), attr("action", .stringAttributeType), attr("source", .stringAttributeType),
+        attr("createdAt", .dateAttributeType)
       ]),
       entity("IdentityMatchEvent", [
         attr("id", .UUIDAttributeType), attr("appRunId", .UUIDAttributeType), attr("conversationSessionId", .UUIDAttributeType, optional: true),

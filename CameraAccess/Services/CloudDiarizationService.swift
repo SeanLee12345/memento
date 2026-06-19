@@ -5,16 +5,24 @@ import Foundation
 enum CloudDiarizationError: LocalizedError {
   case credentialsFailed(String)
   case uploadFailed(String)
-  case timeout
-  case resultDecodeFailed
+  case timeout(jobId: String, audioSeconds: Double?, lastState: String?, timeoutMinutes: Int)
+  case resultDecodeFailed(String)
+  case backendFailed(jobId: String, state: String, kind: String?, message: String?)
   case emptyAudioFile
 
   var errorDescription: String? {
     switch self {
     case .credentialsFailed(let m): return "AWS credentials failed: \(m)"
     case .uploadFailed(let m): return "S3 upload failed: \(m)"
-    case .timeout: return "Diarization job timed out after 15 min"
-    case .resultDecodeFailed: return "Could not decode diarization result"
+    case .timeout(let jobId, let audioSeconds, let lastState, let timeoutMinutes):
+      let secondsText = audioSeconds.map { String(format: "%.1f", Double($0)) } ?? "unknown"
+      return "Diarization job \(jobId) timed out after \(timeoutMinutes) min; audioSeconds=\(secondsText), lastState=\(lastState ?? "unknown")"
+    case .resultDecodeFailed(let jobId): return "Could not decode diarization result for job \(jobId)"
+    case .backendFailed(let jobId, let state, let kind, let message):
+      let detail = [kind, message].compactMap { $0 }.joined(separator: ": ")
+      return detail.isEmpty
+        ? "Diarization job \(jobId) failed with state \(state)"
+        : "Diarization job \(jobId) failed with state \(state): \(detail)"
     case .emptyAudioFile: return "Recorded audio was empty; skipping diarization upload"
     }
   }
@@ -23,46 +31,128 @@ enum CloudDiarizationError: LocalizedError {
 // Orchestrates the cloud diarization job:
 //   upload WAV → upload job spec (S3 event triggers Lambda → EC2) → poll S3 for result.
 actor CloudDiarizationService {
+  private static let lifecycleLambdaFunctionName = "DiarizenStartEC2"
   private let bucket         = "meta-glasses-transcribe-620969609288"
   private let s3Region       = "us-west-1"
   private let cognitoRegion  = "us-west-1"
   private let identityPoolId = "us-west-1:1166ae70-5652-4a7b-b045-66fdaf6e1efb"
   private let accountId      = "620969609288"
+  private let pollIntervalSeconds: UInt64 = 10
+  private let pollAttemptCount = 360
 
   private var cachedCredentials: CloudAWSCredentials?
   private var cognitoIdentityId: String?
+  private let lifecycleClient = AWSCognitoLambdaClient()
 
   // MARK: - Public API
 
-  func submitJob(audioFileURL: URL, streamStart: Date) async throws -> DiarizenResult {
+  func submitJob(audioFileURL: URL, streamStart: Date, conversationSessionId: UUID? = nil) async throws -> DiarizenResult {
     let jobId = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-    AppLogger.log(.audio, "[CloudDiarization] Submitting job \(jobId)")
+    AppLogger.log(.cloudDiarization, "submit jobId=\(jobId) conversationSessionId=\(conversationSessionId?.uuidString ?? "none")")
     let creds = try await getCredentials()
     let audioStats = try validateAudioFileForUpload(audioFileURL)
 
     // 1. Upload session audio
     let audioKey = "diarizen/audio/\(jobId).wav"
+    let specKey = "diarizen/jobs/\(jobId)/spec.json"
+    let statusKey = "diarizen/jobs/\(jobId)/status.json"
+    let errorKey = "diarizen/jobs/\(jobId)/error.json"
+    let pendingKey = "diarizen/jobs/pending.json"
+    let resultKey = "diarizen/results/\(jobId)/result.json"
     let audioData = try Data(contentsOf: audioFileURL)
     try await s3Put(data: audioData, key: audioKey, contentType: "audio/wav", creds: creds)
-    AppLogger.log(.audio, "[CloudDiarization] Audio uploaded \(audioData.count / 1024) KB, seconds=\(String(format: "%.2f", audioStats.seconds)), frames=\(audioStats.frames) -> \(audioKey)")
+    AppLogger.log(
+      .cloudDiarization,
+      "audio uploaded jobId=\(jobId) key=\(audioKey) bytes=\(audioData.count) seconds=\(String(format: "%.2f", Double(audioStats.seconds))) frames=\(audioStats.frames)"
+    )
 
-    // 2. Upload job spec
-    let spec = DiarizenJobSpec(jobId: jobId, audioKey: audioKey, streamStartUnix: streamStart.timeIntervalSince1970)
+    // 2. Upload durable job metadata plus the legacy trigger key consumed by the
+    // current EC2 worker. The per-job spec/status keys make overwritten
+    // pending.json failures diagnosable and recoverable by a newer worker.
+    let createdAt = Self.iso8601(Date())
+    let spec = DiarizenJobSpec(
+      jobId: jobId,
+      audioKey: audioKey,
+      streamStartUnix: streamStart.timeIntervalSince1970,
+      resultKey: resultKey,
+      statusKey: statusKey,
+      errorKey: errorKey,
+      conversationSessionId: conversationSessionId?.uuidString,
+      audioDurationSeconds: audioStats.seconds,
+      audioByteCount: audioData.count,
+      createdAt: createdAt
+    )
     let specData = try JSONEncoder().encode(spec)
-    try await s3Put(data: specData, key: "diarizen/jobs/pending.json", contentType: "application/json", creds: creds)
-    AppLogger.log(.audio, "[CloudDiarization] Job spec uploaded; Lambda will start EC2 if stopped")
+    try await s3Put(data: specData, key: specKey, contentType: "application/json", creds: creds)
+    let queued = DiarizenJobStatus(
+      jobId: jobId,
+      state: "queued",
+      audioKey: audioKey,
+      resultKey: resultKey,
+      statusKey: statusKey,
+      conversationSessionId: conversationSessionId?.uuidString,
+      audioDurationSeconds: audioStats.seconds,
+      audioByteCount: audioData.count,
+      createdAt: createdAt,
+      startedAt: nil,
+      finishedAt: nil,
+      failedAt: nil,
+      updatedAt: createdAt,
+      lambdaRequestId: nil,
+      workerHostname: nil,
+      workerProcessId: nil,
+      errorKind: nil,
+      errorMessage: nil,
+      instanceState: nil,
+      publicIp: nil,
+      privateIp: nil
+    )
+    try await s3Put(data: try JSONEncoder().encode(queued), key: statusKey, contentType: "application/json", creds: creds)
+    try await s3Put(data: specData, key: pendingKey, contentType: "application/json", creds: creds)
+    AppLogger.log(
+      .cloudDiarization,
+      "job trigger uploaded jobId=\(jobId) specKey=\(specKey) statusKey=\(statusKey) pendingKey=\(pendingKey) resultKey=\(resultKey)"
+    )
 
-    // 3. Poll S3 for result (10 s interval, up to 15 min).
+    // 3. Poll S3 for result (10 s interval, up to 60 min).
     // S3 PUT on diarizen/jobs/pending.json triggers DiarizenStartEC2 Lambda,
     // which starts the EC2 worker if stopped. The worker polls S3 and processes
     // any pending job.
-    let resultKey = "diarizen/results/\(jobId)/result.json"
-    return try await pollForResult(key: resultKey, creds: creds)
+    let result = try await pollForResult(
+      resultKey: resultKey,
+      statusKey: statusKey,
+      jobId: jobId,
+      audioSeconds: audioStats.seconds,
+      creds: creds
+    )
+    await stopComputeAfterCompletion(jobId: jobId)
+    return result
   }
 
   func downloadSpeakerClip(s3Key: String) async throws -> Data {
     let creds = try await getCredentials()
     return try await s3Get(key: s3Key, creds: creds)
+  }
+
+  private func stopComputeAfterCompletion(jobId: String) async {
+    do {
+      let response = try await lifecycleClient.invokeLambda(
+        functionName: Self.lifecycleLambdaFunctionName,
+        payload: [
+          "action": "stopAfterDiarizationComplete",
+          "jobId": jobId,
+        ]
+      )
+      AppLogger.log(
+        .cloudDiarization,
+        "shutdown requested jobId=\(jobId) action=\(response.action ?? "unknown") instanceState=\(response.state ?? "unknown") speakerLease=\(response.liveSessionId ?? "none") faceLease=\(response.liveFaceSessionId ?? "none")"
+      )
+    } catch {
+      AppLogger.log(
+        .cloudDiarization,
+        "shutdown request failed jobId=\(jobId) error=\(error.localizedDescription); delayed Lambda watchdog remains active"
+      )
+    }
   }
 
   private func validateAudioFileForUpload(_ url: URL) throws -> (frames: AVAudioFramePosition, seconds: Double) {
@@ -114,20 +204,63 @@ actor CloudDiarizationService {
     return http.statusCode == 200
   }
 
-  private func pollForResult(key: String, creds: CloudAWSCredentials) async throws -> DiarizenResult {
-    for attempt in 0..<90 {
-      if attempt > 0 { try await Task.sleep(nanoseconds: 10_000_000_000) }
-      guard await s3Exists(key: key, creds: creds) else {
-        AppLogger.log(.audio, "[CloudDiarization] Not ready (attempt \(attempt + 1)/90)")
+  private func pollForResult(
+    resultKey: String,
+    statusKey: String,
+    jobId: String,
+    audioSeconds: Double?,
+    creds: CloudAWSCredentials
+  ) async throws -> DiarizenResult {
+    var lastState: String?
+    for attempt in 0..<pollAttemptCount {
+      if attempt > 0 { try await Task.sleep(nanoseconds: pollIntervalSeconds * 1_000_000_000) }
+      let resultExists = await s3Exists(key: resultKey, creds: creds)
+      if let status = await s3StatusIfPresent(key: statusKey, creds: creds) {
+        lastState = status.state
+        AppLogger.log(
+          .cloudDiarization,
+          "poll jobId=\(jobId) attempt=\(attempt + 1)/\(pollAttemptCount) state=\(status.state) instanceState=\(status.instanceState ?? "unknown") resultKey=\(resultKey)"
+        )
+        if Self.shouldTreatDiarizationStatusAsTerminalFailure(statusState: status.state, resultExists: resultExists) {
+          throw CloudDiarizationError.backendFailed(
+            jobId: jobId,
+            state: status.state,
+            kind: status.errorKind,
+            message: status.errorMessage
+          )
+        }
+      } else {
+        AppLogger.log(.cloudDiarization, "poll jobId=\(jobId) attempt=\(attempt + 1)/\(pollAttemptCount) state=missingStatus resultKey=\(resultKey)")
+      }
+      guard resultExists else {
         continue
       }
-      let data = try await s3Get(key: key, creds: creds)
+      let data = try await s3Get(key: resultKey, creds: creds)
       guard let result = try? JSONDecoder().decode(DiarizenResult.self, from: data) else {
-        throw CloudDiarizationError.resultDecodeFailed
+        throw CloudDiarizationError.resultDecodeFailed(jobId)
       }
+      AppLogger.log(
+        .cloudDiarization,
+        "result received jobId=\(jobId) speakers=\(result.speakerCount) segments=\(result.segments.count) resultBytes=\(data.count)"
+      )
       return result
     }
-    throw CloudDiarizationError.timeout
+    let timeoutMinutes = Int((pollIntervalSeconds * UInt64(pollAttemptCount)) / 60)
+    throw CloudDiarizationError.timeout(
+      jobId: jobId,
+      audioSeconds: audioSeconds,
+      lastState: lastState,
+      timeoutMinutes: timeoutMinutes
+    )
+  }
+
+  nonisolated static func shouldTreatDiarizationStatusAsTerminalFailure(statusState: String, resultExists: Bool) -> Bool {
+    statusState == "failed" && !resultExists
+  }
+
+  private func s3StatusIfPresent(key: String, creds: CloudAWSCredentials) async -> DiarizenJobStatus? {
+    guard let data = try? await s3Get(key: key, creds: creds) else { return nil }
+    return try? JSONDecoder().decode(DiarizenJobStatus.self, from: data)
   }
 
   // MARK: - Cognito credentials
@@ -238,6 +371,10 @@ actor CloudDiarizationService {
     let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
     return String(format: "%04d%02d%02dT%02d%02d%02dZ",
                   c.year!, c.month!, c.day!, c.hour!, c.minute!, c.second!)
+  }
+
+  private static func iso8601(_ date: Date) -> String {
+    ISO8601DateFormatter().string(from: date)
   }
 }
 

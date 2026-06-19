@@ -18,7 +18,7 @@ struct FaceCropResult {
   let roll: Float?
   let pitch: Float?
   let faceCaptureQuality: Float?
-  // Similarity-transform-aligned 96×112 crop matching MobileFaceNet training distribution.
+  // Similarity-transform-aligned face crop matching the active embedding model.
   let alignedCroppedImage: CGImage
   // True when the padded bounding box was clipped at the image bottom edge (chin likely cut off).
   let isBottomClipped: Bool
@@ -459,7 +459,7 @@ struct IdentityMatchEvent: Identifiable, Codable, Equatable {
   var createdAt: Date
 }
 
-struct PipelineContext: Codable, Equatable {
+struct PipelineContext: Codable, Equatable, Sendable {
   var appRunId: UUID
   var conversationSessionId: UUID?
   var datDeviceId: String?
@@ -544,8 +544,13 @@ struct CapturedFaceSampleSnapshot: Identifiable {
   let qualityTier: FaceQualityTier
   let rawFaceWidth: Int
   let rawFaceHeight: Int
-  let embeddingRecord: FaceEmbeddingRecord?
+  let faceBoxPixels: CGRect
+  let embeddingRecords: [FaceEmbeddingRecord]
   let embeddingStatus: String
+
+  var embeddingRecord: FaceEmbeddingRecord? {
+    embeddingRecords.first
+  }
 }
 
 struct CapturedFaceGroupSnapshot: Identifiable {
@@ -561,10 +566,24 @@ struct CapturedFaceGroupSnapshot: Identifiable {
   var isAlreadyRecognized: Bool { recognizedPersonId != nil }
 }
 
+struct FaceEmbeddingDebugMetric: Equatable {
+  let sourceLabel: String
+  let modelName: String
+  let modelSource: String
+  let dimension: Int
+  let latencyMS: Double
+  let bestSimilarity: Float
+  let decisionText: String
+  let compatibleSampleCount: Int
+  let compatibleAverageCount: Int
+  let selectedForRecognition: Bool
+}
+
 struct IdentityProcessingResult {
   var activeIdentity: ActiveIdentityState
   var pendingEnrollmentFacePreview: UIImage?
   var lastEnrollmentCandidatePreview: UIImage?
+  var currentRecognitionFacePreview: UIImage?
   var hasLastEnrollmentCandidate: Bool
   var lastEnrollmentCandidateSummary: String
   var modelStatusText: String
@@ -576,6 +595,7 @@ struct IdentityProcessingResult {
   var embeddingGenerated: Bool
   var matchDecisionText: String
   var embeddingLatencyMS: Double
+  var embeddingMetrics: [FaceEmbeddingDebugMetric]
   var alignmentRejectedCount: Int
   var pendingEnrollmentAcceptedSamples: Int
   var pendingEnrollmentRequiredSamples: Int
@@ -639,11 +659,7 @@ enum IdentityConfig {
   #endif
   static let enableFaceQualityFilter = true
   static let enableTranscriptAttachment = true
-  #if DEBUG
-  static let allowLowQualityEmbeddingDebug = true
-  #else
   static let allowLowQualityEmbeddingDebug = false
-  #endif
 
   static let identityProcessingFPS: TimeInterval = 3
   static let qualityConfig = FaceQualityConfig()
@@ -680,10 +696,10 @@ enum IdentityConfig {
   static let faceCropBottomPaddingRatio: CGFloat = 0.60
   // Left/right padding stays symmetric.
   static let faceCropVerticalPaddingRatio: CGFloat = 1.55
-  // Populated by FaceEmbeddingModels once the Core ML model is loaded.
+  // Populated by FaceEmbeddingModels once the active model is configured.
   // FaceCropper reads this to size the aligned warp output without hardcoding dimensions.
-  // Default matches the MobileFaceNet model that ships with the app (1x3x112x96 → W=96 H=112).
-  static var activeEmbeddingModelInputSize: CGSize = CGSize(width: 96, height: 112)
+  // Default matches AWS AdaFace/ArcFace-style 112x112 crops.
+  static var activeEmbeddingModelInputSize: CGSize = CGSize(width: 112, height: 112)
 
   static var startupLogText: String {
     "minRawFacePixelsForDetection=\(Int(qualityConfig.minRawFacePixelsForDetection)) minRawFacePixelsForRecognition=\(Int(qualityConfig.minRawFacePixelsForRecognition)) minRawFacePixelsForEnrollment=\(Int(qualityConfig.minRawFacePixelsForEnrollment)) minCropPixelsForRecognition=\(Int(qualityConfig.minCropPixelsForRecognition)) minCropPixelsForEnrollment=\(Int(qualityConfig.minCropPixelsForEnrollment)) minRecognitionQuality=\(String(format: "%.2f", qualityConfig.minRecognitionQuality)) minEnrollmentQuality=\(String(format: "%.2f", qualityConfig.minEnrollmentQuality)) faceCropHorizontalPaddingRatio=\(String(format: "%.2f", faceCropHorizontalPaddingRatio)) faceCropVerticalPaddingRatio=\(String(format: "%.2f", faceCropVerticalPaddingRatio)) weakMatchThreshold=\(String(format: "%.2f", weakMatchThreshold)) strongMatchThreshold=\(String(format: "%.2f", strongMatchThreshold)) matchMarginThreshold=\(String(format: "%.2f", matchMarginThreshold)) rollingWindowSize=\(rollingWindowSize) requiredStrongMatches=\(requiredStrongMatches) identityHoldSeconds=\(String(format: "%.1f", holdIdentitySeconds)) allowLowQualityEmbeddingDebug=\(allowLowQualityEmbeddingDebug)"
@@ -870,6 +886,7 @@ struct PersonInteractionHour: Identifiable {
   var hour: Date
   var faceDetectionCount: Int
   var transcripts: [TranscriptChunk]
+  var glassesInteractions: [GlassesDisplayInteractionEvent] = []
   var id: Date { hour }
 }
 
@@ -879,6 +896,64 @@ struct PersonInteractionDay: Identifiable {
   var id: Date { day }
   var totalFaceDetections: Int { hours.reduce(0) { $0 + $1.faceDetectionCount } }
   var totalTranscripts: Int { hours.reduce(0) { $0 + $1.transcripts.count } }
+  var totalGlassesInteractions: Int { hours.reduce(0) { $0 + $1.glassesInteractions.count } }
+}
+
+struct GlassesDisplayInteractionEvent: Identifiable, Hashable, Codable {
+  let id: UUID
+  var appRunId: UUID
+  var conversationSessionId: UUID?
+  var personId: UUID?
+  var displayName: String?
+  var cardTitle: String
+  var cardText: String
+  var action: String
+  var source: String
+  var createdAt: Date
+
+  init(
+    id: UUID = UUID(),
+    appRunId: UUID,
+    conversationSessionId: UUID? = nil,
+    personId: UUID? = nil,
+    displayName: String? = nil,
+    cardTitle: String,
+    cardText: String,
+    action: GlassesDisplayAction,
+    source: String,
+    createdAt: Date = Date()
+  ) {
+    self.id = id
+    self.appRunId = appRunId
+    self.conversationSessionId = conversationSessionId
+    self.personId = personId
+    self.displayName = displayName
+    self.cardTitle = cardTitle
+    self.cardText = cardText
+    self.action = action.rawValue
+    self.source = source
+    self.createdAt = createdAt
+  }
+
+  var actionKind: GlassesDisplayAction? {
+    GlassesDisplayAction(rawValue: action)
+  }
+
+  var actionLabel: String {
+    actionKind?.eventTitle ?? action
+  }
+
+  var displaySummary: String {
+    let trimmed = cardText
+      .replacingOccurrences(of: "\n", with: " ")
+      .split(whereSeparator: \.isWhitespace)
+      .joined(separator: " ")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty {
+      return cardTitle
+    }
+    return String(trimmed.prefix(140))
+  }
 }
 
 struct ConversationTranscriptLine: Identifiable {
@@ -893,6 +968,7 @@ struct PersonConversationTranscript: Identifiable {
   var startedAt: Date
   var endedAt: Date?
   var lines: [ConversationTranscriptLine]
+  var sceneContexts: [SceneContextRecord] = []
 
   var id: UUID { conversationSessionId }
 }
@@ -904,6 +980,8 @@ struct PersonDictionaryEntry: Identifiable, Hashable {
   var interactionDays: [PersonInteractionDay]
   var embeddingImages: [UIImage]
   var conversationTranscripts: [PersonConversationTranscript] = []
+  var sceneContexts: [SceneContextRecord] = []
+  var glassesDisplayInteractions: [GlassesDisplayInteractionEvent] = []
 
   var id: UUID { profile.id }
   var displayName: String { profile.displayName }

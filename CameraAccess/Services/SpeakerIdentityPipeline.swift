@@ -7,6 +7,11 @@ import Foundation
 actor SpeakerIdentityPipeline {
   private static let wearerPersonId = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
 
+  private enum WorkerEmbeddingDecision {
+    case run
+    case skip(String)
+  }
+
   // MARK: - Rolling confirmor (mirrors RollingIdentityConfirmor)
 
   private struct RollingSpeakerConfirmor {
@@ -101,7 +106,9 @@ actor SpeakerIdentityPipeline {
   private let vad = VoiceActivityDetector()
   private let embeddingModel: SpeakerEmbeddingModel
   private let iPhoneEmbeddingModel: SpeakerEmbeddingModel
-  private let workerEmbeddingModel: SpeakerEmbeddingModel
+  private var workerEmbeddingModel: SpeakerEmbeddingModel
+  private var workerEmbeddingEnabled = false
+  private var workerEmbeddingDisabledReason: String?
   private var confirmor = RollingSpeakerConfirmor()
 
   // Resampled 16 kHz mono samples accumulated from VAD-confirmed speech frames.
@@ -110,6 +117,9 @@ actor SpeakerIdentityPipeline {
   private var lastSpeechAt: Date?
   // When the last embedding was computed (rate-limiting).
   private var lastEmbeddedAt: Date?
+  // When the last cloud/AWS embedding was computed. Local embeddings can run more
+  // frequently; the worker path is intentionally throttled for cost and latency.
+  private var lastWorkerEmbeddedAt: Date?
   // Actor calls are reentrant while CoreML/network inference awaits. This prevents
   // multiple audio buffers from launching duplicate embedding requests in parallel.
   private var embeddingInFlight = false
@@ -120,6 +130,11 @@ actor SpeakerIdentityPipeline {
   private var enrolledRecords: [SpeakerEmbeddingRecord] = []
   // Short raw audio snippet saved at enrollment time for playback in the dictionary.
   private var enrolledPreviewSamples: [UUID: [Float]] = [:]
+  // Diarized enrollments whose AWS voice embedding could not be created yet
+  // (worker warming/unavailable). The clip is persisted and retried when the
+  // worker becomes reachable — the enrollment stays explicitly pending, never
+  // silently "complete". Keyed by personId.
+  private var pendingDiarizedEnrollments: [UUID: PendingDiarizedEnrollment] = [:]
   // The glasses wearer's own voice profile is intentionally separate from
   // dictionary people. It is used as a negative filter for captured voice clips.
   private var wearerProfile: SpeakerAveragedEmbedding?
@@ -180,10 +195,24 @@ actor SpeakerIdentityPipeline {
 
   // MARK: - Persistence
 
-  private static let storageURL: URL = {
+  static var storageURLOverride: URL?
+
+  private static var storageURL: URL {
+    if let storageURLOverride {
+      return storageURLOverride
+    }
     let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     return docs.appendingPathComponent("speaker_embeddings.json")
-  }()
+  }
+
+  struct PendingDiarizedEnrollment: Codable, Equatable {
+    var personId: UUID
+    var name: String
+    // 16kHz mono float32 samples for the diarized clip awaiting an AWS embedding.
+    var samples: [Float]
+    var createdAt: Date
+    var attempts: Int
+  }
 
   private struct SpeakerStorageData: Codable {
     var enrolledSpeakers: [SpeakerAveragedEmbedding]
@@ -195,6 +224,8 @@ actor SpeakerIdentityPipeline {
     var wearerPreviewSamples: [Float]?
     var wearerConsistencyScore: Float?
     var wearerAdditionalCentroids: [SpeakerAveragedEmbedding]?
+    // Optional so pre-existing on-disk files decode unchanged.
+    var pendingDiarizedEnrollments: [PendingDiarizedEnrollment]?
   }
 
   func loadFromDisk() {
@@ -212,6 +243,12 @@ actor SpeakerIdentityPipeline {
     wearerPreviewSamples = stored.wearerPreviewSamples ?? []
     wearerLastConsistencyScore = stored.wearerConsistencyScore
     wearerAdditionalCentroids = stored.wearerAdditionalCentroids ?? []
+    pendingDiarizedEnrollments = Dictionary(
+      uniqueKeysWithValues: (stored.pendingDiarizedEnrollments ?? []).map { ($0.personId, $0) }
+    )
+    if !pendingDiarizedEnrollments.isEmpty {
+      AppLogger.log(.speakerEnrollment, "diarized pending enrollments restored count=\(pendingDiarizedEnrollments.count) — will retry when AWS worker is reachable")
+    }
     let loadedSpeakers = enrolledSpeakers.count
     let hadWearerProfile = wearerProfile != nil
     purgeIncompatibleEnrollments(saveAfterPurge: false)
@@ -232,7 +269,8 @@ actor SpeakerIdentityPipeline {
       wearerRecords: wearerRecords,
       wearerPreviewSamples: wearerPreviewSamples,
       wearerConsistencyScore: wearerLastConsistencyScore,
-      wearerAdditionalCentroids: wearerAdditionalCentroids
+      wearerAdditionalCentroids: wearerAdditionalCentroids,
+      pendingDiarizedEnrollments: Array(pendingDiarizedEnrollments.values)
     )
     let data: Data
     do {
@@ -261,7 +299,51 @@ actor SpeakerIdentityPipeline {
     self.embeddingModel = embeddingModel ?? SpeakerEmbeddingModelFactory.makeLocalModelOnly()
     self.iPhoneEmbeddingModel = iPhoneEmbeddingModel ?? SpeakerEmbeddingModelFactory.makeLocalModelOnly()
     self.workerEmbeddingModel = workerEmbeddingModel ?? MissingSpeakerEmbeddingModel()
+    self.workerEmbeddingEnabled = workerEmbeddingModel != nil
+    self.workerEmbeddingDisabledReason = workerEmbeddingModel == nil ? "not configured" : nil
     AppLogger.log(.speakerEmbeddingModel, SpeakerEmbeddingModelFactory.diagnosticsText())
+  }
+
+  func configureWorkerEmbedding(endpoint: String, apiKey: String) async {
+    workerEmbeddingModel = SpeakerEmbeddingModelFactory.makeRemoteModelOnly(endpoint: endpoint, apiKey: apiKey)
+    workerEmbeddingEnabled = true
+    workerEmbeddingDisabledReason = nil
+    lastWorkerEmbeddedAt = nil
+    do {
+      try await workerEmbeddingModel.load()
+      AppLogger.log(.speakerEmbeddingModel, "AWS speaker embedding worker configured endpoint=\(endpoint)")
+    } catch {
+      workerEmbeddingEnabled = false
+      workerEmbeddingDisabledReason = "loadFailed"
+      AppLogger.log(.speakerEmbeddingModel, "AWS speaker embedding worker disabled after load failure: \(error.localizedDescription)")
+    }
+  }
+
+  #if DEBUG
+  func configureWorkerEmbeddingForTesting(_ model: SpeakerEmbeddingModel) async {
+    workerEmbeddingModel = model
+    workerEmbeddingEnabled = true
+    workerEmbeddingDisabledReason = nil
+    lastWorkerEmbeddedAt = nil
+    try? await workerEmbeddingModel.load()
+  }
+  #endif
+
+  func disableWorkerEmbedding(reason: String) {
+    workerEmbeddingEnabled = false
+    workerEmbeddingDisabledReason = reason
+    workerEmbeddingModel = MissingSpeakerEmbeddingModel()
+    lastWorkerEmbeddedAt = nil
+    let action = reason.hasPrefix("streamStop-") ? "stopped" : "disabled"
+    AppLogger.log(.speakerEmbeddingModel, "AWS speaker embedding worker \(action) reason=\(reason)")
+  }
+
+  func markWorkerEmbeddingStarting() {
+    workerEmbeddingEnabled = false
+    workerEmbeddingDisabledReason = "starting"
+    workerEmbeddingModel = MissingSpeakerEmbeddingModel()
+    lastWorkerEmbeddedAt = nil
+    AppLogger.log(.speakerEmbeddingModel, "AWS speaker embedding worker starting")
   }
 
   // MARK: - Main entry point
@@ -275,7 +357,7 @@ actor SpeakerIdentityPipeline {
     if rms > diagnosticPeakRMS { diagnosticPeakRMS = rms }
 
     if diagnosticBufferCount % 200 == 0 {
-      AppLogger.log(.speakerVAD, "pipeline alive buffers=\(diagnosticBufferCount) speechSec=\(String(format: "%.1f", speechBufferSeconds)) peakRMS=\(String(format: "%.5f", diagnosticPeakRMS)) threshold=\(SpeakerIdentityConfig.vadEnergyThresholdRMS) format=\(buffer.format.sampleRate)Hz ch=\(buffer.format.channelCount)")
+      AppLogger.log(.speakerVAD, "pipeline alive buffers=\(diagnosticBufferCount) speechSec=\(String(format: "%.1f", Double(speechBufferSeconds))) peakRMS=\(String(format: "%.5f", Double(diagnosticPeakRMS))) threshold=\(SpeakerIdentityConfig.vadEnergyThresholdRMS) format=\(buffer.format.sampleRate)Hz ch=\(buffer.format.channelCount)")
       diagnosticPeakRMS = 0
     }
     diagnosticBufferCount += 1
@@ -301,7 +383,7 @@ actor SpeakerIdentityPipeline {
       }
       if speechBuffer.isEmpty {
         let rms = samples.isEmpty ? 0 : sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count))
-        AppLogger.log(.speakerVAD, "speech started rms=\(String(format: "%.4f", rms))")
+        AppLogger.log(.speakerVAD, "speech started rms=\(String(format: "%.4f", Double(rms)))")
       }
       lastSpeechAt = now
       appendToSpeechBuffer(samples)
@@ -474,7 +556,7 @@ actor SpeakerIdentityPipeline {
     guard accepted.count >= SpeakerIdentityConfig.wearerVoiceMinAcceptedWindows else {
       let bestConsistency = scored.map(\.similarity).reduce(0, +) / Float(max(scored.count, 1))
       return .failure(
-        String(format: "My voice recording is inconsistent (%.2f). Re-record in a quieter room.", bestConsistency),
+        String(format: "My voice recording is inconsistent (%.2f). Re-record in a quieter room.", Double(bestConsistency)),
         acceptedWindowCount: accepted.count,
         rejectedWindowCount: rejectedCount,
         consistencyScore: bestConsistency
@@ -489,7 +571,7 @@ actor SpeakerIdentityPipeline {
       .reduce(0, +) / Float(max(accepted.count, 1))
     guard consistency >= SpeakerIdentityConfig.wearerVoiceMinConsistency else {
       return .failure(
-        String(format: "My voice recording is not stable enough (%.2f). Re-record with steady speech.", consistency),
+        String(format: "My voice recording is not stable enough (%.2f). Re-record with steady speech.", Double(consistency)),
         acceptedWindowCount: accepted.count,
         rejectedWindowCount: rejectedCount,
         consistencyScore: consistency
@@ -515,6 +597,7 @@ actor SpeakerIdentityPipeline {
       modelName: finalCentroid.modelName,
       modelVersion: finalCentroid.modelVersion,
       preprocessingVersion: finalCentroid.preprocessingVersion,
+      embeddingRuntime: finalCentroid.embeddingRuntime,
       updatedAt: now
     )
     let maxPreviewSamples = Int(SpeakerIdentityConfig.maxSpeechBufferSeconds * SpeakerIdentityConfig.targetSampleRate)
@@ -535,7 +618,8 @@ actor SpeakerIdentityPipeline {
             embedding.dimension == finalCentroid.dimension,
             embedding.modelName == finalCentroid.modelName,
             embedding.modelVersion == finalCentroid.modelVersion,
-            embedding.preprocessingVersion == finalCentroid.preprocessingVersion else {
+            embedding.preprocessingVersion == finalCentroid.preprocessingVersion,
+            embedding.embeddingRuntime == finalCentroid.embeddingRuntime else {
         return false
       }
       return cosineSimilarity(embedding.vector, finalCentroid.vector) >= SpeakerIdentityConfig.wearerVoiceMatchThreshold
@@ -553,7 +637,7 @@ actor SpeakerIdentityPipeline {
 
     AppLogger.log(
       .speakerIdentity,
-      "Saved wearer voice profile acceptedWindows=\(accepted.count) rejectedWindows=\(rejectedCount) consistency=\(String(format: "%.3f", consistency)) seconds=\(String(format: "%.1f", seconds))"
+      "Saved wearer voice profile acceptedWindows=\(accepted.count) rejectedWindows=\(rejectedCount) consistency=\(String(format: "%.3f", Double(consistency))) seconds=\(String(format: "%.1f", Double(seconds)))"
     )
     return .success(
       acceptedWindowCount: accepted.count,
@@ -564,7 +648,7 @@ actor SpeakerIdentityPipeline {
 
   func enroll(name: String, personId: UUID) async {
     guard speechBufferSeconds >= SpeakerIdentityConfig.minSpeechSecondsForEmbedding else {
-      AppLogger.log(.speakerIdentity, "Enrollment skipped: insufficient speech \(String(format: "%.1f", speechBufferSeconds))s < \(SpeakerIdentityConfig.minSpeechSecondsForEmbedding)s")
+      AppLogger.log(.speakerIdentity, "Enrollment skipped: insufficient speech \(String(format: "%.1f", Double(speechBufferSeconds)))s < \(SpeakerIdentityConfig.minSpeechSecondsForEmbedding)s")
       return
     }
     guard let embedding = await extractEmbedding() else { return }
@@ -579,26 +663,200 @@ actor SpeakerIdentityPipeline {
     saveToDisk()
   }
 
-  // Enrolls a speaker from raw WAV audio data downloaded from the cloud diarization clip.
-  func enrollFromAudioData(_ data: Data, personId: UUID, name: String) async {
-    // Decode WAV → float samples and fill speechBuffer so extractEmbedding() can run.
+  // Enrolls a speaker from a clean single-speaker diarization preview clip.
+  // AWS is the canonical path for dictionary voice identity; local CoreML is only
+  // used when explicitly allowed for development/offline fallback.
+  func enrollFromAudioData(
+    _ data: Data,
+    personId: UUID,
+    name: String,
+    preferAWS: Bool = true,
+    allowLocalFallback: Bool = false
+  ) async -> SpeakerEnrollmentSaveResult {
     let samples = Self.floatSamples(fromWAV: data)
     guard samples.count >= SpeakerIdentityConfig.embeddingWindowSamples else {
       AppLogger.log(.speakerIdentity, "enrollFromAudioData: clip too short (\(samples.count) samples)")
-      return
+      AppLogger.log(
+        .speakerEnrollment,
+        "diarized clip enrollment rejected reason=clipTooShort samples=\(samples.count) required=\(SpeakerIdentityConfig.embeddingWindowSamples)"
+      )
+      return .failure("Voice clip is too short for enrollment.", personId: personId)
     }
-    let prev = speechBuffer
-    speechBuffer = samples
-    guard let embedding = await extractEmbedding() else {
-      speechBuffer = prev
-      return
+    AppLogger.log(
+      .speakerEnrollment,
+      "diarized clip enrollment embedding start personId=\(personId.uuidString) samples=\(samples.count) seconds=\(String(format: "%.2f", Double(samples.count) / SpeakerIdentityConfig.targetSampleRate)) preferAWS=\(preferAWS) allowLocalFallback=\(allowLocalFallback)"
+    )
+    let embedding: VoiceEmbedding?
+    if preferAWS {
+      embedding = await extractEmbeddingFromDiarizedClip(
+        samples: samples,
+        personId: personId,
+        allowLocalFallback: allowLocalFallback
+      )
+    } else {
+      embedding = await extractEmbedding(fromSamples: samples, using: iPhoneEmbeddingModel, label: "DiarizedLocalClip")
     }
-    speechBuffer = prev
+    guard let embedding else {
+      // No usable voice embedding yet (AWS worker warming/unavailable and local
+      // fallback not permitted). Persist the clip as an explicitly PENDING
+      // enrollment + a playable preview, and retry automatically once the
+      // worker is reachable. We do NOT report success — the speaker is not
+      // recognizable until the embedding lands.
+      if preferAWS {
+        let maxPreviewSamples = Int(SpeakerIdentityConfig.maxSpeechBufferSeconds * SpeakerIdentityConfig.targetSampleRate)
+        enrolledPreviewSamples[personId] = Array(samples.suffix(maxPreviewSamples))
+        let existingAttempts = pendingDiarizedEnrollments[personId]?.attempts ?? 0
+        pendingDiarizedEnrollments[personId] = PendingDiarizedEnrollment(
+          personId: personId,
+          name: name,
+          samples: samples,
+          createdAt: pendingDiarizedEnrollments[personId]?.createdAt ?? Date(),
+          attempts: existingAttempts + 1
+        )
+        _ = saveToDisk()
+        AppLogger.log(
+          .speakerEnrollment,
+          "diarized clip enrollment pending reason=embeddingUnavailable personId=\(personId.uuidString) workerEnabled=\(workerEmbeddingEnabled) workerReason=\(workerEmbeddingDisabledReason ?? "none") attempts=\(existingAttempts + 1) — preview saved, voice embedding queued for retry"
+        )
+        return .pendingEmbedding("Voice preview saved. Speaker recognition will finish when the voice service is reachable.", personId: personId)
+      }
+      AppLogger.log(
+        .speakerEnrollment,
+        "diarized clip enrollment rejected reason=embeddingUnavailable personId=\(personId.uuidString) preferAWS=\(preferAWS) allowLocalFallback=\(allowLocalFallback)"
+      )
+      return .failure("Could not create a voice embedding for this clip.", personId: personId)
+    }
+    return finalizeDiarizedEnrollment(embedding: embedding, samples: samples, personId: personId, name: name)
+  }
+
+  // Commits a successfully-embedded diarized clip into the enrolled speaker set.
+  // Shared by the live enroll path and the pending-enrollment retry path.
+  private func finalizeDiarizedEnrollment(
+    embedding: VoiceEmbedding,
+    samples: [Float],
+    personId: UUID,
+    name: String
+  ) -> SpeakerEnrollmentSaveResult {
     let record = SpeakerEmbeddingRecord(embedding: embedding, personId: personId)
     enrolledRecords.append(record)
     updateCentroid(for: personId, name: name)
-    saveToDisk()
-    AppLogger.log(.speakerIdentity, "enrollFromAudioData: enrolled personId=\(personId) name=\(name) dim=\(embedding.dimension)")
+    guard enrolledSpeakers.contains(where: {
+      $0.personId == personId && isSameEmbeddingSpace($0, embedding)
+    }) else {
+      enrolledRecords.removeAll { $0.id == record.id }
+      AppLogger.log(
+        .speakerEnrollment,
+        "diarized clip enrollment rejected reason=centroidMissing personId=\(personId.uuidString) runtime=\(embedding.embeddingRuntime) dim=\(embedding.dimension)"
+      )
+      return .failure("Voice enrollment failed before creating a speaker profile.", personId: personId)
+    }
+    enrolledPreviewSamples[personId] = samples
+    // A real embedding now exists — clear any pending marker for this person.
+    pendingDiarizedEnrollments.removeValue(forKey: personId)
+    guard saveToDisk() else {
+      enrolledRecords.removeAll { $0.id == record.id }
+      updateCentroid(for: personId, name: name)
+      AppLogger.log(.speakerEnrollment, "diarized clip enrollment rejected reason=saveFailed personId=\(personId.uuidString)")
+      return .failure("Voice enrollment could not be saved to disk.", personId: personId)
+    }
+    AppLogger.log(.speakerIdentity, "enrollFromAudioData: enrolled personId=\(personId) name=\(name) dim=\(embedding.dimension) runtime=\(embedding.embeddingRuntime)")
+    AppLogger.log(
+      .speakerEnrollment,
+      "diarized clip enrollment saved personId=\(personId.uuidString) name=\"\(name)\" dim=\(embedding.dimension) runtime=\(embedding.embeddingRuntime) previewSamples=\(samples.count)"
+    )
+    return .success(personId: personId, name: name, removedDuplicateClipCount: 0)
+  }
+
+  /// Number of diarized enrollments still waiting for an AWS voice embedding.
+  func pendingDiarizedEnrollmentCount() -> Int { pendingDiarizedEnrollments.count }
+
+  func pendingDiarizedEnrollmentPersonIds() -> [UUID] { Array(pendingDiarizedEnrollments.keys) }
+
+  /// Re-attempts every pending diarized enrollment against the AWS worker.
+  /// Called when the worker becomes reachable. Returns the personIds that
+  /// successfully gained a usable voice embedding.
+  @discardableResult
+  func retryPendingDiarizedEnrollments() async -> [UUID] {
+    guard !pendingDiarizedEnrollments.isEmpty else { return [] }
+    guard workerEmbeddingEnabled, !(workerEmbeddingModel is MissingSpeakerEmbeddingModel) else {
+      AppLogger.log(.speakerEnrollment, "diarized pending retry skipped count=\(pendingDiarizedEnrollments.count) reason=workerUnavailable workerReason=\(workerEmbeddingDisabledReason ?? "none")")
+      return []
+    }
+    AppLogger.log(.speakerEnrollment, "diarized pending retry start count=\(pendingDiarizedEnrollments.count)")
+    var completed: [UUID] = []
+    for pending in pendingDiarizedEnrollments.values {
+      guard let embedding = await extractEmbedding(
+        fromSamples: pending.samples,
+        using: workerEmbeddingModel,
+        label: "AWSDiarizedClipRetry"
+      ) else {
+        var bumped = pending
+        bumped.attempts += 1
+        pendingDiarizedEnrollments[pending.personId] = bumped
+        AppLogger.log(.speakerEnrollment, "diarized pending retry deferred personId=\(pending.personId.uuidString) attempts=\(bumped.attempts) reason=embeddingStillUnavailable")
+        continue
+      }
+      let result = finalizeDiarizedEnrollment(
+        embedding: embedding,
+        samples: pending.samples,
+        personId: pending.personId,
+        name: pending.name
+      )
+      if result.saved {
+        completed.append(pending.personId)
+        AppLogger.log(.speakerEnrollment, "diarized pending retry completed personId=\(pending.personId.uuidString) name=\"\(pending.name)\"")
+      }
+    }
+    _ = saveToDisk()
+    AppLogger.log(.speakerEnrollment, "diarized pending retry done completed=\(completed.count) remaining=\(pendingDiarizedEnrollments.count)")
+    return completed
+  }
+
+  func saveDiarizedVoicePreviewOnly(
+    _ data: Data,
+    personId: UUID,
+    name: String
+  ) -> SpeakerEnrollmentSaveResult {
+    let samples = Self.floatSamples(fromWAV: data)
+    guard !samples.isEmpty else {
+      AppLogger.log(.speakerEnrollment, "diarized preview-only save rejected reason=emptyClip personId=\(personId.uuidString)")
+      return .failure("Voice preview clip is empty.", personId: personId)
+    }
+    let maxPreviewSamples = Int(SpeakerIdentityConfig.maxSpeechBufferSeconds * SpeakerIdentityConfig.targetSampleRate)
+    enrolledPreviewSamples[personId] = Array(samples.suffix(maxPreviewSamples))
+    guard saveToDisk() else {
+      AppLogger.log(.speakerEnrollment, "diarized preview-only save rejected reason=saveFailed personId=\(personId.uuidString)")
+      return .failure("Voice preview could not be saved to disk.", personId: personId)
+    }
+    AppLogger.log(
+      .speakerEnrollment,
+      "diarized preview-only saved personId=\(personId.uuidString) name=\"\(name)\" previewSamples=\(samples.count)"
+    )
+    return SpeakerEnrollmentSaveResult(
+      saved: true,
+      message: "Saved voice preview: \(name)",
+      personId: personId,
+      removedDuplicateClipCount: 0,
+      pending: false
+    )
+  }
+
+  private func extractEmbeddingFromDiarizedClip(
+    samples: [Float],
+    personId: UUID,
+    allowLocalFallback: Bool
+  ) async -> VoiceEmbedding? {
+    if workerEmbeddingEnabled, !(workerEmbeddingModel is MissingSpeakerEmbeddingModel) {
+      if let embedding = await extractEmbedding(fromSamples: samples, using: workerEmbeddingModel, label: "AWSDiarizedClip") {
+        return embedding
+      }
+    }
+    AppLogger.log(
+      .speakerIdentity,
+      "AWS diarized speaker enrollment unavailable personId=\(personId.uuidString) workerEnabled=\(workerEmbeddingEnabled) reason=\(workerEmbeddingDisabledReason ?? "none") allowLocalFallback=\(allowLocalFallback)"
+    )
+    guard allowLocalFallback else { return nil }
+    return await extractEmbedding(fromSamples: samples, using: iPhoneEmbeddingModel, label: "DiarizedLocalFallback")
   }
 
   private static func floatSamples(fromWAV data: Data) -> [Float] {
@@ -639,14 +897,20 @@ actor SpeakerIdentityPipeline {
       AppLogger.log(.speakerIdentity, "Voice clip save skipped: embedding unavailable id=\(id.uuidString)")
       return .failure("Could not create a voice embedding for this clip.", personId: personId)
     }
-    guard isCompatible(
+    guard isPersistedEmbeddingValid(vector: embedding.vector, dimension: embedding.dimension, embeddingRuntime: embedding.embeddingRuntime) else {
+      AppLogger.log(.speakerIdentity, "Voice clip save skipped: invalid embedding id=\(id.uuidString) model=\(embedding.modelName) version=\(embedding.modelVersion) preprocessing=\(embedding.preprocessingVersion) runtime=\(embedding.embeddingRuntime) dim=\(embedding.dimension)")
+      return .failure("Voice embedding is invalid. Re-capture this voice.", personId: personId)
+    }
+    guard isCompatibleWithModel(
       modelName: embedding.modelName,
       modelVersion: embedding.modelVersion,
       preprocessingVersion: embedding.preprocessingVersion,
-      dimension: embedding.dimension
+      embeddingRuntime: embedding.embeddingRuntime,
+      dimension: embedding.dimension,
+      model: iPhoneEmbeddingModel
     ) else {
-      AppLogger.log(.speakerIdentity, "Voice clip save skipped: incompatible embedding id=\(id.uuidString) model=\(embedding.modelName) version=\(embedding.modelVersion) preprocessing=\(embedding.preprocessingVersion) dim=\(embedding.dimension)")
-      return .failure("Voice embedding is incompatible with the current model. Re-capture this voice.", personId: personId)
+      AppLogger.log(.speakerIdentity, "Voice clip save skipped: incompatible local embedding id=\(id.uuidString) model=\(embedding.modelName) version=\(embedding.modelVersion) preprocessing=\(embedding.preprocessingVersion) runtime=\(embedding.embeddingRuntime) dim=\(embedding.dimension)")
+      return .failure("Voice embedding is incompatible with the iPhone local estimate model. Re-capture this voice.", personId: personId)
     }
     let previousSpeakers = enrolledSpeakers
     let previousRecords = enrolledRecords
@@ -654,7 +918,7 @@ actor SpeakerIdentityPipeline {
     let record = SpeakerEmbeddingRecord(embedding: embedding, personId: personId)
     enrolledRecords.append(record)
     updateCentroid(for: personId, name: name)
-    guard enrolledSpeakers.contains(where: { $0.personId == personId }) else {
+    guard enrolledSpeakers.contains(where: { $0.personId == personId && isSameEmbeddingSpace($0, embedding) }) else {
       enrolledRecords = previousRecords
       AppLogger.log(.speakerIdentity, "Voice clip save skipped: centroid was not created personId=\(personId.uuidString)")
       return .failure("Voice enrollment failed before creating a speaker profile.", personId: personId)
@@ -675,7 +939,8 @@ actor SpeakerIdentityPipeline {
             queuedEmbedding.dimension == embedding.dimension,
             queuedEmbedding.modelName == embedding.modelName,
             queuedEmbedding.modelVersion == embedding.modelVersion,
-            queuedEmbedding.preprocessingVersion == embedding.preprocessingVersion else {
+            queuedEmbedding.preprocessingVersion == embedding.preprocessingVersion,
+            queuedEmbedding.embeddingRuntime == embedding.embeddingRuntime else {
         return false
       }
       return cosineSimilarity(embedding.vector, queuedEmbedding.vector) >= SpeakerIdentityConfig.capturedVoiceSameSpeakerThreshold
@@ -742,8 +1007,21 @@ actor SpeakerIdentityPipeline {
     enrolledSpeakers.contains { $0.personId == personId }
   }
 
+  func enrollmentRuntimeSignatures(for personId: UUID) -> Set<String> {
+    Set(enrolledSpeakers
+      .filter { $0.personId == personId }
+      .map { normalizedRuntime($0.embeddingRuntime) })
+  }
+
+  func hasCompatibleSpeakerEnrollment(for personId: UUID, runtime: String) -> Bool {
+    enrolledSpeakers.contains { $0.personId == personId && normalizedRuntime($0.embeddingRuntime) == runtime }
+  }
+
   func sampleCountForPerson(_ personId: UUID) -> Int {
-    enrolledSpeakers.first { $0.personId == personId }?.sampleCount ?? 0
+    enrolledSpeakers
+      .filter { $0.personId == personId }
+      .map(\.sampleCount)
+      .reduce(0, +)
   }
 
   var currentSpeechBufferSeconds: Double { speechBufferSeconds }
@@ -765,6 +1043,7 @@ actor SpeakerIdentityPipeline {
     lastCapturedVoiceClipAt = nil
     lastSpeechAt = nil
     lastEmbeddedAt = nil
+    lastWorkerEmbeddedAt = nil
     embeddingInFlight = false
     currentSpeechStartedAt = nil
     openDiarizationSegmentId = nil
@@ -796,17 +1075,35 @@ actor SpeakerIdentityPipeline {
         matchResult: nil
       )
     }
-	    embeddingInFlight = true
-	    lastEmbeddedAt = now
-	    defer { embeddingInFlight = false }
-	
-	    let speechSamplesSnapshot = speechBuffer
-	    let iPhoneDiagnostic = await similarityDiagnostic(
-	      using: iPhoneEmbeddingModel,
-	      label: "iPhone",
-	      samples: speechSamplesSnapshot
-	    )
-	    let workerDiagnostic: SpeakerSimilarityDiagnostic? = nil
+    embeddingInFlight = true
+    lastEmbeddedAt = now
+    defer { embeddingInFlight = false }
+
+    let speechSamplesSnapshot = speechBuffer
+    let iPhoneDiagnostic = await similarityDiagnostic(
+      using: iPhoneEmbeddingModel,
+      label: "iPhone local estimate",
+      samples: speechSamplesSnapshot
+    )
+    let workerDiagnostic: SpeakerSimilarityDiagnostic?
+    switch workerEmbeddingDecision(now: now, finalSegment: finalSegment) {
+    case .run:
+      workerDiagnostic = await similarityDiagnostic(
+        using: workerEmbeddingModel,
+        label: "AWS canonical",
+        samples: speechSamplesSnapshot
+      )
+      if workerDiagnostic?.embedding != nil {
+        lastWorkerEmbeddedAt = now
+      }
+    case .skip(let reason):
+      workerDiagnostic = SpeakerSimilarityDiagnostic(
+        label: "AWS canonical",
+        matchResult: nil,
+        error: reason,
+        embedding: nil
+      )
+    }
     let wearerMatch = iPhoneDiagnostic.embedding.map(matchWearerEmbedding)
     if let wearerEmbedding = iPhoneDiagnostic.embedding,
        let wearerMatch,
@@ -835,11 +1132,11 @@ actor SpeakerIdentityPipeline {
       )
       AppLogger.log(
         .speakerMatch,
-        "wearerVoiceMatch similarity=\(String(format: "%.3f", wearerMatch.bestSimilarity)) suppressedCapturedVoice=true"
+        "wearerVoiceMatch similarity=\(String(format: "%.3f", Double(wearerMatch.bestSimilarity))) suppressedCapturedVoice=true"
       )
       AppLogger.log(
         .speakerMatch,
-        "diarization segment=\(diarizationSegment.id.uuidString) speaker=\(diarizationSegment.speakerName) confidence=\(String(format: "%.3f", diarizationSegment.confidence)) final=\(finalSegment) start=\(diarizationSegment.startAt.timeIntervalSince1970) end=\(diarizationSegment.endAt.timeIntervalSince1970)"
+        "diarization segment=\(diarizationSegment.id.uuidString) speaker=\(diarizationSegment.speakerName) confidence=\(String(format: "%.3f", Double(diarizationSegment.confidence))) final=\(finalSegment) start=\(diarizationSegment.startAt.timeIntervalSince1970) end=\(diarizationSegment.endAt.timeIntervalSince1970)"
       )
       return SpeakerProcessingResult(
         activeIdentity: wearerState,
@@ -852,8 +1149,9 @@ actor SpeakerIdentityPipeline {
         wearerSimilarity: wearerMatch
       )
     }
-    let primaryMatch = iPhoneDiagnostic.matchResult
-    let diarizationSegment = iPhoneDiagnostic.embedding.flatMap { embedding in
+    let primaryDiagnostic = preferredIdentityDiagnostic(local: iPhoneDiagnostic, worker: workerDiagnostic)
+    let primaryMatch = primaryDiagnostic.matchResult
+    let diarizationSegment = primaryDiagnostic.embedding.flatMap { embedding in
       upsertDiarizationSegment(
         embedding: embedding,
         match: primaryMatch,
@@ -888,17 +1186,17 @@ actor SpeakerIdentityPipeline {
 
     AppLogger.log(
       .speakerMatch,
-      "decision=\(match.decision) similarity=\(String(format: "%.3f", match.bestSimilarity)) " +
+      "decision=\(match.decision) similarity=\(String(format: "%.3f", Double(match.bestSimilarity))) " +
       "personId=\(match.bestPersonId?.uuidString ?? "nil") state=\(newState.phase.rawValue)"
     )
     AppLogger.log(
       .speakerMatch,
-      "dualSimilarity iPhone=\(iPhoneDiagnostic.statusText) worker=disabled"
+      "dualSimilarity iPhone=\(iPhoneDiagnostic.statusText) worker=\(workerDiagnostic?.statusText ?? "AWS canonical: unavailable")"
     )
     if let diarizationSegment {
       AppLogger.log(
         .speakerMatch,
-        "diarization segment=\(diarizationSegment.id.uuidString) speaker=\(diarizationSegment.speakerName) confidence=\(String(format: "%.3f", diarizationSegment.confidence)) final=\(finalSegment) start=\(diarizationSegment.startAt.timeIntervalSince1970) end=\(diarizationSegment.endAt.timeIntervalSince1970)"
+        "diarization segment=\(diarizationSegment.id.uuidString) speaker=\(diarizationSegment.speakerName) confidence=\(String(format: "%.3f", Double(diarizationSegment.confidence))) final=\(finalSegment) start=\(diarizationSegment.startAt.timeIntervalSince1970) end=\(diarizationSegment.endAt.timeIntervalSince1970)"
       )
     }
 
@@ -912,6 +1210,41 @@ actor SpeakerIdentityPipeline {
       workerSimilarity: workerDiagnostic,
       wearerSimilarity: wearerMatch
     )
+  }
+
+  private func workerEmbeddingDecision(now: Date, finalSegment: Bool) -> WorkerEmbeddingDecision {
+    guard workerEmbeddingEnabled else { return .skip(workerEmbeddingDisabledReason ?? "disabled") }
+    guard !(workerEmbeddingModel is MissingSpeakerEmbeddingModel) else { return .skip("not configured") }
+    guard speechBufferSeconds >= SpeakerIdentityConfig.minSpeechSecondsForEmbedding else {
+      return .skip("insufficient speech")
+    }
+    if finalSegment {
+      return .run
+    }
+    guard let lastWorkerEmbeddedAt else { return .run }
+    let elapsed = now.timeIntervalSince(lastWorkerEmbeddedAt)
+    let remaining = SpeakerIdentityConfig.cloudEmbeddingMinIntervalSeconds - elapsed
+    if remaining > 0 {
+      return .skip("waiting \(String(format: "%.1f", Double(remaining)))s")
+    }
+    return .run
+  }
+
+  private func preferredIdentityDiagnostic(
+    local: SpeakerSimilarityDiagnostic,
+    worker: SpeakerSimilarityDiagnostic?
+  ) -> SpeakerSimilarityDiagnostic {
+    guard let worker, let workerMatch = worker.matchResult else { return local }
+    guard let localMatch = local.matchResult else { return worker }
+
+    if workerMatch.decision == .known {
+      return worker
+    }
+    if localMatch.decision != .known,
+       workerMatch.bestSimilarity > localMatch.bestSimilarity {
+      return worker
+    }
+    return local
   }
 
   private func upsertDiarizationSegment(
@@ -936,7 +1269,7 @@ actor SpeakerIdentityPipeline {
       "diarization",
       "speakerLabel=\(safeEvidenceValue(assignment.cluster.label))",
       "cluster=\(assignment.cluster.id.uuidString)",
-      "voice=\(String(format: "%.3f", assignment.confidence))",
+      "voice=\(String(format: "%.3f", Double(assignment.confidence)))",
       "known=\(assignment.cluster.personId != nil)",
       "final=\(finalSegment)"
     ].joined(separator: ";")
@@ -978,7 +1311,7 @@ actor SpeakerIdentityPipeline {
       personId: nil,
       displayName: "Me",
       confidence: similarity,
-      source: "wearerVoice;voice=\(String(format: "%.3f", similarity));final=\(finalSegment)"
+      source: "wearerVoice;voice=\(String(format: "%.3f", Double(similarity)));final=\(finalSegment)"
     )
     if let index = diarizationSegments.firstIndex(where: { $0.id == segmentId }) {
       diarizationSegments[index] = segment
@@ -1181,13 +1514,15 @@ actor SpeakerIdentityPipeline {
     }
 
     do {
+      let startedAt = Date()
       let embedding = try await extractEmbedding(from: windows, using: model, label: label)
+      let latencyMS = Date().timeIntervalSince(startedAt) * 1_000
       let match = matchEmbedding(embedding)
       AppLogger.log(
         .speakerMatch,
-        "\(label) cosineSimilarity=\(String(format: "%.3f", match.bestSimilarity)) decision=\(match.decision) personId=\(match.bestPersonId?.uuidString ?? "nil") reason=\(match.reason ?? "none")"
+        "\(label) cosineSimilarity=\(String(format: "%.3f", Double(match.bestSimilarity))) decision=\(match.decision) personId=\(match.bestPersonId?.uuidString ?? "nil") reason=\(match.reason ?? "none")"
       )
-      return SpeakerSimilarityDiagnostic(label: label, matchResult: match, error: nil, embedding: embedding)
+      return SpeakerSimilarityDiagnostic(label: label, matchResult: match, error: nil, embedding: embedding, latencyMS: latencyMS)
     } catch {
       let message = error.localizedDescription
       AppLogger.log(.speakerEmbedding, "\(label) embedding failed: \(message)")
@@ -1229,7 +1564,7 @@ actor SpeakerIdentityPipeline {
        wearerMatch.decision == .known {
       AppLogger.log(
         .speakerIdentity,
-        "Captured voice skipped because it matches wearer profile similarity=\(String(format: "%.3f", wearerMatch.bestSimilarity))"
+        "Captured voice skipped because it matches wearer profile similarity=\(String(format: "%.3f", Double(wearerMatch.bestSimilarity)))"
       )
       return
     }
@@ -1349,7 +1684,7 @@ actor SpeakerIdentityPipeline {
     }
     AppLogger.log(
       .speakerIdentity,
-      "Merged captured voice clip id=\(capturedVoiceClips[index].id.uuidString) incomingSeconds=\(String(format: "%.1f", incomingSeconds)) keptSeconds=\(String(format: "%.1f", max(incomingSeconds, existingSeconds))) similarity=\(sameSpeakerSimilarity.map { String(format: "%.3f", $0) } ?? "known") recognized=\(capturedVoiceClips[index].recognizedPersonName ?? "none") merged=\(capturedVoiceClips[index].mergedSegmentCount)"
+      "Merged captured voice clip id=\(capturedVoiceClips[index].id.uuidString) incomingSeconds=\(String(format: "%.1f", Double(incomingSeconds))) keptSeconds=\(String(format: "%.1f", Double(max(incomingSeconds, existingSeconds)))) similarity=\(sameSpeakerSimilarity.map { String(format: "%.3f", Double($0)) } ?? "known") recognized=\(capturedVoiceClips[index].recognizedPersonName ?? "none") merged=\(capturedVoiceClips[index].mergedSegmentCount)"
     )
   }
 
@@ -1452,6 +1787,7 @@ actor SpeakerIdentityPipeline {
         && $0.modelName == first.modelName
         && $0.modelVersion == first.modelVersion
         && $0.preprocessingVersion == first.preprocessingVersion
+        && $0.embeddingRuntime == first.embeddingRuntime
         && $0.vector.count == dim
         && $0.vector.allSatisfy(\.isFinite)
     }
@@ -1470,31 +1806,24 @@ actor SpeakerIdentityPipeline {
       vector: averaged,
       modelName: first.modelName,
       modelVersion: first.modelVersion,
-      preprocessingVersion: first.preprocessingVersion
+      preprocessingVersion: first.preprocessingVersion,
+      embeddingRuntime: first.embeddingRuntime
     )
   }
 
   private func matchEmbedding(_ embedding: VoiceEmbedding) -> SpeakerMatchResult {
     let incompatible = enrolledSpeakers.filter {
-      !($0.vectorDimension == embedding.dimension
-        && $0.modelName == embedding.modelName
-        && $0.modelVersion == embedding.modelVersion
-        && $0.preprocessingVersion == embedding.preprocessingVersion)
+      !isSameEmbeddingSpace($0, embedding)
     }
     if !incompatible.isEmpty {
       let sample = incompatible[0]
       AppLogger.log(
         .speakerMatch,
-        "incompatibleEnrollmentCount=\(incompatible.count) liveModel=\(embedding.modelName) liveVersion=\(embedding.modelVersion) livePreprocessing=\(embedding.preprocessingVersion) liveDim=\(embedding.dimension) storedModel=\(sample.modelName) storedVersion=\(sample.modelVersion) storedPreprocessing=\(sample.preprocessingVersion) storedDim=\(sample.vectorDimension)"
+        "incompatibleEnrollmentCount=\(incompatible.count) liveModel=\(embedding.modelName) liveVersion=\(embedding.modelVersion) livePreprocessing=\(embedding.preprocessingVersion) liveRuntime=\(embedding.embeddingRuntime) liveDim=\(embedding.dimension) storedModel=\(sample.modelName) storedVersion=\(sample.modelVersion) storedPreprocessing=\(sample.preprocessingVersion) storedRuntime=\(normalizedRuntime(sample.embeddingRuntime)) storedDim=\(sample.vectorDimension)"
       )
     }
     let candidates = enrolledSpeakers
-      .filter {
-        $0.vectorDimension == embedding.dimension
-          && $0.modelName == embedding.modelName
-          && $0.modelVersion == embedding.modelVersion
-          && $0.preprocessingVersion == embedding.preprocessingVersion
-      }
+      .filter { isSameEmbeddingSpace($0, embedding) }
       .map { ($0, cosineSimilarity(embedding.vector, $0.averagedVector)) }
       .sorted { $0.1 > $1.1 }
 
@@ -1502,7 +1831,7 @@ actor SpeakerIdentityPipeline {
       let reason = enrolledSpeakers.isEmpty ? "noEnrollment" : "noCompatibleEnrollment"
       AppLogger.log(
         .speakerMatch,
-        "\(reason) liveModel=\(embedding.modelName) liveVersion=\(embedding.modelVersion) livePreprocessing=\(embedding.preprocessingVersion) liveDim=\(embedding.dimension) enrolled=\(enrolledSpeakers.count)"
+        "\(reason) liveModel=\(embedding.modelName) liveVersion=\(embedding.modelVersion) livePreprocessing=\(embedding.preprocessingVersion) liveRuntime=\(embedding.embeddingRuntime) liveDim=\(embedding.dimension) enrolled=\(enrolledSpeakers.count)"
       )
       return SpeakerMatchResult(
         bestPersonId: nil, bestSimilarity: 0, secondBestSimilarity: nil,
@@ -1530,12 +1859,7 @@ actor SpeakerIdentityPipeline {
   }
 
   private func matchWearerEmbedding(_ embedding: VoiceEmbedding) -> SpeakerMatchResult {
-    let candidates = wearerCentroidCandidates.filter {
-      $0.vectorDimension == embedding.dimension
-        && $0.modelName == embedding.modelName
-        && $0.modelVersion == embedding.modelVersion
-        && $0.preprocessingVersion == embedding.preprocessingVersion
-    }
+    let candidates = wearerCentroidCandidates.filter { isSameEmbeddingSpace($0, embedding) }
     guard let best = candidates
       .map({ ($0, cosineSimilarity(embedding.vector, $0.averagedVector)) })
       .max(by: { $0.1 < $1.1 }) else {
@@ -1567,14 +1891,7 @@ actor SpeakerIdentityPipeline {
 
   private var wearerCentroidCandidates: [SpeakerAveragedEmbedding] {
     ([wearerProfile].compactMap { $0 } + wearerAdditionalCentroids)
-      .filter {
-        isCompatible(
-          modelName: $0.modelName,
-          modelVersion: $0.modelVersion,
-          preprocessingVersion: $0.preprocessingVersion,
-          dimension: $0.vectorDimension
-        )
-      }
+      .filter { isPersistedEmbeddingValid(vector: $0.averagedVector, dimension: $0.vectorDimension, embeddingRuntime: $0.embeddingRuntime) }
   }
 
   private func updateWearerRecentCentroidIfHighConfidence(
@@ -1583,11 +1900,13 @@ actor SpeakerIdentityPipeline {
     now: Date
   ) {
     guard similarity >= SpeakerIdentityConfig.wearerVoiceAutoUpdateThreshold else { return }
-    guard isCompatible(
+    guard isCompatibleWithModel(
       modelName: embedding.modelName,
       modelVersion: embedding.modelVersion,
       preprocessingVersion: embedding.preprocessingVersion,
-      dimension: embedding.dimension
+      embeddingRuntime: embedding.embeddingRuntime,
+      dimension: embedding.dimension,
+      model: iPhoneEmbeddingModel
     ) else { return }
 
     if wearerAdditionalCentroids.isEmpty {
@@ -1601,6 +1920,7 @@ actor SpeakerIdentityPipeline {
         modelName: embedding.modelName,
         modelVersion: embedding.modelVersion,
         preprocessingVersion: embedding.preprocessingVersion,
+        embeddingRuntime: embedding.embeddingRuntime,
         updatedAt: now
       ))
     } else {
@@ -1614,35 +1934,48 @@ actor SpeakerIdentityPipeline {
     }
     wearerAdditionalCentroids = Array(wearerAdditionalCentroids.prefix(SpeakerIdentityConfig.wearerVoiceCentroidLimit - 1))
     saveToDisk()
-    AppLogger.log(.speakerIdentity, "Wearer recent centroid updated similarity=\(String(format: "%.3f", similarity)) centroids=\(wearerCentroidCandidates.count)")
+    AppLogger.log(.speakerIdentity, "Wearer recent centroid updated similarity=\(String(format: "%.3f", Double(similarity))) centroids=\(wearerCentroidCandidates.count)")
   }
 
   private func updateCentroid(for personId: UUID, name: String) {
-    let samples = enrolledRecords.filter {
+    let validSamples = enrolledRecords.filter {
       $0.personId == personId
-        && !$0.vector.isEmpty
-        && isCompatible(modelName: $0.modelName, modelVersion: $0.modelVersion, preprocessingVersion: $0.preprocessingVersion, dimension: $0.dimension)
+        && isPersistedEmbeddingValid(vector: $0.vector, dimension: $0.dimension, embeddingRuntime: $0.embeddingRuntime)
     }
-    guard !samples.isEmpty else { return }
-    let dim = samples[0].dimension
-    var sum = [Float](repeating: 0, count: dim)
-    for s in samples {
-      for i in 0..<dim { sum[i] += s.vector[i] }
-    }
-    let norm = sqrt(sum.reduce(0) { $0 + $1 * $1 })
-    let avg = norm > 1e-6 ? sum.map { $0 / norm } : sum
-    if let idx = enrolledSpeakers.firstIndex(where: { $0.personId == personId }) {
-      enrolledSpeakers[idx].name = name
-      enrolledSpeakers[idx].averagedVector = avg
-      enrolledSpeakers[idx].sampleCount = samples.count
-      enrolledSpeakers[idx].updatedAt = Date()
-    } else {
-      let first = samples[0]
-      enrolledSpeakers.append(SpeakerAveragedEmbedding(
-        id: UUID(), personId: personId, name: name, averagedVector: avg, vectorDimension: dim,
-        sampleCount: samples.count, modelName: first.modelName, modelVersion: first.modelVersion,
-        preprocessingVersion: first.preprocessingVersion, updatedAt: Date()
-      ))
+    let groupedSamples = Dictionary(grouping: validSamples, by: embeddingSpaceKey)
+    let validKeys = Set(groupedSamples.keys)
+    enrolledSpeakers.removeAll { $0.personId == personId && !validKeys.contains(embeddingSpaceKey($0)) }
+
+    for (_, samples) in groupedSamples {
+      guard let first = samples.first else { continue }
+      let dim = first.dimension
+      var sum = [Float](repeating: 0, count: dim)
+      for s in samples {
+        for i in 0..<dim { sum[i] += s.vector[i] }
+      }
+      let norm = sqrt(sum.reduce(0) { $0 + $1 * $1 })
+      guard norm > 1e-6, norm.isFinite else { continue }
+      let avg = sum.map { $0 / norm }
+      if let idx = enrolledSpeakers.firstIndex(where: { $0.personId == personId && isSameEmbeddingSpace($0, first) }) {
+        enrolledSpeakers[idx].name = name
+        enrolledSpeakers[idx].averagedVector = avg
+        enrolledSpeakers[idx].sampleCount = samples.count
+        enrolledSpeakers[idx].updatedAt = Date()
+      } else {
+        enrolledSpeakers.append(SpeakerAveragedEmbedding(
+          id: UUID(),
+          personId: personId,
+          name: name,
+          averagedVector: avg,
+          vectorDimension: dim,
+          sampleCount: samples.count,
+          modelName: first.modelName,
+          modelVersion: first.modelVersion,
+          preprocessingVersion: first.preprocessingVersion,
+          embeddingRuntime: normalizedRuntime(first.embeddingRuntime),
+          updatedAt: Date()
+        ))
+      }
     }
   }
 
@@ -1653,49 +1986,24 @@ actor SpeakerIdentityPipeline {
     let wearerRecordBefore = wearerRecords.count
     let wearerCentroidBefore = wearerAdditionalCentroids.count
     enrolledSpeakers.removeAll {
-      !isCompatible(
-        modelName: $0.modelName,
-        modelVersion: $0.modelVersion,
-        preprocessingVersion: $0.preprocessingVersion,
-        dimension: $0.vectorDimension
-      )
+      !isPersistedEmbeddingValid(vector: $0.averagedVector, dimension: $0.vectorDimension, embeddingRuntime: $0.embeddingRuntime)
     }
     enrolledRecords.removeAll {
-      !isCompatible(
-        modelName: $0.modelName,
-        modelVersion: $0.modelVersion,
-        preprocessingVersion: $0.preprocessingVersion,
-        dimension: $0.dimension
-      )
+      !isPersistedEmbeddingValid(vector: $0.vector, dimension: $0.dimension, embeddingRuntime: $0.embeddingRuntime)
     }
     let validPersonIds = Set(enrolledSpeakers.map(\.personId))
     enrolledPreviewSamples = enrolledPreviewSamples.filter { validPersonIds.contains($0.key) }
     if let profile = wearerProfile,
-       !isCompatible(
-        modelName: profile.modelName,
-        modelVersion: profile.modelVersion,
-        preprocessingVersion: profile.preprocessingVersion,
-        dimension: profile.vectorDimension
-       ) {
+       !isPersistedEmbeddingValid(vector: profile.averagedVector, dimension: profile.vectorDimension, embeddingRuntime: profile.embeddingRuntime) {
       wearerProfile = nil
       wearerPreviewSamples.removeAll()
       wearerLastConsistencyScore = nil
     }
     wearerRecords.removeAll {
-      !isCompatible(
-        modelName: $0.modelName,
-        modelVersion: $0.modelVersion,
-        preprocessingVersion: $0.preprocessingVersion,
-        dimension: $0.dimension
-      )
+      !isPersistedEmbeddingValid(vector: $0.vector, dimension: $0.dimension, embeddingRuntime: $0.embeddingRuntime)
     }
     wearerAdditionalCentroids.removeAll {
-      !isCompatible(
-        modelName: $0.modelName,
-        modelVersion: $0.modelVersion,
-        preprocessingVersion: $0.preprocessingVersion,
-        dimension: $0.vectorDimension
-      )
+      !isPersistedEmbeddingValid(vector: $0.averagedVector, dimension: $0.vectorDimension, embeddingRuntime: $0.embeddingRuntime)
     }
     let removedSpeakers = speakerBefore - enrolledSpeakers.count
     let removedRecords = recordBefore - enrolledRecords.count
@@ -1705,7 +2013,7 @@ actor SpeakerIdentityPipeline {
     if removedSpeakers > 0 || removedRecords > 0 || removedWearerRecords > 0 || removedWearerCentroids > 0 || removedWearerProfile {
       AppLogger.log(
         .speakerIdentity,
-        "Purged incompatible speaker enrollments removedSpeakers=\(removedSpeakers) removedRecords=\(removedRecords) removedWearerProfile=\(removedWearerProfile) removedWearerRecords=\(removedWearerRecords) removedWearerCentroids=\(removedWearerCentroids) expectedModel=\(embeddingModel.modelName) expectedVersion=\(embeddingModel.modelVersion) expectedPreprocessing=\(embeddingModel.preprocessingVersion) expectedDim=\(embeddingModel.embeddingDimension)"
+        "Purged invalid speaker enrollments removedSpeakers=\(removedSpeakers) removedRecords=\(removedRecords) removedWearerProfile=\(removedWearerProfile) removedWearerRecords=\(removedWearerRecords) removedWearerCentroids=\(removedWearerCentroids)"
       )
       if saveAfterPurge {
         saveToDisk()
@@ -1713,11 +2021,75 @@ actor SpeakerIdentityPipeline {
     }
   }
 
-  private func isCompatible(modelName: String, modelVersion: String, preprocessingVersion: String, dimension: Int) -> Bool {
-    dimension == embeddingModel.embeddingDimension
-      && modelName == embeddingModel.modelName
-      && modelVersion == embeddingModel.modelVersion
-      && preprocessingVersion == embeddingModel.preprocessingVersion
+  private func normalizedRuntime(_ runtime: String?) -> String {
+    runtime ?? SpeakerEmbeddingRuntime.localCoreML
+  }
+
+  private func embeddingSpaceKey(_ record: SpeakerEmbeddingRecord) -> String {
+    [
+      record.modelName,
+      record.modelVersion,
+      record.preprocessingVersion,
+      normalizedRuntime(record.embeddingRuntime),
+      String(record.dimension)
+    ].joined(separator: "|")
+  }
+
+  private func embeddingSpaceKey(_ speaker: SpeakerAveragedEmbedding) -> String {
+    [
+      speaker.modelName,
+      speaker.modelVersion,
+      speaker.preprocessingVersion,
+      normalizedRuntime(speaker.embeddingRuntime),
+      String(speaker.vectorDimension)
+    ].joined(separator: "|")
+  }
+
+  private func isSameEmbeddingSpace(_ speaker: SpeakerAveragedEmbedding, _ embedding: VoiceEmbedding) -> Bool {
+    speaker.vectorDimension == embedding.dimension
+      && speaker.modelName == embedding.modelName
+      && speaker.modelVersion == embedding.modelVersion
+      && speaker.preprocessingVersion == embedding.preprocessingVersion
+      && normalizedRuntime(speaker.embeddingRuntime) == embedding.embeddingRuntime
+  }
+
+  private func isSameEmbeddingSpace(_ speaker: SpeakerAveragedEmbedding, _ record: SpeakerEmbeddingRecord) -> Bool {
+    speaker.vectorDimension == record.dimension
+      && speaker.modelName == record.modelName
+      && speaker.modelVersion == record.modelVersion
+      && speaker.preprocessingVersion == record.preprocessingVersion
+      && normalizedRuntime(speaker.embeddingRuntime) == normalizedRuntime(record.embeddingRuntime)
+  }
+
+  private func isSameEmbeddingSpace(_ left: VoiceEmbedding, _ right: VoiceEmbedding) -> Bool {
+    left.dimension == right.dimension
+      && left.modelName == right.modelName
+      && left.modelVersion == right.modelVersion
+      && left.preprocessingVersion == right.preprocessingVersion
+      && left.embeddingRuntime == right.embeddingRuntime
+  }
+
+  private func isCompatibleWithModel(
+    modelName: String,
+    modelVersion: String,
+    preprocessingVersion: String,
+    embeddingRuntime: String,
+    dimension: Int,
+    model: SpeakerEmbeddingModel
+  ) -> Bool {
+    dimension == model.embeddingDimension
+      && modelName == model.modelName
+      && modelVersion == model.modelVersion
+      && preprocessingVersion == model.preprocessingVersion
+      && embeddingRuntime == model.embeddingRuntime
+  }
+
+  private func isPersistedEmbeddingValid(vector: [Float], dimension: Int, embeddingRuntime: String?) -> Bool {
+    let runtime = normalizedRuntime(embeddingRuntime)
+    return dimension > 0
+      && vector.count == dimension
+      && vector.allSatisfy(\.isFinite)
+      && runtime != SpeakerEmbeddingRuntime.missing
   }
 
   private func appendToSpeechBuffer(_ samples: [Float]) {

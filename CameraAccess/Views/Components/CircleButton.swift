@@ -33,9 +33,13 @@ struct CircleButton: View {
           .font(.system(size: 16))
       }
     }
-    .foregroundColor(.black)
+    .foregroundColor(.white)
     .frame(width: 56, height: 56)
-    .background(.white)
+    .background(MementoTheme.panelRaised)
+    .overlay(
+      Circle()
+        .stroke(MementoTheme.primary.opacity(0.28), lineWidth: 1)
+    )
     .clipShape(Circle())
   }
 }

@@ -11,12 +11,20 @@ This project is the Meta Smart Glass Project. Keep work scoped to Swift, Apple f
 - Do not add defensive fallbacks, timing workarounds, retries, alternate lifecycle gates, or custom connection logic unless Meta's sample/docs include that behavior or the user explicitly approves the deviation.
 - If a DAT fix requires deviating from Meta's sample/docs, explain the deviation first and keep it isolated from the core DAT path.
 
+## Audio Output Policy
+
+- Do not use Meta/Ray-Ban glasses speakers for app result announcements or spoken assistance.
+- Treat the glasses as DAT camera/display/input context for this project. Real DAT camera streaming uses the iPhone microphone for recording, but the iPhone audio session must be activated before starting the DAT stream.
+- If audible feedback is needed, keep output on the iPhone speaker/receiver path unless the user explicitly approves a separate glasses-audio experiment.
+- Avoid audio session or Bluetooth output route changes after DAT camera streaming starts; audio route renegotiation can destabilize the stream and has caused `FrameStallDetectorServiceError`.
+
 ## Architecture
 
 The SDK is organized into three modules:
 
 - `MWDATCore`: Device discovery, registration, permissions, device selectors
 - `MWDATCamera`: `StreamSession`, `VideoFrame`, photo capture
+- `MWDATDisplay`: Display capability and display UI primitives
 - `MWDATMockDevice`: MockDeviceKit for testing without hardware
 
 ## Swift Patterns
@@ -42,6 +50,7 @@ The SDK is organized into three modules:
 ```swift
 import MWDATCore
 import MWDATCamera
+import MWDATDisplay
 ```
 
 For testing:
@@ -58,11 +67,12 @@ import MWDATMockDevice
 - `AutoDeviceSelector`: Automatically selects the best available device.
 - `SpecificDeviceSelector`: Selects a specific device by identifier.
 - `StreamSessionConfig`: Configures video codec, resolution, and frame rate.
+- `Display`: Glasses display capability. Add at most one display capability per active device session.
 - `MockDeviceKit`: Factory for creating simulated devices in tests.
 
 ## Info.plist Configuration
 
-Developer Mode for SDK 0.6.0 uses an `MWDAT` dictionary with `MetaAppID` set to `0`.
+Developer Mode for SDK 0.7.0 uses an `MWDAT` dictionary with `MetaAppID` set to `0`. This project enables `MWDAT.DAMEnabled` for display-capable glasses testing.
 
 ```xml
 <key>CFBundleURLTypes</key>
@@ -104,6 +114,12 @@ Developer Mode for SDK 0.6.0 uses an `MWDAT` dictionary with `MetaAppID` set to 
   <string>cameraaccess://</string>
   <key>MetaAppID</key>
   <string>0</string>
+  <key>ClientToken</key>
+  <string>0</string>
+  <key>TeamID</key>
+  <string>$(DEVELOPMENT_TEAM)</string>
+  <key>DAMEnabled</key>
+  <true/>
 </dict>
 ```
 
@@ -218,6 +234,10 @@ DAT work runs inside device sessions. On iOS, observe lifecycle with `addDeviceS
 
 Closing the glasses hinges disconnects Bluetooth, stops active streams, and forces `STOPPED`. Opening the hinges restores Bluetooth when nearby, but does not restart the session automatically.
 
+## Display Capability
+
+Display output uses `MWDATDisplay` in SDK 0.7.0. Treat display as a single active capability on the current `DeviceSession`: combine live captions, identity memory, and scene context into one current card, then update that card. Do not call `addDisplay()` repeatedly after the SDK reports that a display capability is already active on the session. Wait for the display state or device-session stop before attempting to attach again.
+
 ## Mock Device Kit
 
 Mock Device Kit is the official no-hardware test path.
@@ -237,7 +257,7 @@ let camera = mockDevice.services.camera
 camera.setCameraFeed(fileURL: videoURL)
 ```
 
-CameraAccess sample debug flow:
+Meta Sample Code debug flow:
 
 1. Pair RayBan Meta.
 2. PowerOn.
@@ -282,11 +302,12 @@ The DAT app should only depend on:
 
 - `MWDATCore`
 - `MWDATCamera`
+- `MWDATDisplay`
 - `MWDATMockDevice`
 
 ## Links
 
-- iOS API Reference: https://wearables.developer.meta.com/docs/reference/ios_swift/dat/0.6
+- iOS API Reference: https://wearables.developer.meta.com/docs/reference/ios_swift/dat/0.7
 - Developer Documentation: https://wearables.developer.meta.com/docs/develop/
 - GitHub Repository: https://github.com/facebook/meta-wearables-dat-ios
 - Mock Device Kit: https://wearables.developer.meta.com/docs/mock-device-kit/

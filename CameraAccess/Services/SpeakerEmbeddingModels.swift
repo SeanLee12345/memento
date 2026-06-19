@@ -7,6 +7,7 @@ protocol SpeakerEmbeddingModel {
   var modelName: String { get }
   var modelVersion: String { get }
   var preprocessingVersion: String { get }
+  var embeddingRuntime: String { get }
 
   func load() async throws
   func embed(samples: [Float], sampleRate: Double) async throws -> VoiceEmbedding
@@ -43,18 +44,27 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
   nonisolated let modelName = "SpeakerEmbedding"
   nonisolated let modelVersion = "nvidia-speakerverification-en-titanet-large-v1"
   nonisolated let preprocessingVersion = "titanet-raw-16khz-v1"
+  nonisolated let embeddingRuntime = SpeakerEmbeddingRuntime.awsTitaNet
 
-  private let endpoint = LocalWorkerSettings.defaultSpeakerEndpoint
-  private let apiKey = LocalWorkerSettings.defaultAPIKey
+  private let endpoint: String
+  private let apiKey: String
   private let session: URLSession
   private let fallback: SpeakerEmbeddingModel?
   private var remoteDisabledUntil: Date?
   private var lastRemoteFailureLogAt: Date?
 
-  private let embedTimeoutSeconds: TimeInterval = 30
+  private let embedTimeoutSeconds: TimeInterval = 25
   private let remoteFailureBackoffSeconds: TimeInterval = 60
+  private let remoteEmbedRetryDelays: [TimeInterval] = [5, 10]
 
-  init(session: URLSession = .shared, fallback: SpeakerEmbeddingModel? = nil) {
+  init(
+    endpoint: String = LocalWorkerSettings.defaultSpeakerEndpoint,
+    apiKey: String = LocalWorkerSettings.defaultAPIKey,
+    session: URLSession = .shared,
+    fallback: SpeakerEmbeddingModel? = nil
+  ) {
+    self.endpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     self.session = session
     self.fallback = fallback
   }
@@ -109,6 +119,40 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
   }
 
   private func embedRemotely(samples: [Float], sampleRate: Double) async throws -> VoiceEmbedding {
+    var lastError: Error?
+    let requestID = UUID().uuidString
+    let attempts = remoteEmbedRetryDelays.count + 1
+    for attempt in 1...attempts {
+      do {
+        return try await embedRemotelyOnce(
+          samples: samples,
+          sampleRate: sampleRate,
+          requestID: requestID,
+          attempt: attempt,
+          maxAttempts: attempts
+        )
+      } catch {
+        lastError = error
+        let message = error.localizedDescription
+        AppLogger.log(
+          .speakerEmbedding,
+          "Remote TitaNet embedding attempt failed requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(attempts) endpoint=\(endpoint) state=speakerEmbeddingTimedOutOrUnavailable error=\(message)"
+        )
+        guard attempt <= remoteEmbedRetryDelays.count else { break }
+        let delay = remoteEmbedRetryDelays[attempt - 1]
+        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      }
+    }
+    throw lastError ?? SpeakerEmbeddingError.remoteEmbeddingFailed("unknown remote embedding failure")
+  }
+
+  private func embedRemotelyOnce(
+    samples: [Float],
+    sampleRate: Double,
+    requestID: String,
+    attempt: Int,
+    maxAttempts: Int
+  ) async throws -> VoiceEmbedding {
     guard let url = URL(string: endpoint)?.appendingPathComponent("speaker").appendingPathComponent("embed") else {
       throw SpeakerEmbeddingError.remoteEmbeddingFailed("invalid endpoint \(endpoint)")
     }
@@ -130,7 +174,22 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
     request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
     request.httpBody = body
 
-    let (data, response) = try await session.data(for: request)
+    let startedAt = Date()
+    AppLogger.log(
+      .speakerEmbedding,
+      "Remote TitaNet embedding request start requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(maxAttempts) endpoint=\(endpoint) audioSeconds=\(String(format: "%.2f", Double(window.count) / sampleRate)) payloadBytes=\(body.count) timeoutSeconds=\(Int(embedTimeoutSeconds))"
+    )
+    let (data, response): (Data, URLResponse)
+    do {
+      (data, response) = try await session.data(for: request)
+    } catch {
+      let elapsedMS = Date().timeIntervalSince(startedAt) * 1_000
+      AppLogger.log(
+        .speakerEmbedding,
+        "Remote TitaNet embedding request failed requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(maxAttempts) endpoint=\(endpoint) elapsedMs=\(String(format: "%.1f", elapsedMS)) audioSeconds=\(String(format: "%.2f", Double(window.count) / sampleRate)) payloadBytes=\(body.count) state=speakerEmbeddingTimedOut error=\(error.localizedDescription)"
+      )
+      throw error
+    }
     guard let http = response as? HTTPURLResponse else {
       throw SpeakerEmbeddingError.remoteEmbeddingFailed("invalid HTTP response")
     }
@@ -152,12 +211,17 @@ actor RemoteTitaNetSpeakerEmbeddingModel: SpeakerEmbeddingModel {
       throw SpeakerEmbeddingError.invalidEmbeddingValues("remote near-zero norm")
     }
     let normalized = vector.map { $0 / norm }
-    AppLogger.log(.speakerEmbedding, "Remote TitaNet embedding succeeded endpoint=\(endpoint) dim=\(normalized.count)")
+    let elapsedMS = Date().timeIntervalSince(startedAt) * 1_000
+    AppLogger.log(
+      .speakerEmbedding,
+      "Remote TitaNet embedding succeeded requestId=\(requestID.prefix(8)) attempt=\(attempt)/\(maxAttempts) endpoint=\(endpoint) dim=\(normalized.count) elapsedMs=\(String(format: "%.1f", elapsedMS)) audioSeconds=\(String(format: "%.2f", Double(window.count) / sampleRate)) payloadBytes=\(body.count) state=speakerEmbeddingReady"
+    )
     return VoiceEmbedding(
       vector: normalized,
       modelName: modelName,
       modelVersion: modelVersion,
-      preprocessingVersion: preprocessingVersion
+      preprocessingVersion: preprocessingVersion,
+      embeddingRuntime: embeddingRuntime
     )
   }
 
@@ -222,6 +286,7 @@ struct FallbackSpeakerEmbeddingModel: SpeakerEmbeddingModel {
   var modelName: String { primary.modelName }
   var modelVersion: String { primary.modelVersion }
   var preprocessingVersion: String { primary.preprocessingVersion }
+  var embeddingRuntime: String { primary.embeddingRuntime }
 
   func load() async throws {
     do {
@@ -248,6 +313,7 @@ struct MissingSpeakerEmbeddingModel: SpeakerEmbeddingModel {
   let modelName = "missing"
   let modelVersion = "0"
   let preprocessingVersion = "none"
+  let embeddingRuntime = SpeakerEmbeddingRuntime.missing
 
   func load() async throws {}
   func embed(samples: [Float], sampleRate: Double) async throws -> VoiceEmbedding {
@@ -267,6 +333,7 @@ actor LazyCoreMLSpeakerEmbeddingModel: SpeakerEmbeddingModel {
   nonisolated let modelVersion = "nvidia-speakerverification-en-titanet-large-v1"
   nonisolated let embeddingDimension = 192
   nonisolated let preprocessingVersion: String
+  nonisolated let embeddingRuntime = SpeakerEmbeddingRuntime.localCoreML
 
   private let modelURL: URL
   private var loadedModel: MLModel?
@@ -325,7 +392,8 @@ actor LazyCoreMLSpeakerEmbeddingModel: SpeakerEmbeddingModel {
       vector: normalized,
       modelName: modelName,
       modelVersion: modelVersion,
-      preprocessingVersion: preprocessingVersion
+      preprocessingVersion: preprocessingVersion,
+      embeddingRuntime: embeddingRuntime
     )
   }
 
@@ -404,6 +472,10 @@ enum SpeakerEmbeddingModelFactory {
 
   static func makeRemoteModelOnly() -> SpeakerEmbeddingModel {
     RemoteTitaNetSpeakerEmbeddingModel(fallback: nil)
+  }
+
+  static func makeRemoteModelOnly(endpoint: String, apiKey: String) -> SpeakerEmbeddingModel {
+    RemoteTitaNetSpeakerEmbeddingModel(endpoint: endpoint, apiKey: apiKey, fallback: nil)
   }
 
   static func diagnosticsText() -> String {

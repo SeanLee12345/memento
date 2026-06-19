@@ -255,16 +255,15 @@ enum FaceCropper {
 
   // MARK: - Similarity-transform face alignment
 
-  // SphereFace/MobileFaceNet reference landmarks for 96 wide × 112 tall (x in [0,96], y in [0,112]).
-  // These are the canonical positions used in the CASIA-WebFace-112X96 training set.
-  // modelInputSize is NOT hardcoded here — it reads IdentityConfig.activeEmbeddingModelInputSize,
-  // which is set by FaceEmbeddingModels once the Core ML model is loaded (tasks 1, 2).
+  // AdaFace/ArcFace reference landmarks for 112 wide x 112 tall crops.
+  // modelInputSize is NOT hardcoded here; it reads IdentityConfig.activeEmbeddingModelInputSize,
+  // which is set by the active face embedding model.
   private static let referenceLandmarks: [CGPoint] = [
-    CGPoint(x: 30.2946, y: 51.6963),  // left eye
-    CGPoint(x: 65.5318, y: 51.5014),  // right eye
-    CGPoint(x: 48.0252, y: 71.7366),  // nose tip
-    CGPoint(x: 33.5493, y: 92.3655),  // left mouth corner
-    CGPoint(x: 62.7299, y: 92.2041),  // right mouth corner
+    CGPoint(x: 38.2946, y: 51.6963),  // left eye
+    CGPoint(x: 73.5318, y: 51.5014),  // right eye
+    CGPoint(x: 56.0252, y: 71.7366),  // nose tip
+    CGPoint(x: 41.5493, y: 92.3655),  // left mouth corner
+    CGPoint(x: 70.7299, y: 92.2041),  // right mouth corner
   ]
 
   // Task 7/6: full landmark logging; returns nil with reason if any required part is absent.

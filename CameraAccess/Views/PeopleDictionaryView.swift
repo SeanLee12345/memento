@@ -15,6 +15,15 @@ struct PeopleDictionaryView: View {
           emptyState
         } else {
           List {
+            Section {
+              PeopleOverviewRow(
+                peopleCount: viewModel.peopleDictionaryEntries.count,
+                glassesInteractionCount: viewModel.peopleDictionaryEntries.reduce(0) { $0 + $1.glassesDisplayInteractions.count },
+                activeDisplayConnected: viewModel.glassesDisplayConnected
+              )
+              .listRowBackground(Color.mementoListCard)
+            }
+
             // Cloud diarization status banner
             if viewModel.cloudDiarizationState != .idle && viewModel.cloudDiarizationState != .done {
               Section {
@@ -22,11 +31,11 @@ struct PeopleDictionaryView: View {
                   ProgressView()
                   Text(viewModel.cloudDiarizationState.statusText)
                     .font(.subheadline)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(MementoTheme.listCardSecondaryText)
                 }
                 .padding(.vertical, 4)
               }
-              .listRowBackground(Color(.secondarySystemGroupedBackground))
+              .listRowBackground(Color.mementoListCard)
             }
 
             // Unidentified speakers from last session
@@ -36,7 +45,7 @@ struct PeopleDictionaryView: View {
                   UnknownSpeakerRowView(speaker: speaker, onEnroll: {
                     enrollingSpeaker = speaker
                   })
-                  .listRowBackground(Color(.secondarySystemGroupedBackground))
+                  .listRowBackground(Color.mementoListCard)
                 }
               }
             }
@@ -46,7 +55,7 @@ struct PeopleDictionaryView: View {
               PersonRowView(entry: entry, viewModel: viewModel)
                 .contentShape(Rectangle())
                 .onTapGesture { selectedEntry = entry }
-                .listRowBackground(Color(.secondarySystemGroupedBackground))
+                .listRowBackground(Color.mementoListCard)
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                   Button(role: .destructive) {
                     viewModel.deletePerson(id: entry.id)
@@ -61,6 +70,7 @@ struct PeopleDictionaryView: View {
       }
       .navigationTitle("People")
       .navigationBarTitleDisplayMode(.large)
+      .tint(.appPrimary)
       .toolbar {
         ToolbarItem(placement: .navigationBarTrailing) {
           Button("Done") { viewModel.showPeopleDictionary = false }
@@ -88,22 +98,36 @@ struct PeopleDictionaryView: View {
   }
 
   private func enqueueSpeakerPrompts(from speakers: [UnknownDiarizationSpeaker]) {
-    var seenClipData: Set<Data> = []
-    let promptableSpeakers = speakers
-      .sorted { $0.speakerIndex < $1.speakerIndex }
-      .filter { speaker in
-        guard let clipData = speaker.clipData, !clipData.isEmpty else { return false }
-        return seenClipData.insert(clipData).inserted
+    let promptableSpeakers = StreamSessionViewModel.promptableUnknownSpeakers(speakers)
+    AppLogger.log(
+      .speakerEnrollment,
+      "[PeopleDictionary] enqueue speaker prompts unknown=\(speakers.count) promptable=\(promptableSpeakers.count)"
+    )
+    for speaker in speakers.sorted(by: { $0.speakerIndex < $1.speakerIndex }) {
+      if let reason = StreamSessionViewModel.speakerEnrollmentSuppressionReason(for: speaker) {
+        AppLogger.log(
+          .speakerEnrollment,
+          "[PeopleDictionary] prompt suppressed speaker=\(speaker.speakerIndex) reason=\(reason) clipBytes=\(speaker.clipData?.count ?? 0)"
+        )
       }
+    }
 
     for speaker in promptableSpeakers {
       let key = speakerPromptKey(speaker)
       guard !promptedSpeakerKeys.contains(key),
             !pendingSpeakerPrompts.contains(where: { speakerPromptKey($0) == key }),
             enrollingSpeaker.map(speakerPromptKey) != key else {
+        AppLogger.log(
+          .speakerEnrollment,
+          "[PeopleDictionary] prompt skipped duplicate speaker=\(speaker.speakerIndex) key=\(key)"
+        )
         continue
       }
       pendingSpeakerPrompts.append(speaker)
+      AppLogger.log(
+        .speakerEnrollment,
+        "[PeopleDictionary] prompt queued speaker=\(speaker.speakerIndex) key=\(key) clipBytes=\(speaker.clipData?.count ?? 0)"
+      )
     }
     presentNextSpeakerPromptIfNeeded()
   }
@@ -113,6 +137,10 @@ struct PeopleDictionaryView: View {
     let next = pendingSpeakerPrompts.removeFirst()
     promptedSpeakerKeys.insert(speakerPromptKey(next))
     enrollingSpeaker = next
+    AppLogger.log(
+      .speakerEnrollment,
+      "[PeopleDictionary] prompt presented speaker=\(next.speakerIndex) clipBytes=\(next.clipData?.count ?? 0)"
+    )
   }
 
   private func finishCurrentSpeakerPrompt() {
@@ -130,7 +158,7 @@ struct PeopleDictionaryView: View {
       Text("No people enrolled yet")
         .font(.headline)
         .foregroundColor(.primary)
-      Text("Stream video with your glasses to capture and label faces.")
+      Text("Memento saves people, conversations, and glasses display reviews here.")
         .font(.subheadline)
         .foregroundColor(.secondary)
         .multilineTextAlignment(.center)
@@ -162,25 +190,25 @@ private struct PersonRowView: View {
           if hasVoiceEnrollment {
             Image(systemName: "waveform.circle.fill")
               .font(.system(size: 16))
-              .foregroundColor(.blue)
-              .background(Color(.secondarySystemGroupedBackground).clipShape(Circle()))
+              .foregroundColor(MementoTheme.primary)
+              .background(Color.mementoListCard.clipShape(Circle()))
           }
         }
 
       VStack(alignment: .leading, spacing: 4) {
         Text(entry.displayName)
           .font(.system(size: 16, weight: .semibold))
-          .foregroundColor(.primary)
+          .foregroundColor(MementoTheme.listCardPrimaryText)
         if !entry.embeddingImages.isEmpty {
           embeddingImageStrip
         }
         Text(statusLine)
           .font(.system(size: 13))
-          .foregroundColor(.secondary)
+          .foregroundColor(MementoTheme.listCardSecondaryText)
         if !entry.transcripts.isEmpty {
           Text("\(entry.transcripts.count) transcript \(entry.transcripts.count == 1 ? "entry" : "entries")")
             .font(.system(size: 12))
-            .foregroundColor(.secondary)
+            .foregroundColor(MementoTheme.listCardSecondaryText)
         }
       }
 
@@ -192,7 +220,7 @@ private struct PersonRowView: View {
 
       Image(systemName: "chevron.right")
         .font(.system(size: 13, weight: .semibold))
-        .foregroundColor(Color(.tertiaryLabel))
+        .foregroundColor(MementoTheme.listCardTertiaryText)
     }
     .padding(.vertical, 6)
   }
@@ -201,14 +229,14 @@ private struct PersonRowView: View {
     VStack(spacing: 2) {
       Image(systemName: "waveform")
         .font(.system(size: 14, weight: .semibold))
-        .foregroundColor(.blue)
-      Text(String(format: "%.0f%%", viewModel.activeSpeakerSimilarity * 100))
+        .foregroundColor(MementoTheme.primary)
+      Text(String(format: "%.0f%%", Double(viewModel.activeSpeakerSimilarity * 100)))
         .font(.system(size: 10, weight: .medium))
-        .foregroundColor(.blue)
+        .foregroundColor(MementoTheme.primary)
     }
     .padding(.horizontal, 8)
     .padding(.vertical, 4)
-    .background(Color.blue.opacity(0.12))
+    .background(MementoTheme.primary.opacity(0.12))
     .clipShape(RoundedRectangle(cornerRadius: 8))
   }
 
@@ -220,11 +248,11 @@ private struct PersonRowView: View {
           .scaledToFill()
       } else {
         Circle()
-          .fill(Color(.systemGray5))
+          .fill(MementoTheme.listCardMutedFill)
           .overlay(
             Text(entry.displayName.prefix(1).uppercased())
               .font(.system(size: 22, weight: .semibold))
-              .foregroundColor(.secondary)
+              .foregroundColor(MementoTheme.listCardSecondaryText)
           )
       }
     }
@@ -242,9 +270,9 @@ private struct PersonRowView: View {
       if entry.embeddingImages.count > 5 {
         Text("+\(entry.embeddingImages.count - 5)")
           .font(.system(size: 10, weight: .semibold))
-          .foregroundColor(.secondary)
+          .foregroundColor(MementoTheme.listCardSecondaryText)
           .frame(width: 26, height: 26)
-          .background(Color(.tertiarySystemGroupedBackground))
+          .background(MementoTheme.listCardMutedFill)
           .clipShape(RoundedRectangle(cornerRadius: 5))
       }
     }
@@ -256,7 +284,43 @@ private struct PersonRowView: View {
     if let lastSeen = entry.lastSeen {
       parts.append("Last seen \(RelativeDateTimeFormatter().localizedString(for: lastSeen, relativeTo: Date()))")
     }
+    if !entry.glassesDisplayInteractions.isEmpty {
+      parts.append("\(entry.glassesDisplayInteractions.count) glasses review\(entry.glassesDisplayInteractions.count == 1 ? "" : "s")")
+    }
     return parts.joined(separator: " · ")
+  }
+}
+
+private struct PeopleOverviewRow: View {
+  let peopleCount: Int
+  let glassesInteractionCount: Int
+  let activeDisplayConnected: Bool
+
+  var body: some View {
+    HStack(spacing: 14) {
+      Image(systemName: "person.2.fill")
+        .font(.system(size: 22, weight: .semibold))
+        .foregroundColor(MementoTheme.primary)
+        .frame(width: 44, height: 44)
+        .background(MementoTheme.primary.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+
+      VStack(alignment: .leading, spacing: 4) {
+        Text("Memento People")
+          .font(.system(size: 16, weight: .semibold))
+          .foregroundColor(MementoTheme.listCardPrimaryText)
+        HStack(spacing: 10) {
+          Label("\(peopleCount)", systemImage: "person")
+          Label("\(glassesInteractionCount)", systemImage: "eyeglasses")
+          Label(activeDisplayConnected ? "Display on" : "Display idle", systemImage: "rectangle.on.rectangle")
+        }
+        .font(.caption)
+        .foregroundColor(MementoTheme.listCardSecondaryText)
+      }
+
+      Spacer()
+    }
+    .padding(.vertical, 6)
   }
 }
 
@@ -269,24 +333,25 @@ private struct UnknownSpeakerRowView: View {
   var body: some View {
     HStack(spacing: 14) {
       Circle()
-        .fill(Color(.systemGray4))
+        .fill(MementoTheme.listCardMutedFill)
         .frame(width: 56, height: 56)
         .overlay(
           Image(systemName: "person.fill.questionmark")
             .font(.system(size: 22))
-            .foregroundColor(.secondary)
+            .foregroundColor(MementoTheme.listCardSecondaryText)
         )
       VStack(alignment: .leading, spacing: 4) {
         Text(speaker.id)
           .font(.system(size: 16, weight: .semibold))
+          .foregroundColor(MementoTheme.listCardPrimaryText)
         Text(String(format: "%.0f s spoken · %d segment%@",
-                    speaker.totalSeconds, speaker.segmentCount,
+                    Double(speaker.totalSeconds), speaker.segmentCount,
                     speaker.segmentCount == 1 ? "" : "s"))
           .font(.system(size: 13))
-          .foregroundColor(.secondary)
+          .foregroundColor(MementoTheme.listCardSecondaryText)
         Text("Tap to identify & enroll")
           .font(.system(size: 12))
-          .foregroundColor(.blue)
+          .foregroundColor(MementoTheme.primary)
       }
       Spacer()
       Button(action: onEnroll) {
@@ -323,6 +388,12 @@ private struct UnknownSpeakerEnrollSheet: View {
                     systemImage: isPlayingClip ? "stop.circle" : "play.circle")
             }
           }
+        } else {
+          Section("Voice Preview") {
+            Text("No clean single-speaker clip is available for voice enrollment.")
+              .font(.system(size: 13))
+              .foregroundColor(.secondary)
+          }
         }
 
         // Assign to existing person or create new
@@ -338,7 +409,7 @@ private struct UnknownSpeakerEnrollSheet: View {
                     .foregroundColor(.primary)
                   Spacer()
                   if existingPerson?.id == entry.id {
-                    Image(systemName: "checkmark").foregroundColor(.blue)
+                    Image(systemName: "checkmark").foregroundColor(MementoTheme.primary)
                   }
                 }
               }
@@ -349,7 +420,7 @@ private struct UnknownSpeakerEnrollSheet: View {
         }
 
         Section {
-          Button("Save & Enroll") {
+          Button(speaker.clipData == nil ? "Save Name" : "Save & Enroll") {
             enrollSpeaker()
           }
           .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -371,17 +442,50 @@ private struct UnknownSpeakerEnrollSheet: View {
     if isPlayingClip {
       audioPlayer?.stop()
       isPlayingClip = false
-    } else if let data = speaker.clipData,
-              let player = try? AVAudioPlayer(data: data) {
-      audioPlayer = player
-      player.play()
-      isPlayingClip = true
-      player.delegate = nil  // reset when done
-      // Auto-reset when clip ends
-      DispatchQueue.main.asyncAfter(deadline: .now() + player.duration + 0.1) {
+    } else if let data = speaker.clipData {
+      do {
+        try configurePhoneSpeakerPlayback()
+        let player = try AVAudioPlayer(data: data)
+        player.volume = 1.0
+        player.prepareToPlay()
+        audioPlayer = player
+        player.play()
+        isPlayingClip = true
+        player.delegate = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + player.duration + 0.1) {
+          isPlayingClip = false
+        }
+      } catch {
+        AppLogger.log(.audio, "Unknown speaker preview playback failed speaker=\(speaker.speakerIndex): \(error.localizedDescription)")
         isPlayingClip = false
       }
     }
+  }
+
+  private func configurePhoneSpeakerPlayback() throws {
+    let session = AVAudioSession.sharedInstance()
+    try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker])
+    if let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+      try? session.setPreferredInput(builtIn)
+    }
+    try session.overrideOutputAudioPort(.speaker)
+    try session.setActive(true)
+    let outputRouteDesc = session.currentRoute.outputs
+      .map { "\($0.portName)/\($0.portType.rawValue)" }
+      .joined(separator: ",")
+    let lower = outputRouteDesc.lowercased()
+    if lower.contains("rb meta")
+      || lower.contains("ray-ban")
+      || lower.contains("rayban")
+      || lower.contains("bluetootha2dpoutput")
+      || lower.contains("bluetoothhfp") {
+      throw NSError(
+        domain: "UnknownSpeakerPreview",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Refused glasses output route [\(outputRouteDesc)]"]
+      )
+    }
+    AppLogger.log(.audio, "Unknown speaker preview route=[\(outputRouteDesc)]")
   }
 
   private func enrollSpeaker() {

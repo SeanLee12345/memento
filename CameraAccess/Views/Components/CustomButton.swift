@@ -9,7 +9,7 @@
 //
 // CustomButton.swift
 //
-// Reusable button component used throughout the CameraAccess app for consistent styling.
+// Reusable button component used throughout the Memento app for consistent styling.
 //
 
 import SwiftUI
@@ -48,9 +48,9 @@ struct CustomButton: View {
         .font(.system(size: 15, weight: .semibold))
         .foregroundColor(style.foregroundColor)
         .frame(maxWidth: .infinity)
-        .frame(height: 56)
+        .frame(height: 52)
         .background(style.backgroundColor)
-        .cornerRadius(30)
+        .cornerRadius(14)
     }
     .disabled(isDisabled)
     .opacity(isDisabled ? 0.6 : 1.0)

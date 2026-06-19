@@ -21,3 +21,7 @@ VoiceTestAudio/*.mlpackage/
 anaconda_projects/
 MetaDATOfficialSample/
 plugins/
+supabase/.temp/
+
+# Vendored Meta DAT sample code (has its own git repo) — not committed here
+Meta Sample/
