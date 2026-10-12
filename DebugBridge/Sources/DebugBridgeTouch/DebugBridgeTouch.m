@@ -1,6 +1,6 @@
 //
 //  DebugBridgeTouch.m — minimal port of KIF's in-process touch synthesis.
-//  Original code: https://github.com/kif-framework/KIF — MIT-licensed
+//  Original code: https://github.com/kif-framework/KIF — Apache-2.0-licensed
 //  (Square, Inc. + KIF contributors). Adapted to a single-file, tap-only,
 //  iOS 18+ aware subset for the gstack/ios-qa DebugBridge.
 //

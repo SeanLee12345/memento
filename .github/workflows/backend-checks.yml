@@ -1,0 +1,22 @@
+name: Backend checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install boto3 numpy soundfile
+      - name: Diarization worker tests
+        run: python -m unittest discover -s tools/aws_diarization_worker -p 'test_*.py'
+      - name: Worker lifecycle tests
+        run: python -m unittest discover -s tools/diarizen_start_ec2_lambda -p 'test_*.py'

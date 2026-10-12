@@ -25,3 +25,11 @@ supabase/.temp/
 
 # Vendored Meta DAT sample code (has its own git repo) — not committed here
 Meta Sample/
+
+# Local development environments and generated personal data
+.venv/
+.build/
+.pytest_cache/
+*.xcresult/
+recordings/
+exports/
